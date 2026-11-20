@@ -12,7 +12,6 @@
 // logins listed in config.json are served. No dependencies beyond Node.
 
 import { createServer } from "node:http";
-import { createConnection } from "node:net";
 import { createHash, generateKeyPairSync, randomBytes } from "node:crypto";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -24,6 +23,7 @@ import { createMemory } from "./memory.mjs";
 import { createOrchestrator } from "./orchestrator.mjs";
 import { createRelayWatcher } from "./attention-relay.mjs";
 import { catalogs, toModels } from "./catalog.mjs";
+import { proxyControl as routeControl } from "./control.mjs";
 import * as desktop from "./desktop/desktop.mjs";
 import { acquire as leaseAcquire, release as leaseRelease, publicView } from "./desktop/lease.mjs";
 import { acceptUpgrade, bridge as rfbBridge } from "./desktop/rfb-bridge.mjs";
@@ -39,36 +39,13 @@ const BIN = path.join(LIB, "bin");
 const VERSION = 2;
 const RUN_DIR = path.join(process.env.XDG_RUNTIME_DIR || `/run/user/${process.getuid()}`, "buzz-host");
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const DEFAULT_CONCURRENCY = 4;
+const MIN_CONCURRENCY = 1;
+const MAX_CONCURRENCY = 16;
 
-// One JSON line to the agent's acp-proxy control socket, one line back.
+// Route one control request across all live acp-proxy workers for `pubkey`.
 function proxyControl(pubkey, request, timeoutMs = 10_000, notRunning = { cancelled: false }) {
-  return new Promise((resolve, reject) => {
-    const sock = createConnection(path.join(RUN_DIR, `${pubkey}.sock`));
-    let buf = "";
-    const timer = setTimeout(() => {
-      sock.destroy();
-      reject(new Error("The agent's runtime did not answer"));
-    }, timeoutMs);
-    sock.on("connect", () => sock.write(`${JSON.stringify(request)}\n`));
-    sock.on("data", (d) => {
-      buf += d;
-      const i = buf.indexOf("\n");
-      if (i < 0) return;
-      clearTimeout(timer);
-      sock.end();
-      try {
-        resolve(JSON.parse(buf.slice(0, i)));
-      } catch (error) {
-        reject(error);
-      }
-    });
-    sock.on("error", (error) => {
-      clearTimeout(timer);
-      // Not running (restarting, or stopped): nothing to interrupt.
-      if (error.code === "ENOENT" || error.code === "ECONNREFUSED") resolve(notRunning);
-      else reject(error);
-    });
-  });
+  return routeControl(RUN_DIR, pubkey, request, timeoutMs, notRunning);
 }
 
 // Shims keep the adapters' names (buzz-acp keys runtime defaults on the
@@ -226,6 +203,15 @@ function checkCommunity(config, community) {
   return community;
 }
 
+function checkConcurrency(value, fallback = DEFAULT_CONCURRENCY) {
+  if (value === undefined || value === null || value === "") return fallback;
+  const n = Number(value);
+  if (!Number.isInteger(n) || n < MIN_CONCURRENCY || n > MAX_CONCURRENCY) {
+    throw new Error(`Concurrency must be an integer between ${MIN_CONCURRENCY} and ${MAX_CONCURRENCY}`);
+  }
+  return n;
+}
+
 function settingsFrom(input, previous = {}) {
   const runtime = input?.runtime ?? previous.runtime ?? "claude";
   if (!Object.hasOwn(RUNTIMES, runtime)) throw new Error("Unknown runtime");
@@ -236,7 +222,8 @@ function settingsFrom(input, previous = {}) {
   let profile = runtime === "hermes" ? String(input?.profile ?? kept ?? "").trim() : "";
   if (profile === "default") profile = "";
   if (profile && !PROFILE.test(profile)) throw new Error("Invalid Hermes profile name");
-  return { runtime, model, profile };
+  const concurrency = checkConcurrency(input?.concurrency, previous.concurrency ?? DEFAULT_CONCURRENCY);
+  return { runtime, model, profile, concurrency };
 }
 function checkInstructions(text) {
   if (typeof text !== "string") throw new Error("Instructions must be text");
@@ -252,10 +239,12 @@ async function writeRuntimeEnv(pubkey, m) {
   const runtime = RUNTIMES[m.runtime];
   const profile = m.runtime === "hermes" ? m.profile || "" : "";
   if (m.runtime === "hermes") await ensureSessionEnv(profile);
+  const concurrency = checkConcurrency(m.concurrency, DEFAULT_CONCURRENCY);
   const lines = {
     BUZZ_RELAY_URL: m.community,
     BUZZ_ACP_AGENT_OWNER: m.owner,
     BUZZ_ACP_AGENT_COMMAND: runtime.command,
+    BUZZ_ACP_AGENTS: String(concurrency),
     BUZZ_ACP_MODEL: m.model || undefined,
     // The Hermes profile: hermes-acp and its gateway session use this home.
     HERMES_HOME: profile ? hermesHome(profile) : undefined,
@@ -539,13 +528,19 @@ const methods = {
   async "settings.get"(config, { pubkey }) {
     checkPubkey(pubkey);
     const m = await meta(pubkey);
-    return { runtime: m.runtime, model: m.model, profile: m.profile || "", status: await active(pubkey) };
+    return {
+      runtime: m.runtime,
+      model: m.model,
+      profile: m.profile || "",
+      concurrency: checkConcurrency(m.concurrency, DEFAULT_CONCURRENCY),
+      status: await active(pubkey),
+    };
   },
 
-  async "settings.set"(config, { pubkey, runtime, model, profile }) {
+  async "settings.set"(config, { pubkey, runtime, model, profile, concurrency }) {
     checkPubkey(pubkey);
     const m = await meta(pubkey);
-    const next = { ...m, ...settingsFrom({ runtime, model, profile }, m) };
+    const next = { ...m, ...settingsFrom({ runtime, model, profile, concurrency }, m) };
     await checkProfile(next.profile);
     await saveMeta(pubkey, next);
     if (m.activated) {
@@ -678,9 +673,11 @@ const methods = {
           runtime: m.runtime,
           model: m.model,
           profile: m.profile || "",
+          concurrency: checkConcurrency(m.concurrency, DEFAULT_CONCURRENCY),
           activated: m.activated,
           desktop: m.desktop === true,
           orchestrate: m.orchestrate === true,
+          workerPubkey: m.workerPubkey || "",
           status: m.activated ? await active(name) : "provisioned",
         });
     }
@@ -818,16 +815,64 @@ const methods = {
 
   // Cross-harness worker orchestration (orchestrator.mjs). Off by default;
   // turning it on or off rewrites the agent's MCP wrapper and restarts it.
-  async "orchestrator.set"(config, { pubkey, enabled }) {
+  // Selecting or changing workerPubkey takes effect immediately without restart.
+  async "orchestrator.set"(config, { pubkey, enabled, workerPubkey }) {
     checkPubkey(pubkey);
     const m = await meta(pubkey);
-    const next = { ...m, orchestrate: enabled === true };
+    const nextEnabled = enabled === undefined ? m.orchestrate === true : enabled === true;
+    let nextWorker =
+      workerPubkey === undefined
+        ? m.workerPubkey || ""
+        : typeof workerPubkey === "string"
+          ? workerPubkey.trim().toLowerCase()
+          : "";
+    if (nextEnabled) {
+      // Ensure this agent is not currently designated as another active orchestrator's
+      // worker pool (preserves MAX_DEPTH = 1: workers can never orchestrate).
+      const names = await fs.readdir(DATA).catch(() => []);
+      for (const other of names.filter((n) => HEX64.test(n) && n !== pubkey)) {
+        const om = await meta(other).catch(() => undefined);
+        if (om?.orchestrate === true && om?.workerPubkey === pubkey) {
+          throw new Error(
+            `${m.name || "This agent"} is used as ${om.name || "another agent"}'s worker pool; detach it there before turning Orchestrator on.`,
+          );
+        }
+      }
+    }
+    const explicitlySetWorker = workerPubkey !== undefined;
+    if (nextWorker && (nextEnabled || explicitlySetWorker)) {
+      const validateWorker = async () => {
+        checkPubkey(nextWorker);
+        if (nextWorker === pubkey) throw new Error("An agent cannot be its own worker pool");
+        const wm = await meta(nextWorker);
+        if (!wm.activated) throw new Error("Worker agent is not activated yet");
+        if (m.owner && wm.owner && wm.owner !== m.owner) {
+          throw new Error("Worker agent must belong to the same owner");
+        }
+        if (wm.orchestrate === true) {
+          throw new Error("An orchestrator agent cannot be used as a worker pool (workers cannot delegate)");
+        }
+        // Best-effort: prepare Hermes plugin on default/worker profile so Hermes worker chats work.
+        await ensureSessionEnv(wm.profile || "").catch(() => {});
+      };
+      if (explicitlySetWorker) {
+        await validateWorker();
+      } else {
+        // Re-enabling with a previously saved but now-stale workerPubkey: clear instead of blocking toggle.
+        try {
+          await validateWorker();
+        } catch {
+          nextWorker = "";
+        }
+      }
+    }
+    const next = { ...m, orchestrate: nextEnabled, workerPubkey: nextWorker };
     await saveMeta(pubkey, next);
     if (m.activated && next.orchestrate !== (m.orchestrate === true)) {
       await writeRuntimeEnv(pubkey, next);
       await systemctl("restart", unit(pubkey));
     }
-    return { enabled: next.orchestrate };
+    return { enabled: next.orchestrate, workerPubkey: next.workerPubkey || "" };
   },
   async "orchestrator.tasks"(config, { pubkey, channelId, threadRootId, taskId, since, full }) {
     checkPubkey(pubkey);
@@ -846,6 +891,7 @@ const methods = {
     });
     return {
       enabled: m.orchestrate === true,
+      workerPubkey: m.workerPubkey || "",
       tasks: view?.tasks ?? [],
       ...(view?.task !== undefined ? { task: view.task } : {}),
     };
@@ -863,6 +909,16 @@ const methods = {
     await orchestrator.forget(pubkey).catch(() => {});
     await desktop.stop(pubkey).catch(() => {});
     await fs.rm(dir(pubkey), { recursive: true, force: true });
+    // Detach if another orchestrator pointed to this removed agent as its worker pool.
+    const names = await fs.readdir(DATA).catch(() => []);
+    for (const other of names.filter((n) => HEX64.test(n) && n !== pubkey)) {
+      await serialized(other, async () => {
+        const om = await meta(other).catch(() => undefined);
+        if (om?.workerPubkey === pubkey) {
+          await saveMeta(other, { ...om, workerPubkey: "" }).catch(() => {});
+        }
+      });
+    }
     watcher.sync(pubkey, null);
     attention.forget(pubkey);
     return {};
@@ -948,7 +1004,9 @@ const orchestrator = createOrchestrator({
   dataDir: DATA,
   stateDir: path.join(HOME, ".local/share/buzz-host/orchestrator"),
   shimsDir: SHIMS,
+  runDir: RUN_DIR,
   catalog: (runtime) => runtimeCatalog(runtime),
+  ensureHermes: (profile) => ensureSessionEnv(profile || ""),
 });
 const attention = createAttention({ dataDir: DATA, runDir: RUN_DIR, extra: [memory, orchestrator] });
 // Event watches: one relay connection per agent that has any, fed to Attention.

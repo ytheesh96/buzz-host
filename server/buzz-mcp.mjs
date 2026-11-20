@@ -141,7 +141,7 @@ async function handle(request) {
           ...(computerModule ? [computerModule.instructions(pubkey)] : []),
           ...(withOrchestrate
             ? [
-                "Orchestration: you can spawn ephemeral worker sessions on other runtimes (claude, codex, hermes, antigravity) with orch_capabilities, orch_delegate, orch_wait, orch_status, orch_list, orch_steer, and orch_cancel.",
+                "Orchestration: you can delegate tasks to real Solo-chat workers on other runtimes (claude, codex, hermes, antigravity) with orch_capabilities, orch_delegate, orch_wait, orch_status, orch_list, orch_steer, and orch_cancel. Each delegated task opens a real Solo chat with a buzz://message link — include that link verbatim in your chat updates so the owner can open and inspect the worker chat directly.",
               ]
             : []),
         ].join("\n"),

@@ -589,5 +589,120 @@ class TurnAuthors(Base):
         self.assertEqual(set(data.keys()), {"chat-2", "chat-3", "chat-4"})
 
 
+class ParallelAndMultiRuntime(Base):
+    def test_control_state_detail_and_per_pid_socket_dir(self):
+        self.new(rid="n1", sid="s1")
+        # Plain state stays backward-compatible.
+        self.assertEqual(self.p.control({"op": "state", "channel": CHANNEL}), {"state": "idle"})
+        # Detailed state reports session ownership for multi-worker control routing.
+        detail = self.p.control({"op": "state", "channel": CHANNEL, "detail": True})
+        self.assertEqual(detail["state"], "idle")
+        self.assertEqual(detail["hasSession"], True)
+        self.assertIsInstance(detail["lastUsed"], (int, float))
+
+        # With BUZZ_HOST_CONTROL_DIR set, each worker gets its own <pid>.sock.
+        cdir = os.path.join(self.home, "ctrl.d")
+        self.p.control_dir = cdir
+        sock = self.p.effective_control_sock()
+        self.assertEqual(sock, os.path.join(cdir, f"{os.getpid()}.sock"))
+        self.assertTrue(os.path.isdir(cdir))
+
+    def test_chat_settings_locked_update_preserves_other_chats_and_recovers_stale_lock(self):
+        self.p.save_settings({"chat-a": {"runtime": "claude", "model": "opus"}})
+        # Leave a stale lock from a dead PID.
+        with open(self.p.settings_file + ".lock", "w") as f:
+            f.write("99999999\n")
+        self.p.update_settings("chat-b", lambda e: e.update({"runtime": "hermes", "effort": "high"}))
+        saved = self.p.load_settings()
+        self.assertEqual(saved["chat-a"], {"runtime": "claude", "model": "opus"})
+        self.assertEqual(saved["chat-b"], {"runtime": "hermes", "effort": "high"})
+        self.assertFalse(os.path.exists(self.p.settings_file + ".lock"))
+        self.assertEqual(os.stat(self.p.settings_file).st_mode & 0o777, 0o600)
+
+    def test_per_chat_runtime_routing_namespaces_secondary_sessions_and_restores_on_load(self):
+        # Chat configured for hermes on a claude-default acp-proxy.
+        self.p.save_settings({CHANNEL: {"runtime": "hermes", "workspace": [self.app]}})
+        rt, out_bytes = self.p.dispatch_client_line(session_new("n-hermes", self.own))
+        self.assertEqual(rt, "hermes")
+        out = json.loads(out_bytes)
+        # Hermes keeps its own cwd (not rewritten to self.app) so hermes-plugin resolves identity!
+        self.assertEqual(out["params"]["cwd"], self.own)
+
+        # Adapter responds with raw sessionId "h1" -> proxy namespaces as "rt:hermes:h1".
+        resp = json.loads(self.p.handle_adapter_line(
+            line({"jsonrpc": "2.0", "id": "n-hermes", "result": {"sessionId": "h1"}}),
+            adapter_runtime="hermes",
+        ))
+        self.assertEqual(resp["result"]["sessionId"], "rt:hermes:h1")
+
+        # Prompt for "rt:hermes:h1" routes to "hermes" with raw sessionId "h1".
+        prt, pout_bytes = self.p.dispatch_client_line(prompt_meta("p-h1", "rt:hermes:h1", [ev("hi", OWNER)]))
+        self.assertEqual(prt, "hermes")
+        pout = json.loads(pout_bytes)
+        self.assertEqual(pout["params"]["sessionId"], "h1")
+
+        # Update from hermes adapter with raw "h1" is rewritten back to "rt:hermes:h1".
+        upd = json.loads(self.p.handle_adapter_line(
+            line({"jsonrpc": "2.0", "method": "session/update",
+                  "params": {"sessionId": "h1", "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "ok"}}}}),
+            adapter_runtime="hermes",
+        ))
+        self.assertEqual(upd["params"]["sessionId"], "rt:hermes:h1")
+
+        # session/load after restart still routes "rt:hermes:h1" to hermes with raw "h1".
+        fresh = load(self.adapter, self.home)
+        lrt, lout_bytes = fresh.dispatch_client_line(line({
+            "jsonrpc": "2.0", "id": "l1", "method": "session/load",
+            "params": {"sessionId": "rt:hermes:h1", "cwd": self.own, "mcpServers": []},
+        }))
+        self.assertEqual(lrt, "hermes")
+        self.assertEqual(json.loads(lout_bytes)["params"]["sessionId"], "h1")
+
+    def test_turn_lifecycle_notifications_sent_on_start_and_done(self):
+        self.p.agent_pubkey = AGENT
+        seen = []
+        self.p.notify_host = lambda name, args: seen.append((name, args))
+        self.p.spawn = lambda fn, *args: fn(*args)
+        self.p.agent_posted = lambda ch, since: True
+
+        self.new(rid="n1", sid="s1")
+        self.p.handle_client_line(prompt_meta("p1", "s1", [ev("hello", OWNER, tags=[("p", AGENT)])]))
+        self.p.handle_adapter_line(line({"jsonrpc": "2.0", "id": "p1", "result": {"stopReason": "end_turn"}}))
+        self.assertEqual([name for name, _ in seen], ["_acp_turn_start", "_acp_turn_done"])
+        self.assertEqual(seen[0][1]["channel"], CHANNEL)
+        self.assertEqual(seen[1][1]["stopReason"], "end_turn")
+
+    def test_secondary_adapter_client_request_response_routes_back_to_secondary(self):
+        # Secondary adapter (hermes) sends session/request_permission with id=7 and raw sessionId="h1".
+        req = json.loads(self.p.handle_adapter_line(
+            line({"jsonrpc": "2.0", "id": 7, "method": "session/request_permission",
+                  "params": {"sessionId": "h1", "options": [{"optionId": "ok", "kind": "allow_once"}]}}),
+            adapter_runtime="hermes",
+        ))
+        self.assertEqual(req["params"]["sessionId"], "rt:hermes:h1")
+        ext_id = req["id"]
+        self.assertNotEqual(ext_id, 7)
+
+        # Client replies with ext_id -> dispatch_client_line routes to "hermes" with original id=7!
+        rt, out_bytes = self.p.dispatch_client_line(line({
+            "jsonrpc": "2.0", "id": ext_id, "result": {"outcome": {"outcome": "selected", "optionId": "ok"}},
+        }))
+        self.assertEqual(rt, "hermes")
+        out = json.loads(out_bytes)
+        self.assertEqual(out["id"], 7)
+
+    def test_cancel_with_all_flag_cancels_thread_scoped_solo_session(self):
+        sent = []
+        self.p.send_adapter = lambda obj, runtime_id=None: sent.append((runtime_id, obj))
+        self.new(rid="n1", sid="s1", root=ROOT)
+        self.p.handle_client_line(prompt_meta("p1", "s1", [ev("work", OWNER)], root=ROOT))
+        # Without all=True, bare channel does not match thread-scoped key.
+        self.assertEqual(self.p.control({"op": "cancel", "channel": CHANNEL}), {"cancelled": False})
+        # With all=True, in_scope matches channel_root and sends session/cancel.
+        self.assertEqual(self.p.control({"op": "cancel", "channel": CHANNEL, "all": True}), {"cancelled": True})
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0][1]["method"], "session/cancel")
+
+
 if __name__ == "__main__":
     unittest.main()
