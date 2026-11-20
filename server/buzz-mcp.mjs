@@ -9,7 +9,7 @@
 // which owns the agent's records and key. mem_set's `path` is read here, in
 // the session's folder, as Buzz reads it in the agent's workspace.
 //
-//   buzz-mcp.mjs <agent-pubkey> [--attention] [--computer]   (buzz-host writes a per-agent wrapper)
+//   buzz-mcp.mjs <agent-pubkey> [--attention] [--computer] [--orchestrate]   (buzz-host writes a per-agent wrapper)
 
 import fs from "node:fs/promises";
 import { createConnection } from "node:net";
@@ -17,15 +17,21 @@ import path from "node:path";
 import readline from "node:readline";
 import { ATTENTION_TOOLS } from "./attention-core.mjs";
 import { MEMORY_TOOLS } from "./memory.mjs";
+import { ORCHESTRATOR_TOOLS } from "./orchestrator.mjs";
 
 const pubkey = process.argv[2] ?? process.env.BUZZHOST_AGENT ?? "";
 const withAttention = process.argv.includes("--attention");
 const withComputer = process.argv.includes("--computer");
+const withOrchestrate = process.argv.includes("--orchestrate");
 if (!/^[0-9a-f]{64}$/.test(pubkey)) {
-  process.stderr.write("buzz-mcp: usage: buzz-mcp.mjs <agent-pubkey> [--attention] [--computer]\n");
+  process.stderr.write("buzz-mcp: usage: buzz-mcp.mjs <agent-pubkey> [--attention] [--computer] [--orchestrate]\n");
   process.exit(2);
 }
-const TOOLS = [...MEMORY_TOOLS, ...(withAttention ? ATTENTION_TOOLS : [])];
+const TOOLS = [
+  ...MEMORY_TOOLS,
+  ...(withAttention ? ATTENTION_TOOLS : []),
+  ...(withOrchestrate ? ORCHESTRATOR_TOOLS : []),
+];
 // Loaded only for agents with a desktop: everyone else never imports it.
 const computerModule = withComputer ? await import("./desktop/computer.mjs") : null;
 const computer = computerModule?.createComputer(pubkey);
@@ -38,28 +44,46 @@ async function computerTools() {
   return list;
 }
 
-/** mem_set's `path`: a file inside this session's folder, sent as its text. */
-async function withBody(name, args) {
-  if (name !== "mem_set" || typeof args.path !== "string" || !args.path) return args;
-  const root = await fs.realpath(process.cwd());
-  const full = await fs.realpath(path.resolve(root, args.path));
-  const inside = path.relative(root, full);
-  if (inside.startsWith("..") || path.isAbsolute(inside)) throw new Error(`${args.path} is outside ${root}`);
-  const { path: _, ...rest } = args;
-  return { ...rest, text: await fs.readFile(full, "utf8") };
+/** mem_set's `path`: a file inside this session's folder, sent as its text.
+ *  orch_* tools: attach the session's chat key (from acp-proxy's BUZZHOST_CHAT)
+ *  and working directory so buzz-host can enforce owner-initiated chat checks,
+ *  scope tasks to the conversation, and default the worker workspace. */
+async function prepareArgs(name, args) {
+  if (name === "mem_set" && typeof args.path === "string" && args.path) {
+    const root = await fs.realpath(process.cwd());
+    const full = await fs.realpath(path.resolve(root, args.path));
+    const inside = path.relative(root, full);
+    if (inside.startsWith("..") || path.isAbsolute(inside)) throw new Error(`${args.path} is outside ${root}`);
+    const { path: _, ...rest } = args;
+    return { ...rest, text: await fs.readFile(full, "utf8") };
+  }
+  if (name.startsWith("orch_")) {
+    const out = { ...args, cwd: process.cwd() };
+    if (name !== "orch_list") out.chat = process.env.BUZZHOST_CHAT || "";
+    return out;
+  }
+  return args;
 }
 const runDir = path.join(process.env.XDG_RUNTIME_DIR || `/run/user/${process.getuid()}`, "buzz-host");
 const SOCKET = path.join(runDir, "attention.sock");
 const CALL_TIMEOUT_MS = 60_000;
+const ORCH_WAIT_DEFAULT_MS = 120_000;
+const ORCH_WAIT_MAX_MS = 600_000;
 
-function call(name, args) {
+function timeoutFor(name, args) {
+  if (name !== "orch_wait") return CALL_TIMEOUT_MS;
+  const requested = Number.isFinite(args?.timeoutMs) ? args.timeoutMs : ORCH_WAIT_DEFAULT_MS;
+  return Math.min(Math.max(requested, 1_000), ORCH_WAIT_MAX_MS) + 15_000;
+}
+
+function call(name, args, timeoutMs = CALL_TIMEOUT_MS) {
   return new Promise((resolve, reject) => {
     const sock = createConnection(SOCKET);
     let buf = "";
     const timer = setTimeout(() => {
       sock.destroy();
       reject(new Error("buzz-host did not answer"));
-    }, CALL_TIMEOUT_MS);
+    }, timeoutMs);
     sock.setEncoding("utf8");
     sock.on("connect", () => sock.write(`${JSON.stringify({ pubkey, name, args })}\n`));
     sock.on("data", (chunk) => {
@@ -105,6 +129,11 @@ async function handle(request) {
               ]
             : []),
           ...(computerModule ? [computerModule.instructions(pubkey)] : []),
+          ...(withOrchestrate
+            ? [
+                "Orchestration: you can spawn ephemeral worker sessions on other runtimes (claude, codex, hermes, antigravity) with orch_capabilities, orch_delegate, orch_wait, orch_status, orch_list, orch_steer, and orch_cancel.",
+              ]
+            : []),
         ].join("\n"),
       };
     case "ping":
@@ -128,7 +157,8 @@ async function handle(request) {
       }
       try {
         if (!TOOLS.some((t) => t.name === name)) throw new Error(`No tool ${name}`);
-        const text = await call(name, await withBody(name, params?.arguments ?? {}));
+        const prepared = await prepareArgs(name, params?.arguments ?? {});
+        const text = await call(name, prepared, timeoutFor(name, prepared));
         return { content: [{ type: "text", text }] };
       } catch (error) {
         return { content: [{ type: "text", text: String(error.message ?? error) }], isError: true };

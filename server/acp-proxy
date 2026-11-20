@@ -106,6 +106,8 @@ CANVAS_TTL = 15  # seconds a chat's Canvas read is reused
 UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
 restore_file = os.path.join(agent_dir, "model-restore.json") if agent_dir else ""
+turn_authors_file = os.path.join(agent_dir, "turn-authors.json") if agent_dir else ""
+TURN_AUTHORS_CAP = 200
 # The command that compacts a session, by runtime, until it lists its own.
 COMPACT_COMMANDS = ("compact", "compress")
 DEFAULT_COMPACT = {
@@ -246,6 +248,46 @@ def save_restore_point(sid, restore):
             os.replace(tmp, restore_file)
         except OSError as e:
             log(f"saving {restore_file} failed: {e}")
+
+
+def record_turn_author(key, author, event_id=""):
+    """Persist the latest person-authored turn per chat for orchestrator's
+    owner-initiated chat gate and the plugin's per-message card."""
+    if not turn_authors_file or not key:
+        return
+    author = str(author or "").lower()
+    if not HEX64_RE.match(author):
+        return
+    if agent_pubkey and author == agent_pubkey.lower():
+        return
+    event_id = str(event_id or "").lower()
+    if not HEX64_RE.match(event_id):
+        event_id = ""
+    with lock:
+        try:
+            with open(turn_authors_file) as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                data = {}
+        except (OSError, ValueError):
+            data = {}
+        data[key] = {"author": author, "eventId": event_id, "at": int(time.time())}
+        if len(data) > TURN_AUTHORS_CAP:
+            keep = sorted(
+                data.items(),
+                key=lambda kv: (kv[1].get("at", 0) if isinstance(kv[1], dict) else 0),
+                reverse=True,
+            )[:TURN_AUTHORS_CAP]
+            data = dict(keep)
+        try:
+            tmp = f"{turn_authors_file}.{os.getpid()}.{threading.get_ident()}.tmp"
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as f:
+                json.dump(data, f, indent=2)
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, turn_authors_file)
+        except OSError as e:
+            log(f"saving {turn_authors_file} failed: {e}")
 
 
 def picks_of(events):
@@ -1018,12 +1060,13 @@ def handle_client_line(line):
                 return None
         stripped, turn = take_turn_meta(params)
         text = "\n".join(b.get("text", "") for b in params.get("prompt") or [] if isinstance(b, dict))
+        parsed_last = None
         if turn:
             key, root, events = turn
         else:
             # No events named (a wake or heartbeat, or an unpatched buzz-acp):
             # the chat from the prompt, and no commands or picks.
-            key, root, _last, _count = parse_prompt(text)
+            key, root, parsed_last, _count = parse_prompt(text)
             events = []
         ev = events[-1] if events else None
         last = (str(ev.get("id", "")), str(ev.get("pubkey", "")), str(ev.get("content", ""))) if ev else None
@@ -1049,6 +1092,11 @@ def handle_client_line(line):
                                  daemon=True).start()
                 return None
             handle_command(None, command[0], command[1], sid, settings_key, root or None)
+        if key:
+            if ev is not None:
+                record_turn_author(key, ev.get("pubkey", ""), ev.get("id", ""))
+            elif parsed_last is not None:
+                record_turn_author(key, parsed_last[1], parsed_last[0])
         with lock:
             s["running"] = s.get("running", 0) + 1
             pending_prompt[msg["id"]] = sid

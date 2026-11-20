@@ -509,5 +509,65 @@ class ReplyFallbackAndMcpLabel(Base):
         self.assertEqual(servers["other"]["env"], [])
 
 
+class TurnAuthors(Base):
+    def read_authors(self):
+        with open(self.p.turn_authors_file) as f:
+            return json.load(f)
+
+    def test_records_last_meta_event_author_and_mode_0600(self):
+        self.new(root=ROOT)
+        e1, e2 = "1" * 64, "2" * 64
+        self.p.handle_client_line(prompt_meta(
+            "p1", "s1", [ev("hi", OTHER, eid=e1), ev("do it", OWNER, eid=e2)], root=ROOT,
+        ))
+        data = self.read_authors()
+        key = f"{CHANNEL}_{ROOT}"
+        self.assertEqual(data[key]["author"], OWNER)
+        self.assertEqual(data[key]["eventId"], e2)
+        self.assertIsInstance(data[key]["at"], int)
+        self.assertEqual(os.stat(self.p.turn_authors_file).st_mode & 0o777, 0o600)
+
+    def test_fallback_to_prompt_text_and_non_owner_overwrites_and_wake_preserves(self):
+        self.new()
+        # Fallback from prompt text (no _meta.buzzHost) records owner.
+        self.turn(rid="p1", author=OWNER)
+        data = self.read_authors()
+        self.assertEqual(data[CHANNEL]["author"], OWNER)
+        self.assertEqual(data[CHANNEL]["eventId"], "e" * 64)
+
+        # A wake (no events in meta or prompt) leaves the existing record unchanged.
+        wake = line({"jsonrpc": "2.0", "id": "p2", "method": "session/prompt", "params": {
+            "sessionId": "s1",
+            "prompt": [{"type": "text", "text": f"Channel: test (#{CHANNEL})\n<attention-wake>check</attention-wake>"}],
+        }})
+        self.p.handle_client_line(wake)
+        self.assertEqual(self.read_authors()[CHANNEL]["author"], OWNER)
+
+        # A non-owner turn overwrites the chat's author.
+        e3 = "3" * 64
+        self.p.handle_client_line(prompt_meta("p3", "s1", [ev("hey", OTHER, eid=e3)]))
+        self.assertEqual(self.read_authors()[CHANNEL]["author"], OTHER)
+        self.assertEqual(self.read_authors()[CHANNEL]["eventId"], e3)
+
+        # Agent's own pubkey is ignored.
+        self.p.agent_pubkey = AGENT
+        self.p.handle_client_line(prompt_meta("p4", "s1", [ev("self", AGENT, eid="4" * 64)]))
+        self.assertEqual(self.read_authors()[CHANNEL]["author"], OTHER)
+
+    def test_caps_turn_authors_at_200_chats(self):
+        self.p.TURN_AUTHORS_CAP = 3
+        now = [1000]
+        orig_time = self.p.time.time
+        self.p.time.time = lambda: now[0]
+        try:
+            for i in range(5):
+                now[0] = 1000 + i
+                self.p.record_turn_author(f"chat-{i}", OWNER, f"{i:064x}")
+        finally:
+            self.p.time.time = orig_time
+        data = self.read_authors()
+        self.assertEqual(set(data.keys()), {"chat-2", "chat-3", "chat-4"})
+
+
 if __name__ == "__main__":
     unittest.main()

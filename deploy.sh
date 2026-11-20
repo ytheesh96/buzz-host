@@ -4,7 +4,7 @@ set -euo pipefail
 HOST="${1:-omarchy}"
 cd "$(dirname "$0")/server"
 ssh "$HOST" 'mkdir -p ~/.local/lib/buzz-host/{bin,shims,agent-bin} ~/.config/systemd/user'
-scp -q buzz-host.mjs agent-run attention.mjs attention-core.mjs buzz-mcp.mjs memory.mjs nip44.mjs attention-relay.mjs noble.mjs workspace.mjs catalog.mjs "$HOST":.local/lib/buzz-host/
+scp -q buzz-host.mjs agent-run attention.mjs attention-core.mjs buzz-mcp.mjs memory.mjs nip44.mjs attention-relay.mjs noble.mjs workspace.mjs catalog.mjs orchestrator.mjs "$HOST":.local/lib/buzz-host/
 # Agent desktops (Xvnc + Xfce + cua-driver per agent; see README "Agent desktops").
 ssh "$HOST" 'rm -rf ~/.local/lib/buzz-host/desktop && mkdir -p ~/.local/lib/buzz-host/desktop'
 scp -q desktop/*.mjs desktop/launcher.sh desktop/wallpaper.png "$HOST":.local/lib/buzz-host/desktop/
