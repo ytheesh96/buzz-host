@@ -12,7 +12,7 @@ const source = fs.readFileSync(path.join(here, "plugin.js"), "utf8");
 
 function loadOrchHelpers() {
   const start = source.indexOf("  // ----- Orchestrator, in Settings and as an in-chat worker card -----");
-  const end = source.indexOf("  const orchestratorAgents =", start);
+  const end = source.indexOf("  // Coalesce concurrent/rapid", start);
   assert.ok(start >= 0 && end > start, "orchestrator helper block present");
   const snippet = source.slice(start, end);
   return new Function(
@@ -46,15 +46,21 @@ test("orchestrator UI helpers format badges, elapsed time, and select turn tasks
     { taskId: "t1", originEventId: "e1", status: "completed", createdAt: 1000 },
     { taskId: "t2", originEventId: "e2", status: "running", createdAt: 2000 },
     { taskId: "t3", originEventId: "e1", status: "failed", createdAt: 1500 },
+    { taskId: "t4", originEventId: "", status: "running", createdAt: 2100 },
   ];
   // Exact originEventId match wins over other live tasks in the chat.
   assert.deepEqual(
-    orchSelectTasks(tasks, { messageId: "e1", since: 1900 }).map((t) => t.taskId),
+    orchSelectTasks(tasks, { messageId: "e1", since: 1900, live: false }).map((t) => t.taskId),
     ["t1", "t3"],
   );
-  // Fallback when no task carries this messageId: live tasks or tasks since turn start.
+  // Older completed turn with no matching originEventId never latches onto later/live tasks.
   assert.deepEqual(
-    orchSelectTasks(tasks, { messageId: "e-other", since: 1400 }).map((t) => t.taskId),
-    ["t3", "t2"],
+    orchSelectTasks(tasks, { messageId: "e-old", since: 500, live: false }).map((t) => t.taskId),
+    [],
+  );
+  // Live turn with no exact match falls back ONLY to unscoped (no originEventId) tasks.
+  assert.deepEqual(
+    orchSelectTasks(tasks, { messageId: "e-live", since: 2050, live: true }).map((t) => t.taskId),
+    ["t4"],
   );
 });

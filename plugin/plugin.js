@@ -1782,13 +1782,36 @@ export function apply(ctx) {
         return { label: String(status || "Unknown"), color: "var(--text-secondary)", bg: "var(--surface-inset)" };
     }
   }
-  function orchSelectTasks(tasks, { messageId, since }) {
+  function orchSelectTasks(tasks, { messageId, since, live = false }) {
     const list = Array.isArray(tasks) ? tasks : [];
     const exact = messageId ? list.filter((t) => t.originEventId === messageId) : [];
     const chosen = exact.length
       ? exact
-      : list.filter((t) => ORCH_LIVE_STATUSES.has(t.status) || (Number.isFinite(since) && (t.createdAt || t.startedAt || 0) >= since));
+      : live
+        ? list.filter(
+            (t) =>
+              !t.originEventId &&
+              (ORCH_LIVE_STATUSES.has(t.status) || (Number.isFinite(since) && (t.createdAt || t.startedAt || 0) >= since)),
+          )
+        : [];
     return [...chosen].sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
+  }
+
+  // Coalesce concurrent/rapid orchestrator.tasks RPCs for the same agent+chat
+  // across multiple rendered message rows in the channel.
+  const orchChatFetches = new Map(); // key -> { at, promise }
+  function fetchOrchChatTasks(pubkey, channelId, threadRootId) {
+    const key = `${pubkey}:${channelId || ""}:${threadRootId || ""}`;
+    const hit = orchChatFetches.get(key);
+    if (hit && Date.now() - hit.at < 1000) return hit.promise;
+    const promise = client
+      .call("orchestrator.tasks", { pubkey, channelId, threadRootId: threadRootId || undefined }, { timeoutMs: 15000 })
+      .catch((err) => {
+        if (orchChatFetches.get(key)?.promise === promise) orchChatFetches.delete(key);
+        throw err;
+      });
+    orchChatFetches.set(key, { at: Date.now(), promise });
+    return promise;
   }
 
   const orchestratorAgents = (() => {
@@ -1926,13 +1949,12 @@ export function apply(ctx) {
             ? h(ui?.Button ?? "button", { size: "sm", type: "button", onClick: () => refresh() }, "Retry")
             : null,
       },
-      on &&
-        liveCount > 0 && {
-          key: "stop-workers",
-          title: "Stop active workers",
-          subtitle: `Cancels all ${liveCount} running or queued worker task${liveCount === 1 ? "" : "s"} for ${name}.`,
-          action: { label: busy === "stop" ? "Stopping…" : "Stop all", onClick: () => void stopAll() },
-        },
+      liveCount > 0 && {
+        key: "stop-workers",
+        title: "Stop active workers",
+        subtitle: `Cancels all ${liveCount} running or queued worker task${liveCount === 1 ? "" : "s"} for ${name}.`,
+        action: { label: busy === "stop" ? "Stopping…" : "Stop all", onClick: () => void stopAll() },
+      },
     ].filter(Boolean);
 
     if (ui)
@@ -2013,16 +2035,28 @@ export function apply(ctx) {
     const [stoppingIds, setStoppingIds] = React.useState(() => new Set());
     const [error, setError] = React.useState("");
     const [now, setNow] = React.useState(() => Date.now());
+    const mountedRef = React.useRef(true);
     const expandedRef = React.useRef(expanded);
     expandedRef.current = expanded;
     const fullTasksRef = React.useRef(fullTasks);
     fullTasksRef.current = fullTasks;
+    const loadingFullRef = React.useRef(new Set());
+
+    React.useEffect(() => {
+      mountedRef.current = true;
+      return () => {
+        mountedRef.current = false;
+      };
+    }, []);
 
     const loadFull = React.useCallback(
       async (taskId) => {
-        setLoadingFull((prev) => new Set(prev).add(taskId));
+        if (loadingFullRef.current.has(taskId)) return;
+        loadingFullRef.current.add(taskId);
+        if (mountedRef.current) setLoadingFull((prev) => new Set(prev).add(taskId));
         try {
           const r = await client.call("orchestrator.tasks", { pubkey, taskId, full: true }, { timeoutMs: 15000 });
+          if (!mountedRef.current) return;
           const full = r.task ?? (r.tasks ?? []).find((t) => t.taskId === taskId);
           if (full) {
             setFullTasks((prev) => {
@@ -2032,13 +2066,16 @@ export function apply(ctx) {
             });
           }
         } catch (e) {
-          setError(String(e.message ?? e));
+          if (mountedRef.current) setError(String(e.message ?? e));
         } finally {
-          setLoadingFull((prev) => {
-            const next = new Set(prev);
-            next.delete(taskId);
-            return next;
-          });
+          loadingFullRef.current.delete(taskId);
+          if (mountedRef.current) {
+            setLoadingFull((prev) => {
+              const next = new Set(prev);
+              next.delete(taskId);
+              return next;
+            });
+          }
         }
       },
       [pubkey],
@@ -2055,13 +2092,9 @@ export function apply(ctx) {
         let keepPolling = live;
         if (document.visibilityState !== "hidden") {
           try {
-            const r = await client.call(
-              "orchestrator.tasks",
-              { pubkey, channelId, threadRootId: threadRootId || undefined },
-              { timeoutMs: 15000 },
-            );
+            const r = await fetchOrchChatTasks(pubkey, channelId, threadRootId);
             if (stopped) return;
-            const selected = orchSelectTasks(r.tasks, { messageId, since });
+            const selected = orchSelectTasks(r.tasks, { messageId, since, live });
             orchTasksCache.set(turnId, selected);
             setTasks(selected);
             setError("");
@@ -2070,7 +2103,14 @@ export function apply(ctx) {
             if (selected.length > 0) wait = 1500;
             for (const tid of expandedRef.current) {
               const match = selected.find((t) => t.taskId === tid);
-              if (match && (ORCH_LIVE_STATUSES.has(match.status) || !fullTasksRef.current.has(tid))) {
+              const prevFull = fullTasksRef.current.get(tid);
+              if (
+                match &&
+                (ORCH_LIVE_STATUSES.has(match.status) ||
+                  !prevFull ||
+                  prevFull.status !== match.status ||
+                  prevFull.updatedAt !== match.updatedAt)
+              ) {
                 void loadFull(tid);
               }
             }
@@ -2096,15 +2136,14 @@ export function apply(ctx) {
     if (!tasks.length) return null;
 
     const toggleExpand = (taskId) => {
+      const opening = !expandedRef.current.has(taskId);
       setExpanded((prev) => {
         const next = new Set(prev);
         if (next.has(taskId)) next.delete(taskId);
-        else {
-          next.add(taskId);
-          void loadFull(taskId);
-        }
+        else next.add(taskId);
         return next;
       });
+      if (opening) void loadFull(taskId);
     };
 
     const cancelTask = async (taskId) => {

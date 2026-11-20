@@ -72,7 +72,8 @@ const ORCH_WAIT_MAX_MS = 600_000;
 
 function timeoutFor(name, args) {
   if (name !== "orch_wait") return CALL_TIMEOUT_MS;
-  const requested = Number.isFinite(args?.timeoutMs) ? args.timeoutMs : ORCH_WAIT_DEFAULT_MS;
+  const parsed = Number(args?.timeoutMs);
+  const requested = Number.isFinite(parsed) ? parsed : ORCH_WAIT_DEFAULT_MS;
   return Math.min(Math.max(requested, 1_000), ORCH_WAIT_MAX_MS) + 15_000;
 }
 
@@ -80,9 +81,16 @@ function call(name, args, timeoutMs = CALL_TIMEOUT_MS) {
   return new Promise((resolve, reject) => {
     const sock = createConnection(SOCKET);
     let buf = "";
+    let settled = false;
+    const finish = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      fn(value);
+    };
     const timer = setTimeout(() => {
       sock.destroy();
-      reject(new Error("buzz-host did not answer"));
+      finish(reject, new Error("buzz-host did not answer"));
     }, timeoutMs);
     sock.setEncoding("utf8");
     sock.on("connect", () => sock.write(`${JSON.stringify({ pubkey, name, args })}\n`));
@@ -90,23 +98,25 @@ function call(name, args, timeoutMs = CALL_TIMEOUT_MS) {
       buf += chunk;
       const i = buf.indexOf("\n");
       if (i < 0) return;
-      clearTimeout(timer);
       sock.end();
       try {
         const reply = JSON.parse(buf.slice(0, i));
-        if (reply.error) reject(new Error(reply.error));
-        else resolve(reply.result);
+        if (reply.error) finish(reject, new Error(reply.error));
+        else finish(resolve, reply.result);
       } catch (error) {
-        reject(error);
+        finish(reject, error);
       }
     });
     sock.on("error", (error) => {
-      clearTimeout(timer);
-      reject(
+      finish(
+        reject,
         error.code === "ENOENT" || error.code === "ECONNREFUSED"
           ? new Error("buzz-host is not running on this host")
           : error,
       );
+    });
+    sock.on("close", () => {
+      finish(reject, new Error("buzz-host closed the connection before answering"));
     });
   });
 }

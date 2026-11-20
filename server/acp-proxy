@@ -71,7 +71,7 @@
 
 Everything else passes through byte for byte.
 """
-import json, os, re, shlex, socket, subprocess, sys, threading, time
+import json, os, re, shlex, signal, socket, subprocess, sys, threading, time
 
 CHANNEL_RE = re.compile(r"^Channel: .*\(#([0-9a-f-]{36})\)\s*$", re.M)
 THREAD_RE = re.compile(r"^Thread root: ([0-9a-f]{64})\s*$", re.M)
@@ -108,6 +108,8 @@ HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
 restore_file = os.path.join(agent_dir, "model-restore.json") if agent_dir else ""
 turn_authors_file = os.path.join(agent_dir, "turn-authors.json") if agent_dir else ""
 TURN_AUTHORS_CAP = 200
+session_chats_file = os.path.join(agent_dir, "session-chats.json") if agent_dir else ""
+SESSION_CHATS_CAP = 500
 # The command that compacts a session, by runtime, until it lists its own.
 COMPACT_COMMANDS = ("compact", "compress")
 DEFAULT_COMPACT = {
@@ -288,6 +290,55 @@ def record_turn_author(key, author, event_id=""):
             os.replace(tmp, turn_authors_file)
         except OSError as e:
             log(f"saving {turn_authors_file} failed: {e}")
+
+
+def load_session_chats():
+    if not session_chats_file:
+        return {}
+    try:
+        with open(session_chats_file) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_session_chat(sid, key):
+    """Remember sessionId -> chatKey across restarts so session/load and
+    session/resume still label buzz-mcp with BUZZHOST_CHAT."""
+    if not session_chats_file or not sid or not key:
+        return
+    with lock:
+        data = load_session_chats()
+        prev = data.get(sid)
+        if isinstance(prev, dict) and prev.get("key") == key:
+            return
+        data[sid] = {"key": key, "at": int(time.time())}
+        if len(data) > SESSION_CHATS_CAP:
+            keep = sorted(
+                data.items(),
+                key=lambda kv: (kv[1].get("at", 0) if isinstance(kv[1], dict) else 0),
+                reverse=True,
+            )[:SESSION_CHATS_CAP]
+            data = dict(keep)
+        try:
+            tmp = f"{session_chats_file}.{os.getpid()}.{threading.get_ident()}.tmp"
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as f:
+                json.dump(data, f, indent=2)
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, session_chats_file)
+        except OSError as e:
+            log(f"saving {session_chats_file} failed: {e}")
+
+
+def session_chat_for(sid):
+    entry = load_session_chats().get(sid)
+    if isinstance(entry, dict):
+        return entry.get("key") or ""
+    if isinstance(entry, str):
+        return entry
+    return ""
 
 
 def picks_of(events):
@@ -1044,12 +1095,39 @@ def handle_client_line(line):
         msg["params"] = params
         return (json.dumps(msg, separators=(",", ":")) + "\n").encode()
     if method in ("session/new", "session/load", "session/resume") and "id" in msg:
+        sid = params.get("sessionId")
         with lock:
-            pending_new[msg["id"]] = params.get("sessionId")
+            pending_new[msg["id"]] = sid
         if method == "session/new" and "buzzHost" in (params.get("_meta") or {}):
             start_in_workspace(msg["id"], params)
             msg["params"] = params
             return (json.dumps(msg, separators=(",", ":")) + "\n").encode()
+        if method in ("session/load", "session/resume"):
+            key = ""
+            stripped_meta = False
+            meta = params.get("_meta")
+            if isinstance(meta, dict) and "buzzHost" in meta:
+                conv = meta.pop("buzzHost", None)
+                stripped_meta = True
+                if not meta:
+                    params.pop("_meta")
+                if isinstance(conv, dict):
+                    ch, rt = conv.get("channelId") or "", conv.get("rootEventId")
+                    if UUID_RE.match(ch) and (not rt or HEX64_RE.match(str(rt))):
+                        key = f"{ch}_{rt}" if rt else ch
+            if not key and sid:
+                key = session_chat_for(sid)
+            if key:
+                label_mcp(params, key)
+                if sid:
+                    with lock:
+                        sessions.setdefault(sid, {})["key"] = key
+                    save_session_chat(sid, key)
+                msg["params"] = params
+                return (json.dumps(msg, separators=(",", ":")) + "\n").encode()
+            if stripped_meta:
+                msg["params"] = params
+                return (json.dumps(msg, separators=(",", ":")) + "\n").encode()
     elif method == "session/prompt" and "id" in msg:
         sid = params.get("sessionId")
         with lock:
@@ -1060,13 +1138,12 @@ def handle_client_line(line):
                 return None
         stripped, turn = take_turn_meta(params)
         text = "\n".join(b.get("text", "") for b in params.get("prompt") or [] if isinstance(b, dict))
-        parsed_last = None
         if turn:
             key, root, events = turn
         else:
             # No events named (a wake or heartbeat, or an unpatched buzz-acp):
             # the chat from the prompt, and no commands or picks.
-            key, root, parsed_last, _count = parse_prompt(text)
+            key, root, _last, _count = parse_prompt(text)
             events = []
         ev = events[-1] if events else None
         last = (str(ev.get("id", "")), str(ev.get("pubkey", "")), str(ev.get("content", ""))) if ev else None
@@ -1076,6 +1153,8 @@ def handle_client_line(line):
                 s["key"] = key
             key = s.get("key")
             s["last_used"] = time.monotonic()
+        if turn and sid and key:
+            save_session_chat(sid, key)
         command = command_of(last) if key else None
         if command:
             event_id = last[0]
@@ -1092,11 +1171,15 @@ def handle_client_line(line):
                                  daemon=True).start()
                 return None
             handle_command(None, command[0], command[1], sid, settings_key, root or None)
-        if key:
-            if ev is not None:
-                record_turn_author(key, ev.get("pubkey", ""), ev.get("id", ""))
-            elif parsed_last is not None:
-                record_turn_author(key, parsed_last[1], parsed_last[0])
+        # Only trust structured _meta.buzzHost events (never untrusted prompt text)
+        # for the owner-initiated chat gate.
+        if turn and key and events:
+            me = agent_pubkey.lower()
+            for item in reversed(events):
+                author = str(item.get("pubkey", "")).lower()
+                if HEX64_RE.match(author) and (not me or author != me):
+                    record_turn_author(key, author, item.get("id", ""))
+                    break
         with lock:
             s["running"] = s.get("running", 0) + 1
             pending_prompt[msg["id"]] = sid
@@ -1182,6 +1265,8 @@ def handle_adapter_line(line):
                     s["options"] = (msg.get("result") or {}).get("configOptions") or s.get("options") or []
                     if ws:
                         s.update(ws)
+                        if ws.get("key"):
+                            save_session_chat(sid, ws["key"])
             elif rid in pending_prompt:
                 sid = pending_prompt.pop(rid)
                 if sid in sessions:
@@ -1251,6 +1336,12 @@ if __name__ == "__main__":
     if len(sys.argv) < 2:
         sys.exit("usage: acp-proxy <adapter> [args...]")
     child = subprocess.Popen(sys.argv[1:], stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0)
+    def _forward_term(_signum, _frame):
+        try:
+            child.terminate()
+        except OSError:
+            pass
+    signal.signal(signal.SIGTERM, _forward_term)
     if control_sock:
         threading.Thread(target=serve_control, daemon=True).start()
     threading.Thread(target=pump_client, daemon=True).start()

@@ -11,7 +11,7 @@ import path from "node:path";
 import readline from "node:readline";
 import { fileURLToPath } from "node:url";
 import { createAttention } from "./attention.mjs";
-import { ORCHESTRATOR_TOOLS } from "./orchestrator.mjs";
+import { createOrchestrator, ORCHESTRATOR_TOOLS } from "./orchestrator.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PUBKEY = "a".repeat(64);
@@ -163,6 +163,81 @@ test("buzz-mcp.mjs exposes orch_* only with --orchestrate and injects chat/cwd",
       await orch.close();
     }
   } finally {
+    await attention.stop();
+    await fs.rm(tmp, { recursive: true, force: true });
+  }
+});
+
+test("end-to-end: buzz-mcp.mjs --orchestrate -> attention.sock -> createOrchestrator", async () => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "buzz-orch-e2e-"));
+  const dataDir = path.join(tmp, "agents");
+  const stateDir = path.join(tmp, "orchestrator");
+  const shimsDir = path.join(tmp, "shims");
+  const xdgRun = path.join(tmp, "xdg");
+  const runDir = path.join(xdgRun, "buzz-host");
+  const workDir = path.join(tmp, "work");
+  const owner = "9".repeat(64);
+  const eventId = "7".repeat(64);
+  await fs.mkdir(path.join(dataDir, PUBKEY), { recursive: true });
+  await fs.mkdir(shimsDir, { recursive: true });
+  await fs.mkdir(workDir, { recursive: true });
+
+  await fs.writeFile(
+    path.join(dataDir, PUBKEY, "meta.json"),
+    JSON.stringify({ pubkey: PUBKEY, name: "haiku", owner, runtime: "claude", orchestrate: true }),
+  );
+  await fs.writeFile(
+    path.join(dataDir, PUBKEY, "turn-authors.json"),
+    JSON.stringify({ [CHAT]: { author: owner, eventId, at: Math.floor(Date.now() / 1000) } }),
+  );
+  const shim = `#!/usr/bin/env node
+import readline from "node:readline";
+const send = (o) => process.stdout.write(JSON.stringify(o) + "\\n");
+readline.createInterface({ input: process.stdin }).on("line", (line) => {
+  if (!line.trim()) return;
+  const m = JSON.parse(line);
+  if (m.method === "initialize") return send({ jsonrpc: "2.0", id: m.id, result: { protocolVersion: 1 } });
+  if (m.method === "session/new") return send({ jsonrpc: "2.0", id: m.id, result: { sessionId: "s1", configOptions: [] } });
+  if (m.method === "session/prompt") {
+    send({ jsonrpc: "2.0", method: "session/update", params: { update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "e2e-ok" } } } });
+    return send({ jsonrpc: "2.0", id: m.id, result: { stopReason: "end_turn" } });
+  }
+});
+`;
+  await fs.writeFile(path.join(shimsDir, "claude-agent-acp"), shim, { mode: 0o755 });
+  await fs.chmod(path.join(shimsDir, "claude-agent-acp"), 0o755);
+
+  const orchestrator = createOrchestrator({
+    dataDir,
+    stateDir,
+    shimsDir,
+    limits: { idleDrainMs: 30 },
+  });
+  const attention = createAttention({ dataDir, runDir, extra: [orchestrator] });
+  await attention.start();
+  const mcp = startMcp([PUBKEY, "--orchestrate"], { XDG_RUNTIME_DIR: xdgRun, BUZZHOST_CHAT: CHAT }, workDir);
+  try {
+    const del = await mcp.rpc("tools/call", {
+      name: "orch_delegate",
+      arguments: { runtime: "claude", prompt: "ping" },
+    });
+    assert.equal(del.isError, undefined);
+    const task = JSON.parse(del.content[0].text);
+    assert.equal(task.originEventId, eventId);
+    assert.equal(task.workspace, workDir);
+
+    const waitRes = await mcp.rpc("tools/call", {
+      name: "orch_wait",
+      arguments: { taskId: task.taskId, timeoutMs: 5000 },
+    });
+    assert.equal(waitRes.isError, undefined);
+    const waited = JSON.parse(waitRes.content[0].text);
+    assert.equal(waited.timedOut, false);
+    assert.equal(waited.task.status, "completed");
+    assert.equal(waited.task.result.text, "e2e-ok");
+  } finally {
+    await mcp.close();
+    await orchestrator.close();
     await attention.stop();
     await fs.rm(tmp, { recursive: true, force: true });
   }

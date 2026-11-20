@@ -829,16 +829,19 @@ const methods = {
     }
     return { enabled: next.orchestrate };
   },
-  async "orchestrator.tasks"(config, { pubkey, channelId, threadRootId, taskId, full }) {
+  async "orchestrator.tasks"(config, { pubkey, channelId, threadRootId, taskId, since, full }) {
     checkPubkey(pubkey);
     if (channelId != null) checkPlace(channelId, threadRootId);
     if (taskId != null && (typeof taskId !== "string" || !taskId)) throw new Error("Invalid taskId");
+    const parsedSince = since != null ? Number(since) : undefined;
+    if (since != null && !Number.isFinite(parsedSince)) throw new Error("Invalid since timestamp");
     const m = await meta(pubkey);
     const view = await orchestrator.tasks({
       pubkey,
       channelId: channelId || undefined,
       threadRootId: threadRootId || undefined,
       taskId: taskId || undefined,
+      since: parsedSince,
       full: full === true,
     });
     return {
@@ -856,18 +859,9 @@ const methods = {
 
   async remove(config, { pubkey }) {
     checkPubkey(pubkey);
-    await orchestrator
-      .tasks({ pubkey })
-      .then(async (view) => {
-        for (const t of view?.tasks ?? []) {
-          if (t.status === "queued" || t.status === "starting" || t.status === "running") {
-            await orchestrator.cancel({ pubkey, taskId: t.taskId }).catch(() => {});
-          }
-        }
-      })
-      .catch(() => {});
-    await desktop.stop(pubkey).catch(() => {});
     await systemctl("disable", "--now", unit(pubkey)).catch(() => {});
+    await orchestrator.forget(pubkey).catch(() => {});
+    await desktop.stop(pubkey).catch(() => {});
     await fs.rm(dir(pubkey), { recursive: true, force: true });
     watcher.sync(pubkey, null);
     attention.forget(pubkey);

@@ -40,8 +40,9 @@ const orchestrator = createOrchestrator({
 orchestrator.handles(name)                  // true for /^orch_/
 await orchestrator.call(pubkey, name, args) // string (JSON) for the MCP layer
 await orchestrator.capabilities(pubkey, { retry }) // object, for orch_capabilities
-await orchestrator.tasks({ pubkey, channelId, threadRootId, taskId, full })
+await orchestrator.tasks({ pubkey, channelId, threadRootId, taskId, since, full })
 await orchestrator.cancel({ pubkey, taskId })
+await orchestrator.forget(pubkey)           // cancels tasks & removes persisted state on agent delete
 await orchestrator.close()                  // kills live workers (host shutdown/tests)
 ```
 
@@ -130,12 +131,16 @@ the full record; transcripts are included for `orch_status` and `full: true`.
 ```
 
 `chatKey` is the same key `acp-proxy` already uses:
-`<channelId>` or `<channelId>_<threadRootId>`. It is written from
-`session/prompt`'s `_meta.buzzHost` events (the `events` array's last entry),
-falling back to the prompt text's `Event ID`/`From:`/`Content` block, and only
-when that event was written by a person. Wakes and turns that name no event
-leave it unchanged. `eventId` is used only for the plugin's per-message card;
-the gate checks `author === meta.owner`.
+`<channelId>` or `<channelId>_<threadRootId>`. It is written **only** from
+structured `session/prompt` `_meta.buzzHost.events` (the newest entry whose
+`pubkey` is a valid 64-hex key and not the agent itself), never from untrusted
+prompt text. Wakes and turns that name no structured event leave it unchanged.
+`eventId` is used only for the plugin's per-message card; the gate checks
+`author === meta.owner`.
+
+`acp-proxy` also persists `<agent dir>/session-chats.json` (`sessionId ->
+chatKey`, mode 0600, atomic rename) so `session/load` and `session/resume`
+after an agent restart still label `buzz-mcp.mjs` with `BUZZHOST_CHAT`.
 
 ## Socket / tool contract
 
