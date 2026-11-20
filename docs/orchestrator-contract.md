@@ -157,7 +157,7 @@ The host's `extra` chain routes the name to the orchestrator, which exposes
 |---|---|---|
 | `orch_capabilities` | `{ retry? }` | `{ runtimes: [{id,title,available,reason,models,current}], limit, maxDepth, active, queued, tasks }` |
 | `orch_delegate` | `runtime`, `prompt`, `model?`, `effort?`, `workspace?`, `label?`, `timeoutMs?` | full task (status `queued`/`starting`) |
-| `orch_wait` | `taskId`, `timeoutMs?` (default 120 s, max 600 s) | `{ task, timedOut }` |
+| `orch_wait` | `taskId`, `timeoutMs?` (default 120 s, max 600 s) | `{ task, timedOut, closed? }` |
 | `orch_status` | `taskId` | `{ task }` with transcript |
 | `orch_list` | `chat?`, `status?`, `limit?` | `{ tasks }` summaries |
 | `orch_steer` | `taskId`, `prompt` | full task; `steerQueued` ≥ 1 |
@@ -172,18 +172,21 @@ without blocking (the module waits at most ~2.5 s per runtime); otherwise
 
 `orch_steer` is a queued follow-up on the same session, not an injection: the
 driver sends it after the current `session/prompt` resolves (and its trailing
-`session/update` frames have gone idle). Steering a task that is `queued` (no
-session yet) or terminal fails without changing it.
+`session/update` frames have gone idle). At most 16 steers may wait on one
+task. Steering a task that is `queued` (no session yet) or terminal fails
+without changing it. `orch_wait` adds `closed: true` when buzz-host shuts down
+while it is waiting, so a caller never mistakes that for a finished task.
 
 ## Host RPCs (WebSocket methods)
 
 - `orchestrator.set { pubkey, enabled }` → `{ enabled }`. Persists
   `meta.orchestrate`, rewrites the agent's MCP wrapper, restarts the agent when
   the value changed. Mirrors `attention.set`.
-- `orchestrator.tasks { pubkey, channelId?, threadRootId?, taskId?, full? }` →
+- `orchestrator.tasks { pubkey, channelId?, threadRootId?, taskId?, since?, full? }` →
   `{ enabled, tasks, task? }`. Without `channelId`, all of the agent's tasks
   (Settings view). With it, only that chat (`channel_` + thread root when
-  given). `taskId` returns that one task; `full: true` includes transcripts.
+  given). `since` filters by `createdAt` (epoch ms). `taskId` returns that one
+  task; `full: true` includes transcripts.
   `enabled` comes from `meta.orchestrate`; the rest from
   `orchestrator.tasks(params)`.
 - `orchestrator.cancel { pubkey, taskId }` → `{ task }`. Owner-facing (the
