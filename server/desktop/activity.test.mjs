@@ -1,11 +1,12 @@
 // node --test server/desktop/
-import test from "node:test";
+import test, { after } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "buzz-desktop-activity-"));
+after(() => fs.rmSync(root, { recursive: true, force: true }));
 process.env.BUZZHOST_DESKTOP_ROOT = root;
 const desktop = await import("./desktop.mjs");
 

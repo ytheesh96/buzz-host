@@ -1,12 +1,16 @@
 // Phase 2: catch-up, queue and rate limits, against a fake relay that reads
 // as the Buzz relay does (newest first, ties by id ascending, before_id).
-import { test } from "node:test";
+import { after, test } from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { createAttention } from "../server/attention.mjs";
+
+// Temp dirs made by this file, removed when it finishes.
+const tmpDirs = [];
+after(() => Promise.all(tmpDirs.map((d) => fs.rm(d, { recursive: true, force: true }))));
 
 const AGENT = "a".repeat(64);
 const OTHER = "c".repeat(64);
@@ -70,6 +74,7 @@ function fakeRelay() {
 
 async function setup(relay, watch = {}) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "bh-catchup-"));
+  tmpDirs.push(root);
   const dataDir = path.join(root, "agents");
   const agentDir = path.join(dataDir, AGENT);
   await fs.mkdir(agentDir, { recursive: true });
