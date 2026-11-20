@@ -1,0 +1,32 @@
+From 309133e1d978bf0dd2b8d5e2993149d4ed519d36 Mon Sep 17 00:00:00 2001
+From: buzz-host <buzz-host@localhost>
+Date: Sat, 14 Nov 2026 03:00:40 -0500
+Subject: [PATCH 2/3] buzz-host: replay a new channel from 60s before the
+ membership notification
+
+Buzz signs a new chat's first message before the agent is added, so
+replaying from the notification's own timestamp skips it.
+---
+ crates/buzz-acp/src/lib.rs | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/crates/buzz-acp/src/lib.rs b/crates/buzz-acp/src/lib.rs
+index 240c06a37..8d6849246 100644
+--- a/crates/buzz-acp/src/lib.rs
++++ b/crates/buzz-acp/src/lib.rs
+@@ -3542,7 +3542,11 @@ async fn run_harness(
+                                         tracing::debug!(channel_id = %ch, "membership notification: channel already subscribed");
+                                     } else if let Some(filter) = config::resolve_dynamic_channel_filter(config, ch, &rules) {
+                                         tracing::info!(channel_id = %ch, "membership notification: subscribing to new channel");
+-                                        if let Err(e) = relay.subscribe_channel_from(ch, filter, Some(ts)).await {
++                                        // buzz-host patch: the client signs the first message
++                                        // before the add lands, so replay a little earlier than
++                                        // the membership notification (dedup drops repeats).
++                                        let replay_since = ts.saturating_sub(60);
++                                        if let Err(e) = relay.subscribe_channel_from(ch, filter, Some(replay_since)).await {
+                                             tracing::warn!("failed to subscribe to new channel {ch}: {e}");
+                                         } else {
+                                             subscribed_channel_ids.insert(ch);
+-- 
+2.56.0
+

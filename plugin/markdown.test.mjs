@@ -1,0 +1,152 @@
+// node --test plugin/  — the Attention tab's instructions render as Buzz's
+// InstructionsMarkdown does: the same samples through react-markdown with
+// remark-gfm and Buzz's components (from a buzz-app checkout, BUZZ_APP or
+// ~/Work/buzz-app), and through the plugin's renderer, give the same HTML.
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import { createRequire } from "node:module";
+import os from "node:os";
+import path from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+
+const here = path.dirname(fileURLToPath(import.meta.url));
+const app = process.env.BUZZ_APP ?? path.join(os.homedir(), "Work/buzz-app");
+const present = fs.existsSync(path.join(app, "node_modules/react-markdown"));
+
+const SAMPLES = {
+  agent: `## Watch haiku
+
+When [haiku](nostr:npub1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq) posts in #parity-test, tell the owner in **one line**:
+
+- quote what they said
+- say *where* it was
+
+Remove this watch when the owner asks.`,
+  inline: "Some *em*, **strong**, ~~gone~~, ~single~, `code\nwrapped`, a\\\nbreak and two  \nspaces. Entities: &amp; &copy; &#123; &notanentity;",
+  links:
+    "[web](https://example.com) [mail](mailto:a@b.co) [bad](javascript:alert(1)) [rel](/path) [hash](#top) [buzz](buzz://x)\n<https://auto.link> https://bare.example.com/x www.example.org a@b.co\n\n[ref][r] [collapsed][] [shortcut]\n\n[r]: https://ref.example\n[collapsed]: https://c.example\n[shortcut]: ftp://nope",
+  images: "![alt text](https://x/y.png) ![](https://x/z.png) ![ref img][i]\n\n[i]: https://i.example/a.png",
+  lists: `- tight one
+- tight two
+  - nested
+  - nested two
+- three
+
+1. loose
+
+2. loose two
+   with more
+
+7. starts at seven
+8. eight
+
+* [ ] todo
+* [x] done
+* [x]
+* [ ] > quote in task`,
+  looseTasks: "- [ ] first\n\n- [x] second\n\n  more text",
+  blocks: `Setext heading
+===
+
+> A quote
+> - with a list
+>
+> and a paragraph
+
+---
+
+\`\`\`js extra
+const x = 1;
+\`\`\`
+
+    indented code
+
+<div class="x">raw <b>html</b></div>
+
+Inline <span>html</span> here.`,
+  table: `| left | center | right | none |
+| :--- | :----: | ----: | ---- |
+| a | b | c |
+| *d* | \`e\` | [f](https://f.example) | g | extra |`,
+  headerOnly: "| a | b |\n| - | - |",
+  footnotes: "Text with a note[^1] and another[^big] and again[^1].\n\n[^1]: The note.\n[^big]: A bigger note\n\n    with a second paragraph.\n[^unused]: Never cited.",
+  headings: "# One\n## Two\n### Three\n#### Four\n##### Five\n###### Six\n####### not a heading",
+  empty: "",
+  whitespace: "   \n\n  ",
+};
+
+test("instructions render as Buzz's InstructionsMarkdown", { skip: !present && "no buzz-app checkout" }, async () => {
+  const require = createRequire(path.join(app, "package.json"));
+  const React = require("react");
+  const { renderToStaticMarkup } = require("react-dom/server");
+  const { JSDOM } = require(fs.realpathSync(path.join(app, "node_modules/.pnpm", fs.readdirSync(path.join(app, "node_modules/.pnpm")).find((n) => /^jsdom@/.test(n)), "node_modules/jsdom")));
+  const esm = async (name) => import(pathToFileURL(require.resolve(name)).href);
+  const { default: Markdown } = await esm("react-markdown");
+  const { default: remarkGfm } = await esm("remark-gfm");
+  const document = new JSDOM("").window.document;
+
+  // Buzz's side: InstructionsMarkdown's profile and components, with no
+  // OpenLink (as for an agent type's tab) and plain code blocks (no copy).
+  const h = React.createElement;
+  const strip = ({ node: _node, ...props }) => props;
+  const components = {
+    a: ({ href, children }) =>
+      !href || /^nostr:npub1[023456789acdefghjklmnpqrstuvwxyz]+$/.test(href)
+        ? h("span", null, children)
+        : h("a", { href, target: "_blank", rel: "noreferrer" }, children),
+    img: ({ alt }) => (alt ? h("span", null, alt) : null),
+    pre: (props) => h("pre", strip(props)),
+    table: (props) => h("table", strip(props)),
+  };
+  const buzz = (text) =>
+    renderToStaticMarkup(
+      h(
+        "div",
+        { className: "attention-markdown text-body-sm text-secondary" },
+        h(Markdown, {
+          remarkPlugins: [remarkGfm],
+          components,
+          urlTransform: (url) => (/^(https?:|mailto:|buzz:|nostr:|#)/i.test(url) ? url : ""),
+          children: text,
+        }),
+      ),
+    );
+
+  // The plugin's side: its renderer and the generated parser, from plugin.js.
+  const source = fs.readFileSync(path.join(here, "plugin.js"), "utf8");
+  const slice = (from, to) => {
+    const start = source.indexOf(from);
+    const end = source.indexOf(to, start);
+    assert.ok(start >= 0 && end > start, `plugin.js has ${from.trim()}`);
+    return source.slice(start, end);
+  };
+  const renderer = slice("  // ----- Instructions, rendered as Buzz renders them -----", "  function WatchRow(");
+  const parser = slice("// ---------- GENERATED by plugin/build-markdown.mjs", "// ---------- end GENERATED");
+  const { InstructionsMarkdown } = new Function("React", "h", "document", `${parser}\n${renderer}\nreturn { InstructionsMarkdown };`)(
+    React,
+    h,
+    document,
+  );
+  const ours = (text) => renderToStaticMarkup(h(InstructionsMarkdown, { text }));
+
+  // Whitespace between tags is layout-neutral here (the container is a grid).
+  const normal = (html) => html.replace(/>\s+</g, "><");
+  for (const [name, text] of Object.entries(SAMPLES)) assert.equal(normal(ours(text)), normal(buzz(text)), name);
+
+  // Past Buzz's limits, the source is shown as is.
+  const deep = `${"> ".repeat(120)}deep`;
+  assert.match(ours(deep), /^<div class="attention-markdown[^"]*"><pre[^>]*><code>&gt; &gt;/);
+
+  // With Buzz's Markdown stylesheet loaded, its hashed module classes are used:
+  // the module that has document, compact and imageAlt, not another `_compact_`.
+  const style = document.createElement("style");
+  style.textContent = `._compact_10qan_3 { color: red }
+    @layer x { ._document_m4s2h_1 p { margin: 0 } ._compact_m4s2h_252 h1 { margin: 0 } }
+    ._imageAlt_m4s2h_214 { font-style: italic } ._source_m4s2h_123 code { white-space: pre-wrap }`;
+  document.head.append(style);
+  const fresh = new Function("React", "h", "document", `${parser}\n${renderer}\nreturn { InstructionsMarkdown };`)(React, h, document);
+  const styled = (text) => renderToStaticMarkup(h(fresh.InstructionsMarkdown, { text }));
+  assert.match(styled("![pic](x.png)"), /^<div class="_document_m4s2h_1 _compact_m4s2h_252 attention-markdown [^"]*"><p><span class="_imageAlt_m4s2h_214">pic<\/span>/);
+  assert.match(styled(deep), /^<div class="_document_m4s2h_1 attention-markdown [^"]*"><pre class="_source_m4s2h_123"><code>/);
+});

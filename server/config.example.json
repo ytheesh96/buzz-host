@@ -1,0 +1,5 @@
+{
+  "port": 8457,
+  "allowLogins": ["you@example.com"],
+  "allowCommunities": ["wss://omarchy.tail65c5a9.ts.net:8446"]
+}

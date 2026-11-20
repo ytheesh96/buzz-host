@@ -1,0 +1,134 @@
+From 2276e7a65bc167a2900a05c7f15fec7d79a7bd41 Mon Sep 17 00:00:00 2001
+From: buzz-host <buzz-host@localhost>
+Date: Tue, 17 Nov 2026 02:39:11 -0500
+Subject: [PATCH] buzz-host: name the conversation in session/new
+ _meta.buzzHost
+
+---
+ crates/buzz-acp/src/acp.rs  | 74 +++++++++++++++++++++++++++++++++++++
+ crates/buzz-acp/src/pool.rs |  3 +-
+ 2 files changed, 76 insertions(+), 1 deletion(-)
+
+diff --git a/crates/buzz-acp/src/acp.rs b/crates/buzz-acp/src/acp.rs
+index d01127dc1..84caadc74 100644
+--- a/crates/buzz-acp/src/acp.rs
++++ b/crates/buzz-acp/src/acp.rs
+@@ -732,6 +732,22 @@ impl AcpClient {
+         mcp_servers: Vec<McpServer>,
+         system_prompt: Option<SystemPromptTransport<'_>>,
+         session_title: Option<&str>,
++    ) -> Result<SessionNewResponse, AcpError> {
++        self.session_new_scoped(cwd, mcp_servers, system_prompt, session_title, None)
++            .await
++    }
++
++    /// [`session_new_full`](Self::session_new_full), plus the Buzz conversation
++    /// the session is for in `_meta.buzzHost` (`channelId`, and `rootEventId`
++    /// for a thread). buzz-host's ACP proxy reads it (and removes it) to start
++    /// the session in that conversation's workspace folder.
++    pub async fn session_new_scoped(
++        &mut self,
++        cwd: &str,
++        mcp_servers: Vec<McpServer>,
++        system_prompt: Option<SystemPromptTransport<'_>>,
++        session_title: Option<&str>,
++        conversation: Option<&crate::scope::SessionScope>,
+     ) -> Result<SessionNewResponse, AcpError> {
+         let mut params = serde_json::json!({
+             "cwd": cwd,
+@@ -759,6 +775,12 @@ impl AcpClient {
+             params["_meta"]["claudeCode"]["options"]["extraArgs"]["thinking-display"] =
+                 serde_json::Value::String("summarized".to_owned());
+         }
++        if let Some(scope) = conversation {
++            params["_meta"]["buzzHost"] = serde_json::json!({
++                "channelId": scope.channel_id().to_string(),
++                "rootEventId": scope.root_event_id(),
++            });
++        }
+         let result = self.send_request("session/new", params).await?;
+         let session_id = result["sessionId"]
+             .as_str()
+@@ -3837,6 +3859,58 @@ mod tests {
+         );
+     }
+ 
++    #[tokio::test]
++    async fn session_new_scoped_names_the_conversation_in_meta() {
++        let script = r#"
++            read -t 2 _init
++            echo '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1,"agentCapabilities":{}}}'
++            read -t 2 REQ
++            echo '{"jsonrpc":"2.0","id":1,"result":{"sessionId":"ses_a","_receivedRequest":'"$REQ"'}}'
++            read -t 2 REQ
++            echo '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"ses_b","_receivedRequest":'"$REQ"'}}'
++            sleep 1
++        "#;
++        let mut client = spawn_script(script).await;
++        client
++            .initialize()
++            .await
++            .expect("initialize should succeed");
++        let channel_id = uuid::Uuid::parse_str("123e4567-e89b-42d3-a456-426614174000").unwrap();
++        let root = "a".repeat(64);
++
++        let thread = crate::scope::SessionScope::Thread {
++            channel_id,
++            root_event_id: root.clone(),
++        };
++        let resp = client
++            .session_new_scoped("/tmp", vec![], None, Some("Fizz"), Some(&thread))
++            .await
++            .expect("session_new_scoped should succeed");
++        let meta = &resp.raw["_receivedRequest"]["params"]["_meta"];
++        assert_eq!(
++            meta["buzzHost"]["channelId"].as_str(),
++            Some("123e4567-e89b-42d3-a456-426614174000")
++        );
++        assert_eq!(
++            meta["buzzHost"]["rootEventId"].as_str(),
++            Some(root.as_str())
++        );
++        assert_eq!(
++            meta["sessionTitle"].as_str(),
++            Some("Fizz"),
++            "the conversation merges into _meta beside the title"
++        );
++
++        let chat = crate::scope::SessionScope::Conversation { channel_id };
++        let resp = client
++            .session_new_scoped("/tmp", vec![], None, None, Some(&chat))
++            .await
++            .expect("session_new_scoped should succeed");
++        let meta = &resp.raw["_receivedRequest"]["params"]["_meta"];
++        assert!(meta["buzzHost"]["rootEventId"].is_null());
++        assert!(meta["buzzHost"]["channelId"].is_string());
++    }
++
+     #[tokio::test]
+     async fn session_new_full_omits_meta_when_session_title_none() {
+         let script = r#"
+diff --git a/crates/buzz-acp/src/pool.rs b/crates/buzz-acp/src/pool.rs
+index 5349d7fc3..9c50c05a7 100644
+--- a/crates/buzz-acp/src/pool.rs
++++ b/crates/buzz-acp/src/pool.rs
+@@ -1625,7 +1625,7 @@ async fn create_session_and_apply_model(
+ 
+     let resp = agent
+         .acp
+-        .session_new_full(
++        .session_new_scoped(
+             &ctx.cwd,
+             mcp_servers,
+             session_new_system_prompt(
+@@ -1635,6 +1635,7 @@ async fn create_session_and_apply_model(
+                 combined_system_prompt.as_deref(),
+             ),
+             session_title.as_deref(),
++            channel.scope,
+         )
+         .await?;
+ 
+-- 
+2.56.0
+

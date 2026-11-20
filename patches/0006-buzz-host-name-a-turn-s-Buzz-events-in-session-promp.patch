@@ -1,0 +1,219 @@
+From 5dcafdb92a06836f6c3ae914980d12d9d2b5cb6c Mon Sep 17 00:00:00 2001
+From: buzz-host <buzz-host@localhost>
+Date: Tue, 17 Nov 2026 17:04:08 -0500
+Subject: [PATCH] buzz-host: name a turn's Buzz events in session/prompt
+ _meta.buzzHost
+
+buzz-host's ACP proxy reads owner commands and the composer's model and
+effort picks (["model"|"effort", agent, value] tags) from the events a turn
+answers. Reading them from prompt text let message content imitate an
+event block; the structured copy can't be imitated.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/buzz-acp/src/acp.rs  | 68 ++++++++++++++++++++++++++++++++++++-
+ crates/buzz-acp/src/pool.rs | 64 ++++++++++++++++++++++++++++++++++
+ 2 files changed, 131 insertions(+), 1 deletion(-)
+
+diff --git a/crates/buzz-acp/src/acp.rs b/crates/buzz-acp/src/acp.rs
+index 84caadc74..53c307c31 100644
+--- a/crates/buzz-acp/src/acp.rs
++++ b/crates/buzz-acp/src/acp.rs
+@@ -225,6 +225,9 @@ pub struct AcpClient {
+     /// readable thinking unless asked; set only when the CLI the adapter runs
+     /// is new enough to accept `--thinking-display`.
+     claude_thinking_summaries: bool,
++    /// buzz-host: the Buzz events the next `session/prompt` answers, sent as
++    /// its `_meta.buzzHost` and consumed (via `take()`) by that prompt.
++    next_prompt_meta: Option<serde_json::Value>,
+ }
+ 
+ /// Recursively merge `overlay` into `base`, with `overlay` winning on scalar/shape
+@@ -634,9 +637,18 @@ impl AcpClient {
+             standard_usage: StandardUsageTracker::default(),
+             standard_adapter,
+             claude_thinking_summaries,
++            next_prompt_meta: None,
+         })
+     }
+ 
++    /// buzz-host: name the Buzz events the next `session/prompt` answers in
++    /// its `_meta.buzzHost`, so buzz-host's ACP proxy reads their authors and
++    /// tags from them rather than from prompt text that message content could
++    /// imitate. The proxy removes it before the adapter sees the prompt.
++    pub fn set_next_prompt_meta(&mut self, meta: Option<serde_json::Value>) {
++        self.next_prompt_meta = meta;
++    }
++
+     /// Attach a local observer feed to this ACP client.
+     pub fn set_observer(&mut self, observer: Option<ObserverHandle>, agent_index: usize) {
+         self.observer = observer;
+@@ -889,7 +901,10 @@ impl AcpClient {
+         idle_timeout: std::time::Duration,
+         max_duration: std::time::Duration,
+     ) -> Result<StopReason, AcpError> {
+-        let params = build_prompt_params(session_id, prompt_blocks);
++        let mut params = build_prompt_params(session_id, prompt_blocks);
++        if let Some(meta) = self.next_prompt_meta.take() {
++            params["_meta"] = serde_json::json!({ "buzzHost": meta });
++        }
+         let hard_deadline = tokio::time::Instant::now() + max_duration;
+         self.current_hard_deadline = Some(hard_deadline);
+ 
+@@ -3911,6 +3926,57 @@ mod tests {
+         assert!(meta["buzzHost"]["channelId"].is_string());
+     }
+ 
++    #[tokio::test]
++    async fn next_prompt_meta_goes_on_one_prompt_only() {
++        let script = r#"
++            read -t 2 _init
++            echo '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1,"agentCapabilities":{}}}'
++            read -t 2 REQ
++            echo "$REQ" > "$CAPTURE_A"
++            echo '{"jsonrpc":"2.0","id":1,"result":{"stopReason":"end_turn"}}'
++            read -t 2 REQ
++            echo "$REQ" > "$CAPTURE_B"
++            echo '{"jsonrpc":"2.0","id":2,"result":{"stopReason":"end_turn"}}'
++            sleep 1
++        "#;
++        let dir = tempfile::tempdir().unwrap();
++        let a = dir.path().join("a.json");
++        let b = dir.path().join("b.json");
++        let script = script
++            .replace("$CAPTURE_A", &a.display().to_string())
++            .replace("$CAPTURE_B", &b.display().to_string());
++        let mut client = spawn_script(&script).await;
++        client
++            .initialize()
++            .await
++            .expect("initialize should succeed");
++        let meta = serde_json::json!({
++            "channelId": "123e4567-e89b-42d3-a456-426614174000",
++            "events": [{ "id": "e1", "pubkey": "p1", "tags": [["model", "p2", "opus"]] }],
++        });
++        client.set_next_prompt_meta(Some(meta.clone()));
++        let secs = std::time::Duration::from_secs(5);
++        client
++            .session_prompt_with_idle_timeout("ses", "hi", secs, secs)
++            .await
++            .expect("first prompt should succeed");
++        client
++            .session_prompt_with_idle_timeout("ses", "again", secs, secs)
++            .await
++            .expect("second prompt should succeed");
++        let first: serde_json::Value =
++            serde_json::from_str(&std::fs::read_to_string(&a).unwrap()).unwrap();
++        let second: serde_json::Value =
++            serde_json::from_str(&std::fs::read_to_string(&b).unwrap()).unwrap();
++        assert_eq!(first["method"], "session/prompt");
++        assert_eq!(first["params"]["_meta"]["buzzHost"], meta);
++        assert_eq!(first["params"]["prompt"][0]["text"], "hi");
++        assert!(
++            second["params"].get("_meta").is_none(),
++            "the meta is consumed by the prompt it was set for"
++        );
++    }
++
+     #[tokio::test]
+     async fn session_new_full_omits_meta_when_session_title_none() {
+         let script = r#"
+diff --git a/crates/buzz-acp/src/pool.rs b/crates/buzz-acp/src/pool.rs
+index 9c50c05a7..ae51ca49c 100644
+--- a/crates/buzz-acp/src/pool.rs
++++ b/crates/buzz-acp/src/pool.rs
+@@ -2413,6 +2413,33 @@ fn send_prompt_result(
+ /// The agent is ALWAYS returned — even on panic the `JoinSet` detects the
+ /// abort and the caller uses `task_map` to recover the agent index.
+ #[allow(clippy::too_many_arguments)]
++/// buzz-host: the conversation a channel turn is in and the Buzz events it
++/// answers, oldest first, for the `_meta.buzzHost` of its `session/prompt`
++/// (see [`AcpClient::set_next_prompt_meta`]). Events of a cancelled turn
++/// re-prompted with this batch come first.
++fn buzz_host_prompt_meta(batch: &FlushBatch) -> serde_json::Value {
++    let events: Vec<serde_json::Value> = batch
++        .cancelled_events
++        .iter()
++        .chain(batch.events.iter())
++        .map(|be| {
++            let tags: Vec<&[String]> = be.event.tags.iter().map(|t| t.as_slice()).collect();
++            serde_json::json!({
++                "id": be.event.id.to_hex(),
++                "pubkey": be.event.pubkey.to_hex(),
++                "kind": be.event.kind.as_u16(),
++                "content": be.event.content,
++                "tags": tags,
++            })
++        })
++        .collect();
++    serde_json::json!({
++        "channelId": batch.scope.channel_id().to_string(),
++        "rootEventId": batch.scope.root_event_id(),
++        "events": events,
++    })
++}
++
+ pub async fn run_prompt_task(
+     mut agent: OwnedAgent,
+     batch: Option<FlushBatch>,
+@@ -2443,6 +2470,7 @@ pub async fn run_prompt_task(
+         .as_ref()
+         .map(|b| b.events.iter().map(|be| be.event.id.to_hex()).collect())
+         .unwrap_or_default();
++    let buzz_host_meta = batch.as_ref().map(buzz_host_prompt_meta);
+     let mut turn_started_payload = serde_json::json!({
+         "source": match &source {
+             PromptSource::Channel(_) => "channel",
+@@ -3224,6 +3252,9 @@ pub async fn run_prompt_task(
+         prompt_label(&source)
+     );
+ 
++    // Set last, so an initial message sent on a new session doesn't take it.
++    agent.acp.set_next_prompt_meta(buzz_host_meta);
++
+     // When control_rx is Some (channel tasks), wrap the prompt in select! so
+     // the main loop can cancel, interrupt, or rotate it. Heartbeats
+     // (control_rx=None) take the simple await path — they are not controllable.
+@@ -8437,6 +8468,39 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
+         }
+     }
+ 
++    #[test]
++    fn buzz_host_prompt_meta_names_the_conversation_and_its_events() {
++        let ch = Uuid::new_v4();
++        let root = "a".repeat(64);
++        let agent = "c".repeat(64);
++        let ev = signed_event_with_tags(vec![
++            vec!["model".into(), agent.clone(), "opus".into()],
++            vec!["effort".into(), agent.clone(), "high".into()],
++        ]);
++        let mut batch = batch_with_scope(thread_scope(ch, &root), ev.clone());
++        let old = signed_event_with_tags(vec![]);
++        batch.cancelled_events.push(crate::queue::BatchEvent {
++            edit: None,
++            event: old.clone(),
++            prompt_tag: "test".into(),
++            received_at: std::time::Instant::now(),
++        });
++        let meta = buzz_host_prompt_meta(&batch);
++        assert_eq!(meta["channelId"], ch.to_string());
++        assert_eq!(meta["rootEventId"], root);
++        let events = meta["events"].as_array().unwrap();
++        assert_eq!(events.len(), 2);
++        assert_eq!(events[0]["id"], old.id.to_hex(), "cancelled events come first");
++        assert_eq!(events[1]["id"], ev.id.to_hex());
++        assert_eq!(events[1]["pubkey"], ev.pubkey.to_hex());
++        assert_eq!(events[1]["kind"], 9);
++        assert_eq!(events[1]["content"], "hi");
++        assert_eq!(events[1]["tags"][0], serde_json::json!(["model", agent, "opus"]));
++
++        let chat = batch_with_scope(conv(ch), signed_event_with_tags(vec![]));
++        assert!(buzz_host_prompt_meta(&chat)["rootEventId"].is_null());
++    }
++
+     fn signed_event_with_tags(tags: Vec<Vec<String>>) -> nostr::Event {
+         let keys = Keys::generate();
+         let tags: Vec<Tag> = tags.into_iter().map(|t| Tag::parse(t).unwrap()).collect();
+-- 
+2.56.0
+

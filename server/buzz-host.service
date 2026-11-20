@@ -1,0 +1,15 @@
+[Unit]
+Description=buzz-host: self-hosted provider for Buzz remote agents
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/node %h/.local/lib/buzz-host/buzz-host.mjs
+Environment=PATH=%h/.local/lib/buzz-host/bin:/usr/local/bin:/usr/bin
+Restart=on-failure
+RestartSec=5
+UMask=0077
+
+[Install]
+WantedBy=default.target

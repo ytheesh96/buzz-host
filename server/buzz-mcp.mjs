@@ -1,0 +1,163 @@
+#!/usr/bin/env node
+// The agent's Buzz tools as an MCP server named "buzz", as Buzz's own (stdio,
+// newline-delimited JSON-RPC), started by the agent's runtime for each session
+// through BUZZ_ACP_MCP_COMMAND: Buzz's memory tools (memory.mjs) always, and
+// its Attention tools (attention-core.mjs) while the owner has Attention on,
+// and the computer tools for the agent's own desktop (desktop/computer.mjs)
+// while the owner has given it one.
+// Each call goes to buzz-host on $XDG_RUNTIME_DIR/buzz-host/attention.sock,
+// which owns the agent's records and key. mem_set's `path` is read here, in
+// the session's folder, as Buzz reads it in the agent's workspace.
+//
+//   buzz-mcp.mjs <agent-pubkey> [--attention] [--computer]   (buzz-host writes a per-agent wrapper)
+
+import fs from "node:fs/promises";
+import { createConnection } from "node:net";
+import path from "node:path";
+import readline from "node:readline";
+import { ATTENTION_TOOLS } from "./attention-core.mjs";
+import { MEMORY_TOOLS } from "./memory.mjs";
+
+const pubkey = process.argv[2] ?? process.env.BUZZHOST_AGENT ?? "";
+const withAttention = process.argv.includes("--attention");
+const withComputer = process.argv.includes("--computer");
+if (!/^[0-9a-f]{64}$/.test(pubkey)) {
+  process.stderr.write("buzz-mcp: usage: buzz-mcp.mjs <agent-pubkey> [--attention] [--computer]\n");
+  process.exit(2);
+}
+const TOOLS = [...MEMORY_TOOLS, ...(withAttention ? ATTENTION_TOOLS : [])];
+// Loaded only for agents with a desktop: everyone else never imports it.
+const computerModule = withComputer ? await import("./desktop/computer.mjs") : null;
+const computer = computerModule?.createComputer(pubkey);
+let computerNames = new Set();
+async function computerTools() {
+  if (!computer) return [];
+  const own = new Set(TOOLS.map((t) => t.name));
+  const list = (await computer.tools()).filter((t) => !own.has(t.name));
+  computerNames = new Set(list.map((t) => t.name));
+  return list;
+}
+
+/** mem_set's `path`: a file inside this session's folder, sent as its text. */
+async function withBody(name, args) {
+  if (name !== "mem_set" || typeof args.path !== "string" || !args.path) return args;
+  const root = await fs.realpath(process.cwd());
+  const full = await fs.realpath(path.resolve(root, args.path));
+  const inside = path.relative(root, full);
+  if (inside.startsWith("..") || path.isAbsolute(inside)) throw new Error(`${args.path} is outside ${root}`);
+  const { path: _, ...rest } = args;
+  return { ...rest, text: await fs.readFile(full, "utf8") };
+}
+const runDir = path.join(process.env.XDG_RUNTIME_DIR || `/run/user/${process.getuid()}`, "buzz-host");
+const SOCKET = path.join(runDir, "attention.sock");
+const CALL_TIMEOUT_MS = 60_000;
+
+function call(name, args) {
+  return new Promise((resolve, reject) => {
+    const sock = createConnection(SOCKET);
+    let buf = "";
+    const timer = setTimeout(() => {
+      sock.destroy();
+      reject(new Error("buzz-host did not answer"));
+    }, CALL_TIMEOUT_MS);
+    sock.setEncoding("utf8");
+    sock.on("connect", () => sock.write(`${JSON.stringify({ pubkey, name, args })}\n`));
+    sock.on("data", (chunk) => {
+      buf += chunk;
+      const i = buf.indexOf("\n");
+      if (i < 0) return;
+      clearTimeout(timer);
+      sock.end();
+      try {
+        const reply = JSON.parse(buf.slice(0, i));
+        if (reply.error) reject(new Error(reply.error));
+        else resolve(reply.result);
+      } catch (error) {
+        reject(error);
+      }
+    });
+    sock.on("error", (error) => {
+      clearTimeout(timer);
+      reject(
+        error.code === "ENOENT" || error.code === "ECONNREFUSED"
+          ? new Error("buzz-host is not running on this host")
+          : error,
+      );
+    });
+  });
+}
+
+const send = (message) => process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", ...message })}\n`);
+
+async function handle(request) {
+  const { id, method, params } = request;
+  switch (method) {
+    case "initialize":
+      return {
+        protocolVersion: params?.protocolVersion ?? "2025-06-18",
+        capabilities: { tools: {} },
+        serverInfo: { name: "buzz", version: "1.0.0" },
+        instructions: [
+          "Your memory: core, injected into your context, and cold mem/ entries you read on demand. Your owner sees it in your Memory tab in Buzz.",
+          ...(withAttention
+            ? [
+                "Your Attention: Interests you are responsible for, event watches that wake you when a matching message arrives, and timers that wake you on a schedule.",
+              ]
+            : []),
+          ...(computerModule ? [computerModule.instructions(pubkey)] : []),
+        ].join("\n"),
+      };
+    case "ping":
+      return {};
+    case "tools/list":
+      return {
+        tools: [
+          ...TOOLS.map(({ name, description, inputSchema }) => ({ name, description, inputSchema })),
+          // A desktop that cannot start must not take memory and Attention down with it.
+          ...(await computerTools().catch((error) => {
+            process.stderr.write(`buzz-mcp: computer tools unavailable: ${error.message}\n`);
+            return [];
+          })),
+        ],
+      };
+    case "tools/call": {
+      const name = params?.name;
+      if (computer && (computerNames.has(name) || !TOOLS.some((t) => t.name === name))) {
+        if (!computerNames.size) await computerTools().catch(() => {});
+        if (computerNames.has(name)) return computer.call(name, params?.arguments ?? {});
+      }
+      try {
+        if (!TOOLS.some((t) => t.name === name)) throw new Error(`No tool ${name}`);
+        const text = await call(name, await withBody(name, params?.arguments ?? {}));
+        return { content: [{ type: "text", text }] };
+      } catch (error) {
+        return { content: [{ type: "text", text: String(error.message ?? error) }], isError: true };
+      }
+    }
+    default:
+      if (id === undefined) return undefined; // a notification
+      throw Object.assign(new Error(`Method not found: ${method}`), { code: -32601 });
+  }
+}
+
+const lines = readline.createInterface({ input: process.stdin });
+lines.on("line", async (line) => {
+  if (!line.trim()) return;
+  let request;
+  try {
+    request = JSON.parse(line);
+  } catch {
+    return send({ id: null, error: { code: -32700, message: "Parse error" } });
+  }
+  try {
+    const result = await handle(request);
+    if (request.id !== undefined && result !== undefined) send({ id: request.id, result });
+  } catch (error) {
+    if (request.id !== undefined)
+      send({ id: request.id, error: { code: error.code ?? -32603, message: String(error.message ?? error) } });
+  }
+});
+lines.on("close", () => {
+  computer?.close();
+  process.exit(0);
+});

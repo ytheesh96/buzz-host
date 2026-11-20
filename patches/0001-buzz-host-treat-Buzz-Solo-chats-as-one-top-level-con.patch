@@ -1,0 +1,160 @@
+From a2b4aa8096330fabbf41b1dd40be2562da7a3a9d Mon Sep 17 00:00:00 2001
+From: buzz-host <buzz-host@localhost>
+Date: Sat, 14 Nov 2026 03:00:32 -0500
+Subject: [PATCH 1/3] buzz-host: treat Buzz Solo chats as one top-level
+ conversation
+
+Channels labelled buzz.solo (NIP-CL) are conversation-scoped under every
+session policy, and top-level mentions there are answered at the top level,
+matching Buzz's own agent harness. Mentions are still required.
+---
+ crates/buzz-acp/src/pool.rs  |  1 +
+ crates/buzz-acp/src/queue.rs | 17 ++++++++++-
+ crates/buzz-acp/src/relay.rs |  1 +
+ crates/buzz-acp/src/scope.rs | 57 +++++++++++++++++++++++++++++++++++-
+ 4 files changed, 74 insertions(+), 2 deletions(-)
+
+diff --git a/crates/buzz-acp/src/pool.rs b/crates/buzz-acp/src/pool.rs
+index 7a7e3229e..dea78cd17 100644
+--- a/crates/buzz-acp/src/pool.rs
++++ b/crates/buzz-acp/src/pool.rs
+@@ -3703,6 +3703,7 @@ async fn fetch_channel_info_once(channel_id: Uuid, rest: &RestClient) -> Option<
+                 }
+             }
+             let channel_type = crate::relay::channel_type_from_tags(tags);
++            crate::scope::record_channel_labels(channel_id, tags);
+             let description = description
+                 .map(|s| s.trim())
+                 .filter(|s| !s.is_empty())
+diff --git a/crates/buzz-acp/src/queue.rs b/crates/buzz-acp/src/queue.rs
+index 1cf53baef..d02da9f62 100644
+--- a/crates/buzz-acp/src/queue.rs
++++ b/crates/buzz-acp/src/queue.rs
+@@ -1719,6 +1719,17 @@ fn append_new_thread_reply_instruction(s: &mut String, event_id: &str) {
+     ));
+ }
+ 
++/// buzz-host patch: a top-level mention in a Solo chat (`buzz.solo` label) is
++/// answered at the top level, as Buzz's own agents answer Solo chats.
++fn append_solo_reply_instruction(s: &mut String) {
++    s.push_str(
++        "\nIMPORTANT: This channel is a Solo chat: one top-level conversation. \
++         For ordinary replies in this turn, send `buzz messages send` WITHOUT \
++         `--reply-to`, so your reply stays at the top level. Reply in a thread \
++         only if the human explicitly asks for one.",
++    );
++}
++
+ /// Decide whether a turn is human-facing for reply-anchor purposes.
+ ///
+ /// A turn is human-facing when the triggering sender is a human, OR a human
+@@ -2064,7 +2075,11 @@ fn format_context_hints(
+             "\nHint: Use `buzz messages get --channel <UUID>` for recent messages if needed.",
+         );
+         if let Some(event_id) = reply_anchor {
+-            append_new_thread_reply_instruction(&mut s, event_id);
++            if crate::scope::is_solo_channel(channel_id) {
++                append_solo_reply_instruction(&mut s);
++            } else {
++                append_new_thread_reply_instruction(&mut s, event_id);
++            }
+         }
+         crate::prompt_framing::semantic_section("context", &s)
+     }
+diff --git a/crates/buzz-acp/src/relay.rs b/crates/buzz-acp/src/relay.rs
+index 59a9bbef4..5c6a149f6 100644
+--- a/crates/buzz-acp/src/relay.rs
++++ b/crates/buzz-acp/src/relay.rs
+@@ -225,6 +225,7 @@ pub(crate) fn merge_discovered_channels(
+                     }
+                     let ch_name = name.unwrap_or("unknown").to_string();
+                     let ch_type = channel_type_from_tags(tags);
++                    crate::scope::record_channel_labels(uuid, tags);
+                     let ch_desc = description
+                         .map(|s| s.trim())
+                         .filter(|s| !s.is_empty())
+diff --git a/crates/buzz-acp/src/scope.rs b/crates/buzz-acp/src/scope.rs
+index a0dd2176f..ab0a6a672 100644
+--- a/crates/buzz-acp/src/scope.rs
++++ b/crates/buzz-acp/src/scope.rs
+@@ -25,6 +25,42 @@ use uuid::Uuid;
+ 
+ use crate::queue::{reply_thread, ResolvedEdit};
+ 
++/// NIP-CL channel label Buzz puts on a Solo chat.
++pub const SOLO_LABEL: &str = "buzz.solo";
++
++/// Channels whose kind:39000 metadata carries [`SOLO_LABEL`], as last seen.
++///
++/// Buzz runs a Solo chat as one top-level conversation, so it is
++/// conversation-scoped (like a DM) under every [`SessionPolicy`], while its
++/// events still need a mention like any channel's.
++static SOLO_CHANNELS: std::sync::LazyLock<std::sync::RwLock<std::collections::HashSet<Uuid>>> =
++    std::sync::LazyLock::new(Default::default);
++
++/// Record whether `channel_id`'s metadata tags label it a Solo chat.
++pub fn record_channel_labels(channel_id: Uuid, tags: &[serde_json::Value]) {
++    let solo = tags.iter().any(|tag| {
++        tag.as_array().is_some_and(|arr| {
++            arr.first().and_then(|v| v.as_str()) == Some("t")
++                && arr.get(1).and_then(|v| v.as_str()) == Some(SOLO_LABEL)
++        })
++    });
++    if let Ok(mut set) = SOLO_CHANNELS.write() {
++        if solo {
++            set.insert(channel_id);
++        } else {
++            set.remove(&channel_id);
++        }
++    }
++}
++
++/// True when the channel was last seen labelled a Solo chat.
++pub fn is_solo_channel(channel_id: Uuid) -> bool {
++    SOLO_CHANNELS
++        .read()
++        .map(|set| set.contains(&channel_id))
++        .unwrap_or(false)
++}
++
+ /// Operator policy controlling how ACP provider sessions are scoped.
+ ///
+ /// Selected via `--session-policy` / `BUZZ_ACP_SESSION_POLICY`. Defaults to
+@@ -146,7 +182,7 @@ impl SessionScope {
+         event: &Event,
+         edit: Option<&ResolvedEdit>,
+     ) -> Self {
+-        if is_dm || policy == SessionPolicy::Channel {
++        if is_dm || policy == SessionPolicy::Channel || is_solo_channel(channel_id) {
+             return Self::Conversation { channel_id };
+         }
+ 
+@@ -220,6 +256,25 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    fn solo_chat_is_conversation_scoped_under_thread_policy() {
++        let ch = Uuid::new_v4();
++        let labels = vec![
++            serde_json::json!(["d", ch.to_string()]),
++            serde_json::json!(["t", "private"]),
++            serde_json::json!(["t", SOLO_LABEL]),
++        ];
++        record_channel_labels(ch, &labels);
++        let ev = event_with_tags(vec![]);
++        assert_eq!(
++            SessionScope::derive(SessionPolicy::Thread, ch, false, &ev),
++            SessionScope::Conversation { channel_id: ch }
++        );
++        // Converted back to an ordinary channel: threads again.
++        record_channel_labels(ch, &labels[..2]);
++        assert!(SessionScope::derive(SessionPolicy::Thread, ch, false, &ev).is_thread());
++    }
++
+     #[test]
+     fn dm_is_always_conversation_scoped_under_thread_policy() {
+         let ch = Uuid::new_v4();
+-- 
+2.56.0
+

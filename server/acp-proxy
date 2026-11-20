@@ -1,0 +1,1213 @@
+#!/usr/bin/env python3
+"""ACP proxy between buzz-acp and a runtime adapter (claude-agent-acp, codex-acp, hermes-acp, agy).
+
+1. Negotiates ACP v1: buzz-acp's v2 handshake predates the current ACP v2
+   schema, so recent adapters reject it; their v1 path matches buzz-acp.
+2. Chat commands from the agent's owner, answered without waking the model:
+
+     @agent /model [<id>|default]    @agent /effort [<level>|default]
+     @agent /new    @agent /stop     @agent /status    @agent /help
+
+   The patched buzz-acp names each turn's chat (channel, and thread root for
+   thread scope) and the Buzz events it answers in session/prompt
+   `_meta.buzzHost` (removed here), so settings and actions apply to that
+   chat (Solo chat / DM) or thread. Commands and picks are read only from
+   those events: prompt text, which message content can imitate, is not
+   trusted for them. /model and /effort are saved in chat-settings.json and
+   applied before each of that chat's turns (session/set_config_option). /stop
+   cancels only that chat's running turn (session/cancel). /new asks the
+   patched buzz-acp to start that chat in a fresh session
+   (BUZZ_ACP_FRESH_SESSION_DIR). The agent posts a short confirmation with the
+   buzz CLI.
+
+   Buzz's composer picks: the owner's message can carry
+   ["model", <this agent>, id] and ["effort", <this agent>, level] tags (the
+   owner's patched Buzz offers model and effort for hosted agents). A pick
+   runs that turn only, ahead of the chat's /model and /effort; a turn
+   without one goes back to those, else to what the session ran before this
+   proxy changed it (model-restore.json keeps that across restarts).
+
+3. Attention: while buzz-host has Attention on for the agent, each prompt gets
+   Buzz's end-of-turn review note (attention-note.txt in the agent's dir).
+
+4. Workspaces: a chat's folders come from `@agent /workspace <path>...`, else
+   from its Canvas's Buzz workspace block (Solo workspace folders), read only
+   when the owner or one of their attested agents wrote it (workspace.mjs).
+   The patched buzz-acp names each new session's chat in `_meta.buzzHost`
+   (removed here). Claude and Codex sessions start in the chat's first folder
+   that exists on this server, so its CLAUDE.md, .mcp.json and skills load;
+   Claude also gets the other folders and the agent's own workspace as
+   additionalDirectories. Every runtime (Hermes too, whose session cwd keys its
+   agent identity) gets Buzz's per-turn note naming the folders and, for a
+   Canvas workspace, the Canvas. Laptop paths (/home/<user>/x, /Users/<user>/x)
+   map to ~/x here when that exists.
+
+5. Memory: the first turn each session has in this process gets Buzz's memory
+   guide and the agent's core memory (<core-memory>), as Buzz puts them in a
+   local agent's prompt when its process starts. buzz-host reads core from the
+   relay (memory.mjs); the agent's mem_* tools come from its buzz MCP server.
+   That turn also gets <owner-review-drafts>: how the owner's patched Buzz
+   shows `buzz agents draft-create` / `draft-update` as review popups.
+
+6. Session controls for Buzz's composer (control socket, from buzz-host):
+   `state` (idle / active / compacting), `new` (as /new), and `compact`,
+   which runs the session's own /compact (Claude, Codex) or /compress
+   (Hermes) as a turn of this proxy's: its updates don't reach buzz-acp, and
+   a prompt buzz-acp sends that session meanwhile waits for it to end.
+
+7. Reply fallback: an agent replies by running `buzz messages send`, so text it
+   only writes as its answer never reaches the chat (Haiku does this now and
+   then). When a turn someone asked the agent for (an event from a person that
+   tags it: a mention, a Solo chat or DM message) ends normally with text after
+   its last tool call, and the agent posted nothing in that chat during the
+   turn (asked of the relay), this proxy posts that text for it, where its
+   reply would go. Stopped and failed turns, wakes and turns nobody addressed
+   are left alone, and so is a turn the relay can't be asked about.
+
+8. Computer tools by chat: each new session's `buzz` MCP server gets
+   BUZZHOST_CHAT (the chat's key), so the computer tools record which chat used
+   them (desktop/computer.mjs) and the owner's in-chat preview of the agent's
+   desktop shows only in that chat.
+
+Everything else passes through byte for byte.
+"""
+import json, os, re, shlex, socket, subprocess, sys, threading, time
+
+CHANNEL_RE = re.compile(r"^Channel: .*\(#([0-9a-f-]{36})\)\s*$", re.M)
+THREAD_RE = re.compile(r"^Thread root: ([0-9a-f]{64})\s*$", re.M)
+SCOPE_RE = re.compile(r"^Session scope: (\S+)", re.M)
+EVENT_RE = re.compile(
+    r"Event ID: ([0-9a-f]{64})\n.*?^From: .*?hex: ([0-9a-f]{64})\).*?^Content: (.*?)\nTags: ",
+    re.M | re.S)
+MENTION_RE = re.compile(r"^(?:\s*(?:@\S+|nostr:n(?:pub|profile)1[0-9a-z]+))+\s*")
+COMMANDS = {"model", "effort", "new", "stop", "status", "help", "workspace"}
+MODEL_KEYS = {"model"}
+EFFORT_KEYS = {"thought_level", "effort", "reasoning_effort", "reasoning", "thinking"}
+
+agent_dir = os.environ.get("BUZZ_HOST_AGENT_DIR", "")
+settings_file = os.path.join(agent_dir, "chat-settings.json") if agent_dir else ""
+fresh_dir = os.environ.get("BUZZ_ACP_FRESH_SESSION_DIR", "")
+owner = os.environ.get("BUZZ_ACP_AGENT_OWNER", "").lower()
+control_sock = os.environ.get("BUZZ_HOST_CONTROL_SOCK", "")
+agent_pubkey = os.environ.get("BUZZ_HOST_AGENT", "")
+host_sock = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}",
+                         "buzz-host", "attention.sock")
+ADAPTER = os.path.basename(sys.argv[1]) if len(sys.argv) > 1 else ""
+# Runtimes whose session may start in a chat's folder. Hermes keys its agent
+# identity on the session cwd (hermes-plugin), so it keeps the agent's own.
+STARTS_IN_FOLDER = ADAPTER in ("claude-agent-acp", "codex-acp", "agy", "antigravity")
+EXTRA_DIRS = ADAPTER in ("claude-agent-acp", "agy", "antigravity")  # ACP additionalDirectories
+_here = os.path.dirname(os.path.abspath(__file__))
+# Installed: bin/acp-proxy beside ../workspace.mjs. In the repo: server/ holds both.
+WORKSPACE_HELPER = next((p for p in (os.path.join(_here, "workspace.mjs"),
+                                     os.path.join(os.path.dirname(_here), "workspace.mjs"))
+                         if os.path.exists(p)), "")
+CANVAS_TTL = 15  # seconds a chat's Canvas read is reused
+UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
+restore_file = os.path.join(agent_dir, "model-restore.json") if agent_dir else ""
+# The command that compacts a session, by runtime, until it lists its own.
+COMPACT_COMMANDS = ("compact", "compress")
+DEFAULT_COMPACT = {
+    "claude-agent-acp": "compact",
+    "codex-acp": "compact",
+    "hermes-acp": "compress",
+    "agy": "compact",
+    "antigravity": "compact",
+}
+COMPACT_TIMEOUT = 900
+
+lock = threading.RLock()
+to_adapter_lock = threading.Lock()
+to_client_lock = threading.Lock()
+sessions = {}        # sid -> {"options": [...], "key": str|None, "running": int}
+pending_new = {}     # client request id -> sid for load/resume (None for new)
+pending_prompt = {}  # client request id -> sid
+waiters = {}         # proxy request id -> [threading.Event, response]
+pending_ws = {}      # client request id -> {"key", "start", "home"} for session/new
+pending_cfg = {}     # client request id -> (sid, method, params): buzz-acp's own model/effort changes
+canvas_cache = {}    # channel -> (time, workspace.mjs result)
+turns = {}           # client request id -> a turn that may need its reply posted (reply fallback)
+next_id = [0]
+REPLY_LIMIT = 30000  # characters of a fallback reply
+
+
+def log(msg):
+    print(f"acp-proxy: {msg}", file=sys.stderr, flush=True)
+
+
+def send_adapter_raw(data):
+    with to_adapter_lock:
+        child.stdin.write(data)
+        child.stdin.flush()
+
+
+def send_adapter(obj):
+    send_adapter_raw((json.dumps(obj, separators=(",", ":")) + "\n").encode())
+
+
+def send_client(obj):
+    data = (json.dumps(obj, separators=(",", ":")) + "\n").encode()
+    with to_client_lock:
+        sys.stdout.buffer.write(data)
+        sys.stdout.buffer.flush()
+
+
+def proxy_request(method, params, timeout=20):
+    with lock:
+        next_id[0] += 1
+        rid = f"buzz-host-{next_id[0]}"
+        ev = threading.Event()
+        waiters[rid] = [ev, None]
+    send_adapter({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
+    ev.wait(timeout)
+    with lock:
+        return waiters.pop(rid, [None, None])[1]
+
+
+# ---------- config options ----------
+
+def option_by(options, wanted):
+    for o in options or []:
+        if o.get("category") in wanted or o.get("id") in wanted or o.get("configId") in wanted:
+            return o
+    return None
+
+
+def option_id(o):
+    return o.get("id") or o.get("configId")
+
+
+def choices(o):
+    out = []
+    for v in (o or {}).get("options") or []:
+        if isinstance(v, dict) and "value" in v:
+            out.append((v["value"], v.get("name") or v["value"]))
+        elif isinstance(v, dict) and "options" in v:  # grouped
+            out += [(g["value"], g.get("name") or g["value"]) for g in v["options"]]
+    return out
+
+
+def load_settings():
+    try:
+        with open(settings_file) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_settings(all_settings):
+    tmp = settings_file + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(all_settings, f, indent=2)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, settings_file)
+
+
+def wanted_for(key, settings):
+    """A thread uses its channel's settings unless it has its own."""
+    base = dict(settings.get(key.split("_", 1)[0], {})) if "_" in key else {}
+    base.update(settings.get(key, {}))
+    return base
+
+
+def load_restore():
+    try:
+        with open(restore_file) as f:
+            value = json.load(f)
+        return value if isinstance(value, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def restore_point(sid):
+    """{kind: value} the session ran before this proxy changed it."""
+    with lock:
+        s = sessions.setdefault(sid, {})
+        if "restore" not in s:
+            s["restore"] = dict(load_restore().get(sid) or {}) if restore_file else {}
+        return dict(s["restore"])
+
+
+def save_restore_point(sid, restore):
+    with lock:
+        sessions.setdefault(sid, {})["restore"] = dict(restore)
+        if not restore_file:
+            return
+        everything = load_restore()
+        if restore:
+            everything[sid] = dict(restore)
+        else:
+            everything.pop(sid, None)
+        try:
+            tmp = restore_file + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(everything, f, indent=2)
+            os.replace(tmp, restore_file)
+        except OSError as e:
+            log(f"saving {restore_file} failed: {e}")
+
+
+def picks_of(events):
+    """{"model", "effort"} the owner picked for this agent in Buzz's composer:
+    tags ["model"|"effort", <this agent>, value] on the latest of the owner's
+    messages this turn answers. Their other messages, and anyone else's, are
+    not asked: only the owner is honoured, as Buzz does for local agents."""
+    me = agent_pubkey.lower()
+    if not owner or not HEX64_RE.match(me):
+        return {}
+    for ev in reversed(events or []):
+        if str(ev.get("pubkey", "")).lower() != owner:
+            continue
+        found = {}
+        for tag in ev.get("tags") or []:
+            if (isinstance(tag, list) and len(tag) >= 3 and tag[0] in ("model", "effort")
+                    and str(tag[1]).lower() == me and isinstance(tag[2], str) and tag[2]):
+                found.setdefault(tag[0], tag[2])
+        return found
+    return {}
+
+
+def apply_settings(sid, key, picks=None):
+    """Put the session on this turn's model and effort: the owner's pick on
+    the message, else the chat's /model and /effort, else what it ran before
+    this proxy changed it (the agent's own). The model goes first: the
+    effort levels offered can change with it."""
+    want = wanted_for(key, load_settings()) if key and settings_file else {}
+    picks = picks or {}
+    restore = restore_point(sid)
+    for kind, keyset in (("model", MODEL_KEYS), ("effort", EFFORT_KEYS)):
+        with lock:
+            options = list(sessions.get(sid, {}).get("options") or [])
+        opt = option_by(options, keyset)
+        if not opt:
+            continue
+        current = opt.get("currentValue")
+        source = "pick" if picks.get(kind) else "setting"
+        value = picks.get(kind) or want.get(kind)
+        if not value:
+            if kind not in restore:
+                continue
+            value, source = restore[kind], "restore"
+        if value == current:
+            if source == "restore":
+                restore.pop(kind)
+                save_restore_point(sid, restore)
+            continue
+        if value not in {v for v, _ in choices(opt)}:
+            log(f"{key}: {kind} {value!r} ({source}) not offered; keeping {current!r}")
+            if source == "restore":
+                restore.pop(kind)
+                save_restore_point(sid, restore)
+            continue
+        resp = proxy_request("session/set_config_option",
+                             {"sessionId": sid, "configId": option_id(opt), "value": value})
+        if resp and "result" in resp:
+            new = (resp["result"] or {}).get("configOptions")
+            with lock:
+                s = sessions.setdefault(sid, {})
+                if new:
+                    s["options"] = new
+                else:
+                    opt["currentValue"] = value
+                    s["options"] = options
+            if source == "restore":
+                restore.pop(kind)
+            elif kind not in restore and current is not None:
+                restore[kind] = current
+            save_restore_point(sid, restore)
+            log(f"{key}: {kind} -> {value} ({source})")
+        else:
+            log(f"{key}: setting {kind} failed: {resp and resp.get('error')}")
+
+
+# ---------- workspaces ----------
+
+def local_path(given):
+    """The directory on this server a chat's folder names, or None. `~` is
+    this server's home; a laptop path under /home/<user>/ or /Users/<user>/
+    that is missing here maps to the same path under this server's home."""
+    p = (given or "").strip()
+    if p == "~" or p.startswith("~/"):
+        cand = os.path.expanduser(p)
+    elif os.path.isabs(p):
+        cand = p
+    else:
+        return None
+    cand = os.path.normpath(cand)
+    if os.path.isdir(cand):
+        return cand
+    m = re.match(r"^/(?:home|Users)/[^/]+/(.+)$", p)
+    if m:
+        alt = os.path.normpath(os.path.join(os.path.expanduser("~"), m.group(1)))
+        if os.path.isdir(alt):
+            return alt
+    return None
+
+
+def canvas_workspace(channel, fresh=False):
+    """workspace.mjs's reading of the chat's Canvas, reused for CANVAS_TTL
+    seconds; {} when it can't be read (the caller keeps what it knew)."""
+    if not UUID_RE.match(channel or "") or not WORKSPACE_HELPER:
+        return {}
+    now = time.monotonic()
+    with lock:
+        hit = canvas_cache.get(channel)
+    if hit and not fresh and now - hit[0] < CANVAS_TTL:
+        return hit[1]
+    try:
+        r = subprocess.run(["node", WORKSPACE_HELPER, channel], capture_output=True, text=True, timeout=8)
+        out = json.loads(r.stdout or "{}")
+    except Exception as e:
+        log(f"{channel}: reading the Canvas failed: {e}")
+        return {}
+    if out.get("error"):
+        log(f"{channel}: reading the Canvas failed: {out['error']}")
+        return {}
+    if out.get("reason") and out.get("author"):
+        log(f"{channel}: Canvas not used: {out['reason']}")
+    with lock:
+        canvas_cache[channel] = (now, out)
+    return out
+
+
+def chat_workspace(key, fresh=False):
+    """{"source": "command"|"canvas"|None, "folders": [given...], "local":
+    {given: dir or None}, "canvas": text or None, "worktree": {...} or None}.
+    A /workspace setting wins over the Canvas; `/workspace off` saves []."""
+    channel = (key or "").split("_", 1)[0]
+    chosen = wanted_for(key, load_settings()).get("workspace") if settings_file else None
+    ws = {"source": None, "folders": [], "canvas": None, "worktree": None}
+    if isinstance(chosen, list):
+        ws.update(source="command" if chosen else None, folders=[str(f) for f in chosen])
+    else:
+        found = canvas_workspace(channel, fresh)
+        if found.get("folders"):
+            ws.update(source="canvas", folders=list(found["folders"]),
+                      canvas=found.get("canvas"), worktree=found.get("worktree"))
+    ws["local"] = {f: local_path(f) for f in ws["folders"]}
+    # Worktree mode: new worktrees go here, so it may not exist yet.
+    loc = (ws["worktree"] or {}).get("location") or ""
+    ws["worktree_dir"] = local_path(loc) or (
+        os.path.normpath(os.path.expanduser(loc)) if loc == "~" or loc.startswith("~/") or os.path.isabs(loc) else None)
+    return ws
+
+
+def workspace_dirs(ws):
+    """The chat's folders found here, then its worktree location (Buzz's
+    `workspaceDirectories` order). The first is where a session starts."""
+    seen, out = set(), []
+    for d in [ws["local"].get(f) for f in ws["folders"]] + [ws.get("worktree_dir")]:
+        if d and d not in seen:
+            seen.add(d)
+            out.append(d)
+    return out
+
+
+def unframed(text):
+    """Keep a Canvas from closing the note it sits in (Buzz's `unframed`)."""
+    return re.sub(r"</?\s*workspace-canvas\b[^>]*>", lambda m: m.group(0).replace("<", "&lt;"), text, flags=re.I)
+
+
+def workspace_note(sid, key):
+    """Buzz's per-turn workspace note for this chat, or "" when it has none.
+    Once a chat had one, a turn without one says to disregard it."""
+    try:
+        ws = chat_workspace(key)
+    except Exception as e:
+        log(f"{key}: workspace lookup failed: {e}")
+        return ""
+    with lock:
+        s = sessions.setdefault(sid, {})
+        had, s["had_workspace"] = s.get("had_workspace"), bool(ws["folders"])
+        start, home = s.get("start"), s.get("home")
+    if not ws["folders"]:
+        if not had:
+            return ""
+        return ("<workspace-canvas>\nThis chat has no workspace from its owner now. Disregard any "
+                "earlier workspace Canvas, its instructions and its folders.\n</workspace-canvas>")
+    dirs = workspace_dirs(ws)
+    lines = []
+    if dirs:
+        mine = f" (`{home}`)" if home else ""
+        lines.append("This chat's work happens in these folders, not your own workspace: "
+                     + ", ".join(f"`{d}`" for d in dirs)
+                     + f". `cd` into the one you need; your workspace{mine} keeps your notes.")
+    if start:
+        lines.append(f"This session started in `{start}`.")
+    missing = [f for f in ws["folders"] if not ws["local"].get(f)]
+    if missing:
+        lines.append("Not found on this server (you run on the owner's server, not their laptop; "
+                     "tell the owner if you need them): " + ", ".join(f"`{f}`" for f in missing) + ".")
+    if ws["source"] == "canvas":
+        head = ("This chat's Canvas as of this message: its standing instructions for this chat, which "
+                "the owner's messages override. It replaces any earlier workspace Canvas.")
+        return f"<workspace-canvas>\n{head} {' '.join(lines)}\n\n{unframed(ws['canvas'].strip())}\n</workspace-canvas>"
+    return ("<workspace-canvas>\nThe owner set this chat's workspace folders. " + " ".join(lines)
+            + "\n</workspace-canvas>")
+
+
+def start_in_workspace(msg_id, params):
+    """session/new: take buzz-acp's `_meta.buzzHost` and, for Claude/Codex,
+    start the session in the chat's first folder found here."""
+    meta = params.get("_meta")
+    conv = meta.pop("buzzHost", None) if isinstance(meta, dict) else None
+    if isinstance(meta, dict) and not meta:
+        params.pop("_meta")
+    if not isinstance(conv, dict):
+        return
+    channel, root = conv.get("channelId") or "", conv.get("rootEventId")
+    if not UUID_RE.match(channel) or (root and not re.fullmatch(r"[0-9a-f]{64}", root)):
+        return
+    key = f"{channel}_{root}" if root else channel
+    label_mcp(params, key)
+    home = params.get("cwd")
+    start = None
+    try:
+        ws = chat_workspace(key, fresh=True)
+        dirs = workspace_dirs(ws)
+        found = [d for d in (ws["local"].get(f) for f in ws["folders"]) if d]
+        if STARTS_IN_FOLDER and found:
+            start = found[0]
+            params["cwd"] = start
+            if EXTRA_DIRS:
+                extra = list(params.get("additionalDirectories") or [])
+                for d in [home] + dirs[1:]:
+                    if d and d != start and d not in extra:
+                        extra.append(d)
+                params["additionalDirectories"] = extra
+            log(f"{key}: session starts in {start}")
+    except Exception as e:  # never block a session on its workspace
+        log(f"{key}: workspace lookup failed: {e}")
+    with lock:
+        pending_ws[msg_id] = {"key": key, "start": start, "home": home}
+
+
+# ---------- chat commands ----------
+
+def parse_prompt(text):
+    """(chat key, reply-to root or None, last event (id, author, content) or None, event count)."""
+    ch = CHANNEL_RE.search(text)
+    if not ch:
+        return None, None, None, 0
+    scope = SCOPE_RE.search(text)
+    root = THREAD_RE.search(text)
+    threaded = bool(scope and scope.group(1) == "thread" and root)
+    events = EVENT_RE.findall(text)
+    last = events[-1] if events else None
+    key = f"{ch.group(1)}_{root.group(1)}" if threaded else ch.group(1)
+    return key, (root.group(1) if threaded else None), last, len(events)
+
+
+def take_turn_meta(params):
+    """session/prompt: remove the patched buzz-acp's `_meta.buzzHost` and
+    return (found, (key, root, events) or None): the chat the turn is in and
+    the Buzz events it answers, oldest first, each {id, pubkey, kind,
+    content, tags}."""
+    meta = params.get("_meta")
+    if not isinstance(meta, dict) or "buzzHost" not in meta:
+        return False, None
+    turn = meta.pop("buzzHost")
+    if not meta:
+        params.pop("_meta")
+    if not isinstance(turn, dict):
+        return True, None
+    channel, root = str(turn.get("channelId") or ""), turn.get("rootEventId")
+    if not UUID_RE.match(channel) or (root is not None and not (isinstance(root, str) and HEX64_RE.match(root))):
+        return True, None
+    events = [e for e in turn.get("events") or [] if isinstance(e, dict)]
+    return True, ((f"{channel}_{root}" if root else channel), root, events)
+
+
+def command_of(event):
+    """('model', ['opus']) for an owner's '@agent /model opus', else None."""
+    if not event or not owner:
+        return None
+    _event_id, author, content = event
+    if author.lower() != owner:
+        return None
+    line = MENTION_RE.sub("", content.strip().splitlines()[0] if content.strip() else "")
+    if not line.startswith("/"):
+        return None
+    parts = line[1:].split()
+    if not parts or parts[0].lower() not in COMMANDS:
+        return None
+    if parts[0].lower() == "workspace":  # paths may be quoted or `code`
+        try:
+            parts = shlex.split(line[1:])
+        except ValueError:
+            pass
+        parts = [parts[0]] + [p.strip().strip("`") for p in parts[1:] if p.strip().strip("`")]
+    return parts[0].lower(), parts[1:]
+
+
+def reply(channel, root, text):
+    args = ["buzz", "messages", "send", "--channel", channel, "--content", text]
+    if root:
+        args += ["--reply-to", root]
+    try:
+        r = subprocess.run(args, capture_output=True, text=True, timeout=60)
+        if r.returncode != 0:
+            log(f"reply failed: {(r.stderr or r.stdout).strip()[:300]}")
+    except Exception as e:
+        log(f"reply failed: {e}")
+
+
+def spawn(fn, *args):
+    threading.Thread(target=fn, args=args, daemon=True).start()
+
+
+def addresses_agent(event):
+    """A person's event that tags this agent: a mention, or a Solo chat or DM message."""
+    if not isinstance(event, dict) or not HEX64_RE.match(agent_pubkey):
+        return False
+    author = str(event.get("pubkey", "")).lower()
+    if not HEX64_RE.match(author) or author == agent_pubkey:
+        return False
+    return any(isinstance(t, list) and len(t) >= 2 and t[0] == "p" and str(t[1]).lower() == agent_pubkey
+               for t in event.get("tags") or [])
+
+
+def agent_posted(channel, since):
+    """Whether the agent posted in `channel` after `since` (unix seconds).
+    Raises when the relay can't be asked."""
+    r = subprocess.run(["buzz", "--format", "json", "messages", "get", "--channel", channel,
+                        "--since", str(int(since) - 2), "--limit", "200"],
+                       capture_output=True, text=True, timeout=30)
+    if r.returncode != 0:
+        raise RuntimeError((r.stderr or r.stdout).strip()[:200] or f"exit {r.returncode}")
+    events = json.loads(r.stdout or "[]")
+    return any(isinstance(e, dict) and str(e.get("pubkey", "")).lower() == agent_pubkey
+               and (e.get("created_at") or 0) >= int(since) for e in events)
+
+
+def reply_fallback(turn):
+    """Post a finished turn's final text when the agent didn't reply itself."""
+    text = turn["text"].strip()
+    if not text:
+        return
+    try:
+        if agent_posted(turn["channel"], turn["start"]):
+            return
+    except Exception as e:
+        log(f"{turn['channel']}: reply fallback skipped, can't tell whether the agent replied: {e}")
+        return
+    if len(text) > REPLY_LIMIT:
+        text = text[:REPLY_LIMIT].rstrip() + "…"
+    log(f"{turn['channel']}: the agent ended its turn without replying; posting its final text ({len(text)} chars)")
+    reply(turn["channel"], turn["root"], text)
+
+
+def label_mcp(params, key):
+    """Tell the session's buzz MCP server which chat it serves (BUZZHOST_CHAT)."""
+    for server in params.get("mcpServers") or []:
+        if not isinstance(server, dict) or server.get("name") != "buzz":
+            continue
+        env = [e for e in server.get("env") or [] if not (isinstance(e, dict) and e.get("name") == "BUZZHOST_CHAT")]
+        env.append({"name": "BUZZHOST_CHAT", "value": key})
+        server["env"] = env
+
+
+def describe(sid, key):
+    with lock:
+        options = list(sessions.get(sid, {}).get("options") or [])
+    want = wanted_for(key, load_settings())
+    lines = []
+    for kind, keyset in (("Model", MODEL_KEYS), ("Effort", EFFORT_KEYS)):
+        opt = option_by(options, keyset)
+        chosen = want.get(kind.lower())
+        current = opt.get("currentValue") if opt else None
+        if opt:
+            lines.append(f"{kind}: {chosen or 'default'}" + (f" (running: {current})" if current and current != chosen else ""))
+        elif chosen:
+            lines.append(f"{kind}: {chosen}")
+    return lines
+
+
+def describe_workspace(ws, where, start):
+    host, home = socket.gethostname(), os.path.expanduser("~")
+    if not ws["folders"]:
+        return (f"Workspace for {where}: none, so the agent works in its own folder. Set one with "
+                f"`/workspace <path>...` (paths on {host}; `~` is `{home}`), or file the chat in a Buzz "
+                "workspace that has folders.")
+    shown = []
+    for f in ws["folders"]:
+        d = ws["local"].get(f)
+        shown.append(f"`{f}`" + (f" → `{d}`" if d and d != f else "") + ("" if d else " (not found on this server)"))
+    text = (f"Workspace for {where} ({'from its Canvas' if ws['source'] == 'canvas' else 'set with /workspace'}): "
+            + ", ".join(shown) + ".")
+    if ws.get("worktree"):
+        text += f" New worktrees go under `{ws['worktree']['location']}` from `{ws['worktree']['baseBranch']}`."
+    if start:
+        text += f" This session started in `{start}`."
+    elif STARTS_IN_FOLDER:
+        text += " The next new session starts in the first folder found here."
+    else:
+        text += " This runtime keeps its own folder; each message names the workspace folders."
+    return text
+
+
+def set_workspace(args, key, where):
+    host, home = socket.gethostname(), os.path.expanduser("~")
+    all_settings = load_settings()
+    entry = dict(all_settings.get(key, {}))
+    word = args[0].lower()
+    if word in ("default", "canvas"):
+        entry.pop("workspace", None)
+        text = f"Workspace for {where}: its Canvas's (Buzz workspace folders), if it has any."
+    elif word in ("off", "none"):
+        entry["workspace"] = []
+        text = f"Workspace for {where}: none; the agent works in its own folder and ignores Canvas folders."
+    else:
+        missing = [f for f in args if not local_path(f)]
+        if missing:
+            return ("Not found on " + host + ": " + ", ".join(f"`{f}`" for f in missing)
+                    + f". Folders must exist on {host} (`~` is `{home}`). Nothing changed.")
+        entry["workspace"] = list(args)
+        text = f"Workspace for {where}: " + ", ".join(
+            f"`{f}`" + (f" → `{local_path(f)}`" if local_path(f) != f else "") for f in args) + "."
+    if entry:
+        all_settings[key] = entry
+    else:
+        all_settings.pop(key, None)
+    save_settings(all_settings)
+    with lock:
+        canvas_cache.pop(key.split("_", 1)[0], None)
+    if STARTS_IN_FOLDER and fresh_dir:
+        os.makedirs(fresh_dir, exist_ok=True)
+        open(os.path.join(fresh_dir, key), "w").close()
+        return text + " The next message starts a fresh session there."
+    return text + " Applies from the next message."
+
+
+def provider_of(value):
+    """'nous' for 'nous:anthropic/x'; 'custom:local' for 'custom:local:x' (Hermes ids)."""
+    parts = value.split(":")
+    if len(parts) < 2:
+        return None
+    return f"{parts[0]}:{parts[1]}" if parts[0] == "custom" and len(parts) > 2 else parts[0]
+
+
+def by_provider(offered):
+    """{provider: [model ids]} when (nearly) every id names its provider, else None."""
+    ids = [v for v, _ in offered]
+    if not ids or sum(1 for v in ids if provider_of(v)) < 0.8 * len(ids):
+        return None
+    groups = {}
+    for v in ids:
+        groups.setdefault(provider_of(v) or "other", []).append(v)
+    return groups
+
+
+def in_scope(session_key, key):
+    """A chat/thread key covers itself; a bare channel key also covers its threads."""
+    return session_key == key or ("_" not in key and (session_key or "").startswith(key + "_"))
+
+
+def run_command(cmd, args, sid, key, root):
+    channel = key.split("_", 1)[0]
+    where = "this thread" if "_" in key else "this chat"
+    with lock:
+        options = list(sessions.get(sid, {}).get("options") or [])
+    if cmd in ("model", "effort"):
+        keyset = MODEL_KEYS if cmd == "model" else EFFORT_KEYS
+        opt = option_by(options, keyset)
+        offered = choices(opt)
+        current = wanted_for(key, load_settings()).get(cmd) or "default"
+        groups = by_provider(offered) if cmd == "model" else None
+        if not args:
+            if groups:
+                providers = ", ".join(f"`{p}` ({len(v)})" for p, v in sorted(groups.items()))
+                return (f"Model for {where}: {current}. Providers: {providers}. "
+                        "List one with `/model <provider>`; set with `/model <provider> <model>`, "
+                        "`/model <id>` or `/model default`.")
+            listing = ", ".join(f"`{v}`" for v, _ in offered) or "(the runtime lists none)"
+            return f"{cmd.title()} for {where}: {current}. Options: {listing}. Set with `/{cmd} <id>` or `/{cmd} default`."
+        value = args[0]
+        if groups and value in groups and len(args) == 1 and value not in {v for v, _ in offered}:
+            names = ", ".join(f"`{v[len(value) + 1:]}`" for v in groups[value])
+            return f"`{value}` models: {names}. Set with `/model {value} <model>`."
+        if groups and len(args) >= 2 and value in groups:
+            value = f"{value}:{args[1]}"
+        all_settings = load_settings()
+        entry = dict(all_settings.get(key, {}))
+        if value.lower() == "default":
+            entry.pop(cmd, None)
+        else:
+            if offered and value not in {v for v, _ in offered}:
+                if groups:
+                    return (f"`{value}` isn't offered. Providers: "
+                            + ", ".join(f"`{p}`" for p in sorted(groups))
+                            + ". List one with `/model <provider>`.")
+                return f"`{value}` isn't offered. Options: " + ", ".join(f"`{v}`" for v, _ in offered)
+            entry[cmd] = value
+        if entry:
+            all_settings[key] = entry
+        else:
+            all_settings.pop(key, None)
+        save_settings(all_settings)
+        return f"{cmd.title()} for {where}: {entry.get(cmd, 'default')}. Applies from the next message."
+    if cmd == "workspace":
+        if args:
+            return set_workspace(args, key, where)
+        with lock:
+            start = sessions.get(sid, {}).get("start")
+        return describe_workspace(chat_workspace(key, fresh=True), where, start)
+    if cmd == "new":
+        if not fresh_dir:
+            return "Fresh sessions need the patched buzz-acp (build-acp.sh)."
+        os.makedirs(fresh_dir, exist_ok=True)
+        open(os.path.join(fresh_dir, key), "w").close()
+        return f"The next message in {where} starts a fresh session."
+    if cmd == "stop":
+        with lock:
+            running = [s for s, st in sessions.items() if in_scope(st.get("key"), key) and st.get("running", 0) > 0]
+        for s in running:
+            send_adapter({"jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": s}})
+        return f"Stopped the running turn in {where}." if running else f"Nothing is running in {where}."
+    if cmd == "status":
+        lines = describe(sid, key)
+        ws = chat_workspace(key)
+        with lock:
+            start = sessions.get(sid, {}).get("start")
+        if ws["folders"]:
+            lines.append("Workspace: " + ", ".join(f"`{f}`" for f in ws["folders"])
+                         + (f" (started in `{start}`)" if start else ""))
+        with lock:
+            busy = any(in_scope(st.get("key"), key) and st.get("running", 0) > 0 for st in sessions.values())
+        lines.append("Working on a turn." if busy else "Idle.")
+        return f"Status for {where}: " + " · ".join(lines)
+    return ("Commands (from the owner, applying to this chat or thread): "
+            "`/model [<id>|default]`, `/effort [<level>|default]` (a model or effort picked in Buzz's "
+            "composer runs just that message), `/new` (fresh session next message), "
+            "`/stop` (stop the running turn), `/status`, "
+            "`/workspace [<path>...|off|default]` (folders this chat works in; default: its Canvas's "
+            "Buzz workspace folders; a change starts a fresh session).")
+
+
+def handle_command(msg_id, cmd, args, sid, key, root):
+    """Answer the command; msg_id None means the turn goes on to the model."""
+    try:
+        text = run_command(cmd, args, sid, key, root)
+    except Exception as e:
+        text = f"/{cmd} failed: {e}"
+    log(f"{key}: /{cmd} {' '.join(args)}")
+    if msg_id is not None:
+        send_client({"jsonrpc": "2.0", "id": msg_id, "result": {"stopReason": "end_turn"}})
+    reply(key.split("_", 1)[0], root, text)
+
+
+# ---------- control socket (buzz-host: Buzz's Stop for remote agents) ----------
+
+def cancel_conversation(channel, root):
+    """Cancel the running turn of one conversation: the thread rooted at
+    `root`, else the channel's own session (a Solo chat or DM, where Buzz
+    names the conversation by a top-level message). True if one was running."""
+    with lock:
+        def running(key):
+            return [s for s, st in sessions.items() if st.get("key") == key and st.get("running", 0) > 0]
+        targets = (running(f"{channel}_{root}") if root else []) or running(channel)
+    for sid in targets:
+        send_adapter({"jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": sid}})
+    if targets:
+        log(f"{channel}{'_' + root if root else ''}: stop from Buzz")
+    return bool(targets)
+
+
+def conversation_sessions(channel, root):
+    """The sessions of one conversation, most recently prompted first."""
+    key = f"{channel}_{root}" if root else channel
+    with lock:
+        found = [(st.get("last_used", 0), sid) for sid, st in sessions.items() if st.get("key") == key]
+    return [sid for _, sid in sorted(found, reverse=True)]
+
+
+def conversation_state(channel, root):
+    """Buzz's session state for one conversation: compacting, active or idle."""
+    sids = conversation_sessions(channel, root)
+    with lock:
+        states = [sessions.get(sid, {}) for sid in sids]
+    if any(st.get("compacting") for st in states):
+        return "compacting"
+    if any(st.get("running", 0) > 0 for st in states):
+        return "active"
+    return "idle"
+
+
+def fresh_conversation(channel, root):
+    """Buzz's New session: the next message starts a fresh session (/new)."""
+    if not fresh_dir:
+        return {"error": "Fresh sessions need the patched buzz-acp (build-acp.sh)."}
+    if conversation_state(channel, root) != "idle":
+        return {"error": "Wait for the turn to finish before starting a new session."}
+    key = f"{channel}_{root}" if root else channel
+    os.makedirs(fresh_dir, exist_ok=True)
+    open(os.path.join(fresh_dir, key), "w").close()
+    log(f"{key}: new session from Buzz")
+    return {"ok": True}
+
+
+def end_compaction(sid):
+    """Clear the compaction and run the prompts buzz-acp sent meanwhile."""
+    with lock:
+        s = sessions.setdefault(sid, {})
+        s["compacting"] = False
+        s["running"] = max(0, s.get("running", 1) - 1)
+        held = s.pop("held", [])
+    for raw in held:
+        try:
+            out = handle_client_line(raw)
+            if out is not None:
+                send_adapter_raw(out)
+        except Exception as e:
+            log(f"sending a held prompt failed: {e}")
+
+
+def compact_conversation(channel, root):
+    """Buzz's Compact: the session's own /compact (or /compress) as a turn of
+    this proxy's, which buzz-acp never sees. Resolves when it ends."""
+    sids = conversation_sessions(channel, root)
+    if not sids:
+        return {"error": "No session here yet: it starts with the next message."}
+    sid = sids[0]
+    with lock:
+        s = sessions.setdefault(sid, {})
+        if s.get("compacting") or s.get("running", 0) > 0:
+            return {"error": "Wait for the turn to finish before compacting."}
+        listed = s.get("commands")
+        name = (next((c for c in COMPACT_COMMANDS if c in listed), None) if listed is not None
+                else DEFAULT_COMPACT.get(ADAPTER))
+        if not name:
+            return {"error": "This runtime can't compact a session."}
+        s["compacting"] = True
+        s["running"] = s.get("running", 0) + 1
+    key = f"{channel}_{root}" if root else channel
+    log(f"{key}: /{name} from Buzz")
+    try:
+        resp = proxy_request("session/prompt", {"sessionId": sid, "prompt": [{"type": "text", "text": f"/{name}"}]},
+                             timeout=COMPACT_TIMEOUT)
+    finally:
+        end_compaction(sid)
+    if not resp:
+        return {"error": "Compaction did not finish in time."}
+    if "error" in resp:
+        return {"error": (resp["error"] or {}).get("message") or "Compaction failed"}
+    stop = (resp.get("result") or {}).get("stopReason")
+    return {"compacted": stop != "cancelled", "stopReason": stop}
+
+
+def control(req):
+    op = req.get("op")
+    channel = str(req.get("channel", ""))
+    root = req.get("root") or None
+    if op not in ("cancel", "state", "new", "compact"):
+        return {"error": "unknown op"}
+    if not UUID_RE.match(channel) or (root and not HEX64_RE.match(str(root))):
+        return {"error": "invalid conversation"}
+    if op == "cancel":
+        return {"cancelled": cancel_conversation(channel, root)}
+    if op == "state":
+        return {"state": conversation_state(channel, root)}
+    if op == "new":
+        return fresh_conversation(channel, root)
+    return compact_conversation(channel, root)
+
+
+def serve_control():
+    try:
+        os.unlink(control_sock)
+    except OSError:
+        pass
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(control_sock)
+    os.chmod(control_sock, 0o600)
+    srv.listen(8)
+    while True:
+        conn, _ = srv.accept()
+        threading.Thread(target=control_conn, args=(conn,), daemon=True).start()
+
+
+def control_conn(conn):
+    with conn:
+        f = conn.makefile("rwb")
+        for line in f:
+            try:
+                reply = control(json.loads(line))
+            except Exception as e:
+                reply = {"error": str(e)}
+            f.write((json.dumps(reply) + "\n").encode())
+            f.flush()
+
+
+# ---------- pumps ----------
+
+# What the owner's patched Buzz desktop (~/Work/buzz-pkg/patches) does with
+# the buzz CLI's agent drafts, which stock Buzz 1.x drops.
+DRAFTS_NOTE = """<owner-review-drafts>
+Your owner's Buzz desktop shows your agent drafts as review popups:
+- `buzz agents draft-create --channel <this chat's channel id> --display-name <name> --system-prompt <instructions>` opens Buzz's Create agent popup, prefilled, for a new agent of your own type (hosted on this server like you).
+- `buzz agents draft-update --channel <this chat's channel id> --agent-name <exact current name> [--display-name <new name>] [--system-prompt <instructions>]` opens Buzz's edit popup for one of your owner's agents, yourself included. Only the name and instructions change; --runtime, --provider, --model and --respond-to are ignored.
+Nothing is created or changed until your owner saves it. A draft reaches them only while their Buzz desktop is open, and the command succeeding doesn't mean they saw it, so say in the chat what you sent.
+</owner-review-drafts>"""
+
+
+def memory_note():
+    """Buzz's memory guide and this agent's core memory, from buzz-host. Empty
+    when buzz-host can't be reached, so a turn never waits long on it."""
+    if not re.fullmatch(r"[0-9a-f]{64}", agent_pubkey):
+        return ""
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as c:
+            c.settimeout(12)  # a slow relay must not hold the turn long
+            c.connect(host_sock)
+            c.sendall((json.dumps({"pubkey": agent_pubkey, "name": "memory_core", "args": {}}) + "\n").encode())
+            buf = b""
+            while b"\n" not in buf:
+                chunk = c.recv(65536)
+                if not chunk:
+                    break
+                buf += chunk
+        reply = json.loads(buf.split(b"\n", 1)[0] or b"{}")
+        if reply.get("error"):
+            log(f"memory note: {reply['error']}")
+        return (reply.get("result") or "").strip()
+    except Exception as e:
+        log(f"memory note failed: {e}")
+        return ""
+
+
+def attention_note():
+    """buzz-host's attention-note.txt for this agent: Buzz's review note while
+    Attention is on (the service keeps it current), else nothing."""
+    if not agent_dir:
+        return ""
+    try:
+        with open(os.path.join(agent_dir, "attention-note.txt"), encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def handle_client_line(line):
+    """buzz-acp -> adapter. Returns bytes to forward, or None if handled here."""
+    try:
+        msg = json.loads(line)
+    except ValueError:
+        return line
+    method = msg.get("method")
+    params = msg.get("params") or {}
+    if method == "initialize":
+        params["protocolVersion"] = 1
+        params.pop("info", None)
+        msg["params"] = params
+        return (json.dumps(msg, separators=(",", ":")) + "\n").encode()
+    if method in ("session/new", "session/load", "session/resume") and "id" in msg:
+        with lock:
+            pending_new[msg["id"]] = params.get("sessionId")
+        if method == "session/new" and "buzzHost" in (params.get("_meta") or {}):
+            start_in_workspace(msg["id"], params)
+            msg["params"] = params
+            return (json.dumps(msg, separators=(",", ":")) + "\n").encode()
+    elif method == "session/prompt" and "id" in msg:
+        sid = params.get("sessionId")
+        with lock:
+            s = sessions.setdefault(sid, {})
+            # Compacting: it runs once the compaction ends (end_compaction).
+            if s.get("compacting"):
+                s.setdefault("held", []).append(line)
+                return None
+        stripped, turn = take_turn_meta(params)
+        text = "\n".join(b.get("text", "") for b in params.get("prompt") or [] if isinstance(b, dict))
+        if turn:
+            key, root, events = turn
+        else:
+            # No events named (a wake or heartbeat, or an unpatched buzz-acp):
+            # the chat from the prompt, and no commands or picks.
+            key, root, _last, _count = parse_prompt(text)
+            events = []
+        ev = events[-1] if events else None
+        last = (str(ev.get("id", "")), str(ev.get("pubkey", "")), str(ev.get("content", ""))) if ev else None
+        count = len(events)
+        with lock:
+            if key:
+                s["key"] = key
+            key = s.get("key")
+            s["last_used"] = time.monotonic()
+        command = command_of(last) if key else None
+        if command:
+            event_id = last[0]
+            # A top-level mention in a channel starts its own thread; settings
+            # made there are meant for the channel.
+            settings_key = key.split("_", 1)[0] if key.endswith("_" + event_id) else key
+            # Alone, a command is the whole turn. Batched behind other
+            # messages, /model /effort /status /help are answered and the turn
+            # still runs (with the new setting); /stop and /new end it.
+            ends_turn = count <= 1 or command[0] in ("stop", "new")
+            if ends_turn:
+                threading.Thread(target=handle_command,
+                                 args=(msg["id"], command[0], command[1], sid, settings_key, root or None),
+                                 daemon=True).start()
+                return None
+            handle_command(None, command[0], command[1], sid, settings_key, root or None)
+        with lock:
+            s["running"] = s.get("running", 0) + 1
+            pending_prompt[msg["id"]] = sid
+            # Reply fallback: a turn someone asked this agent for.
+            if turn and key and any(addresses_agent(e) for e in events):
+                turns[msg["id"]] = {"channel": key.split("_", 1)[0], "root": root or None,
+                                    "start": time.time(), "text": ""}
+                s["turn"] = msg["id"]
+        try:
+            apply_settings(sid, key, picks_of(events))
+        except Exception as e:  # never block a turn on settings
+            log(f"applying settings failed: {e}")
+        extra = []
+        # Memory: once per session in this process, as Buzz's prompt has it.
+        with lock:
+            first = not s.get("memory_sent")
+            s["memory_sent"] = True
+        if first:
+            note = memory_note()
+            if note:
+                extra.append(note)
+            if re.fullmatch(r"[0-9a-f]{64}", agent_pubkey):
+                extra.append(DRAFTS_NOTE)
+        # The chat's workspace folders (and its Canvas), as Buzz hands a Solo
+        # chat's workspace to a local agent with every turn.
+        if key:
+            note = workspace_note(sid, key)
+            if note:
+                extra.append(note)
+        note = attention_note()
+        # Buzz's end-of-turn Attention review, as Buzz adds it to a local
+        # agent's turns. A wake's prompt already ends with it.
+        if note and "<attention>" not in text:
+            extra.append(note)
+        if extra and isinstance(params.get("prompt"), list):
+            params["prompt"] += [{"type": "text", "text": t} for t in extra]
+        if extra or stripped:
+            msg["params"] = params
+            return (json.dumps(msg, separators=(",", ":")) + "\n").encode()
+    elif method in ("session/set_config_option", "session/set_model") and "id" in msg:
+        with lock:
+            pending_cfg[msg["id"]] = (params.get("sessionId"), method, params)
+    return line
+
+
+def handle_adapter_line(line):
+    """adapter -> buzz-acp. Returns None to swallow."""
+    try:
+        msg = json.loads(line)
+    except ValueError:
+        return line
+    rid = msg.get("id")
+    if isinstance(rid, str) and rid.startswith("buzz-host-") and "method" not in msg:
+        with lock:
+            w = waiters.get(rid)
+            if w:
+                w[1] = msg
+                w[0].set()
+        return None
+    if "method" not in msg and rid is not None:
+        with lock:
+            if rid in pending_cfg:
+                sid, method, params = pending_cfg.pop(rid)
+                result = msg.get("result")
+                if isinstance(result, dict) and sid:
+                    s = sessions.setdefault(sid, {})
+                    if result.get("configOptions"):
+                        s["options"] = result["configOptions"]
+                    elif method == "session/set_config_option":
+                        for o in s.get("options") or []:
+                            if option_id(o) == params.get("configId"):
+                                o["currentValue"] = params.get("value")
+                    elif method == "session/set_model":
+                        o = option_by(s.get("options"), MODEL_KEYS)
+                        if o:
+                            o["currentValue"] = params.get("modelId")
+            elif rid in pending_new:
+                sid = (msg.get("result") or {}).get("sessionId") or pending_new[rid]
+                pending_new.pop(rid)
+                ws = pending_ws.pop(rid, None)
+                if sid:
+                    s = sessions.setdefault(sid, {})
+                    s["options"] = (msg.get("result") or {}).get("configOptions") or s.get("options") or []
+                    if ws:
+                        s.update(ws)
+            elif rid in pending_prompt:
+                sid = pending_prompt.pop(rid)
+                if sid in sessions:
+                    sessions[sid]["running"] = max(0, sessions[sid].get("running", 1) - 1)
+                    if sessions[sid].get("turn") == rid:
+                        sessions[sid].pop("turn")
+                turn = turns.pop(rid, None)
+                if turn and (msg.get("result") or {}).get("stopReason") == "end_turn" and turn["text"].strip():
+                    spawn(reply_fallback, turn)
+    elif msg.get("method") == "session/update":
+        p = msg.get("params") or {}
+        upd = p.get("update") or {}
+        with lock:
+            s = sessions.setdefault(p.get("sessionId"), {})
+            if upd.get("sessionUpdate") == "config_option_update" and upd.get("configOptions"):
+                s["options"] = upd["configOptions"]
+            elif upd.get("sessionUpdate") == "available_commands_update":
+                s["commands"] = [c.get("name") for c in upd.get("availableCommands") or [] if isinstance(c, dict)]
+            turn = turns.get(s.get("turn"))
+            if turn is not None:
+                # The reply fallback posts only what comes after the last tool call.
+                if upd.get("sessionUpdate") == "agent_message_chunk":
+                    content = upd.get("content") or {}
+                    if content.get("type") == "text":
+                        turn["text"] += content.get("text") or ""
+                elif upd.get("sessionUpdate") == "tool_call":
+                    turn["text"] = ""
+            # A compaction is this proxy's turn: buzz-acp isn't in one.
+            if s.get("compacting"):
+                return None
+    elif "method" in msg and rid is not None:
+        sid = (msg.get("params") or {}).get("sessionId")
+        with lock:
+            compacting = bool(sid and sessions.get(sid, {}).get("compacting"))
+        if compacting:  # nothing in buzz-acp is waiting to answer it
+            send_adapter({"jsonrpc": "2.0", "id": rid,
+                          "error": {"code": -32603, "message": "The session is compacting"}})
+            return None
+    return line
+
+
+def pump_client():
+    for line in sys.stdin.buffer:
+        out = handle_client_line(line)
+        if out is None:
+            continue
+        try:
+            send_adapter_raw(out)
+        except BrokenPipeError:
+            break
+    try:
+        child.stdin.close()
+    except OSError:
+        pass
+
+
+def pump_adapter():
+    for line in child.stdout:
+        out = handle_adapter_line(line)
+        if out is not None:
+            with to_client_lock:
+                sys.stdout.buffer.write(out)
+                sys.stdout.buffer.flush()
+
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        sys.exit("usage: acp-proxy <adapter> [args...]")
+    child = subprocess.Popen(sys.argv[1:], stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0)
+    if control_sock:
+        threading.Thread(target=serve_control, daemon=True).start()
+    threading.Thread(target=pump_client, daemon=True).start()
+    reader = threading.Thread(target=pump_adapter, daemon=True)
+    reader.start()
+    code = child.wait()
+    reader.join(5)
+    sys.exit(code)

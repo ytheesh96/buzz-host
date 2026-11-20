@@ -1,0 +1,17 @@
+[Unit]
+Description=Buzz agent %i (buzz-host)
+After=network-online.target buzz-host.service
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=%h/.local/lib/buzz-host/agent-run %i
+Restart=always
+RestartSec=10
+RestartPreventExitStatus=78
+UMask=0077
+MemoryMax=2G
+
+[Install]
+WantedBy=default.target

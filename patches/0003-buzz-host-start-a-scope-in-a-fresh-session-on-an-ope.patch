@@ -1,0 +1,67 @@
+From bd5f69b808327cfe0db1a9507dc55517fbf45f15 Mon Sep 17 00:00:00 2001
+From: buzz-host <buzz-host@localhost>
+Date: Sat, 14 Nov 2026 03:04:04 -0500
+Subject: [PATCH 3/3] buzz-host: start a scope in a fresh session on an
+ operator request file
+
+A file named after the scope in $BUZZ_ACP_FRESH_SESSION_DIR asks the next
+turn there to drop its cached session, like the owner's !rotate but without
+a chat message.
+---
+ crates/buzz-acp/src/pool.rs  |  8 ++++++++
+ crates/buzz-acp/src/scope.rs | 20 ++++++++++++++++++++
+ 2 files changed, 28 insertions(+)
+
+diff --git a/crates/buzz-acp/src/pool.rs b/crates/buzz-acp/src/pool.rs
+index dea78cd17..5349d7fc3 100644
+--- a/crates/buzz-acp/src/pool.rs
++++ b/crates/buzz-acp/src/pool.rs
+@@ -2530,6 +2530,14 @@ pub async fn run_prompt_task(
+         },
+         PromptSource::Heartbeat => None,
+     };
++    // buzz-host patch: an operator's fresh-session request for this scope drops
++    // the cached session, so this turn starts a new one (as `!rotate` does).
++    if let PromptSource::Channel(scope) = &source {
++        if crate::scope::take_fresh_session_request(scope) {
++            tracing::info!(target: "pool::session", "fresh session requested for {scope:?}");
++            agent.state.invalidate(&source);
++        }
++    }
+     // Whether this turn's prompt renders the channel as a DM. `format_prompt`
+     // derives the same value from `resolved_channel_info`, which is fixed
+     // from here on, so the main loop's native-steer guard can rely on it now
+diff --git a/crates/buzz-acp/src/scope.rs b/crates/buzz-acp/src/scope.rs
+index ab0a6a672..aa9ecd1ca 100644
+--- a/crates/buzz-acp/src/scope.rs
++++ b/crates/buzz-acp/src/scope.rs
+@@ -53,6 +53,26 @@ pub fn record_channel_labels(channel_id: Uuid, tags: &[serde_json::Value]) {
+     }
+ }
+ 
++/// Consume an operator request to start `scope` in a fresh provider session.
++///
++/// buzz-host patch: a control plane outside the harness (no chat message, unlike
++/// the owner's `!rotate`) asks for a new session by creating the file
++/// `$BUZZ_ACP_FRESH_SESSION_DIR/<channel-uuid>` (conversation scope) or
++/// `<channel-uuid>_<root-event-id>` (thread scope). The file is removed here.
++pub fn take_fresh_session_request(scope: &SessionScope) -> bool {
++    let Some(dir) = std::env::var_os("BUZZ_ACP_FRESH_SESSION_DIR") else {
++        return false;
++    };
++    let name = match scope {
++        SessionScope::Conversation { channel_id } => channel_id.to_string(),
++        SessionScope::Thread {
++            channel_id,
++            root_event_id,
++        } => format!("{channel_id}_{root_event_id}"),
++    };
++    std::fs::remove_file(std::path::Path::new(&dir).join(name)).is_ok()
++}
++
+ /// True when the channel was last seen labelled a Solo chat.
+ pub fn is_solo_channel(channel_id: Uuid) -> bool {
+     SOLO_CHANNELS
+-- 
+2.56.0
+

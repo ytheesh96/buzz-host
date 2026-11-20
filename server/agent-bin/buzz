@@ -1,0 +1,19 @@
+#!/bin/bash
+# buzz CLI for a buzz-host agent: always acts as the agent named by
+# BUZZ_HOST_AGENT or BUZZHOST_AGENT (both set by agent-run), whatever BUZZ_*
+# the calling shell has. Hermes strips every BUZZ_* name from its terminal,
+# so BUZZHOST_AGENT (no BUZZ_ prefix) is the one that reaches it there.
+# The owner's ~/.bashrc may export another identity, so credentials are
+# loaded here from the agent's own files.
+set -euo pipefail
+real="$HOME/.local/lib/buzz-host/bin/buzz"
+a="${BUZZ_HOST_AGENT:-${BUZZHOST_AGENT:-}}"
+if [[ "$a" =~ ^[0-9a-f]{64}$ ]]; then
+  d="$HOME/.local/share/buzz-host/agents/$a"
+  BUZZ_PRIVATE_KEY="$(tr -d '[:space:]' < "$d/key")"
+  BUZZ_AUTH_TAG="$(cat "$d/auth.json")"
+  relay="$(sed -n "s/^export BUZZ_RELAY_URL='\(.*\)'\$/\1/p" "$d/runtime.env")"
+  export BUZZ_PRIVATE_KEY BUZZ_AUTH_TAG
+  export BUZZ_RELAY_URL="${relay/#ws/http}"
+fi
+exec "$real" "$@"

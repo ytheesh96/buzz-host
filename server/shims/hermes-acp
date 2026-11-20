@@ -1,0 +1,4 @@
+#!/bin/sh
+# Args ignored: buzz-acp's legacy default would pass "acp".
+export HERMES_ACP_SKIP_CONFIGURED_MCP="${HERMES_ACP_SKIP_CONFIGURED_MCP:-1}"
+exec "$HOME/.local/lib/buzz-host/bin/acp-proxy" "$HOME/.local/bin/hermes-acp"

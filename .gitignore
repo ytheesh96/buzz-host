@@ -1,0 +1,7 @@
+.backup-*/
+*.bak-*
+__pycache__/
+*.pyc
+node_modules/
+*.tgz
+.DS_Store

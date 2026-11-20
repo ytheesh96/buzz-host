@@ -1,0 +1,9 @@
+name: buzz-host-session-env
+version: 1.0.0
+description: >
+  Gives each buzz-host agent's Hermes session its Buzz identity. hermes-acp only views a session;
+  its tools run in this shared gateway, whose environment has no per-agent values. buzz-host runs
+  every agent with ~/buzz-agents/<pubkey> as the session cwd, so this plugin maps a session to its
+  agent and sets BUZZHOST_AGENT for that session's commands (unset for every other session). The
+  `buzz` shell function in ~/.bash_profile then runs that agent's CLI wrapper.
+author: local

@@ -1,0 +1,2 @@
+#!/bin/sh
+exec "$HOME/.local/lib/buzz-host/bin/acp-proxy" "$HOME/.local/lib/buzz-host/npm/node_modules/.bin/codex-acp"

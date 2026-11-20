@@ -1,0 +1,43 @@
+#!/bin/bash
+# Runs one buzz-host agent: buzz-agent@<pubkey>.service ExecStart.
+set -euo pipefail
+pubkey="$1"
+[[ "$pubkey" =~ ^[0-9a-f]{64}$ ]] || { echo "bad pubkey" >&2; exit 78; }
+d="$HOME/.local/share/buzz-host/agents/$pubkey"
+[[ -f "$d/auth.json" && -f "$d/runtime.env" ]] || { echo "agent not activated" >&2; exit 78; }
+BUZZ_PRIVATE_KEY="$(tr -d '[:space:]' < "$d/key")"
+BUZZ_AUTH_TAG="$(cat "$d/auth.json")"
+export BUZZ_PRIVATE_KEY BUZZ_AUTH_TAG
+# shellcheck source=/dev/null
+source "$d/runtime.env"
+export BUZZ_ACP_RESPOND_TO="${BUZZ_ACP_RESPOND_TO:-owner-only}"
+# Publish turn activity (tool calls, steps) to the owner, encrypted, as kind
+# 24200 observer frames: Buzz shows them like a local agent's activity.
+export BUZZ_ACP_RELAY_OBSERVER="${BUZZ_ACP_RELAY_OBSERVER:-true}"
+# Non-secret marker: agent-bin/buzz and the owner's ~/.bashrc key off it.
+export BUZZ_HOST_AGENT="$pubkey"
+# Same, under the name the Hermes plugin also sets.
+export BUZZHOST_AGENT="$pubkey"
+# Hermes runs every turn's tools in its shared gateway, not under this process,
+# so none of this env reaches them. Its buzz-host-session-env plugin
+# (hermes-plugin/) sets BUZZHOST_AGENT per session instead, and the `buzz`
+# function in ~/.bash_profile routes to agent-bin/buzz.
+export BUZZ_MANAGED_AGENT="$pubkey"
+export PATH="$HOME/.local/lib/buzz-host/agent-bin:$HOME/.local/lib/buzz-host/bin:$HOME/.local/share/mise/command-wrappers/bin:$HOME/.local/share/mise/shims:$HOME/.local/bin:/usr/local/bin:/usr/bin"
+# Chat commands (acp-proxy) and, with the patched buzz-acp from build-acp.sh,
+# fresh-session requests and thread-scoped sessions.
+export BUZZ_HOST_AGENT_DIR="$d"
+# Stop from Buzz reaches acp-proxy here (short path: Unix sockets cap at ~108 bytes).
+run_dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/buzz-host"
+mkdir -p -m 700 "$run_dir"
+export BUZZ_HOST_CONTROL_SOCK="$run_dir/$pubkey.sock"
+if [[ -f "$HOME/.local/lib/buzz-host/bin/buzz-acp.version" ]]; then
+  export BUZZ_ACP_FRESH_SESSION_DIR="$d/fresh"
+  export BUZZ_ACP_SESSION_POLICY="${BUZZ_ACP_SESSION_POLICY:-thread}"
+  # Attention wakes (patch 4): buzz-host drops a JSON request here to start a
+  # turn; buzz-acp writes the outcome to wake/results/<id>.json.
+  export BUZZ_ACP_WAKE_DIR="$d/wake"
+  mkdir -p "$d/fresh" "$d/wake/results"
+fi
+cd "$HOME/buzz-agents/$pubkey"
+exec "$HOME/.local/lib/buzz-host/bin/buzz-acp"

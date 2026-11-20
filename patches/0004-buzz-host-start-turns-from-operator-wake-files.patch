@@ -1,0 +1,570 @@
+From 07bd5b97bb973479c32e68bbb036f9cec97eb3fd Mon Sep 17 00:00:00 2001
+From: buzz-host <buzz-host@localhost>
+Date: Sun, 15 Nov 2026 23:37:36 -0500
+Subject: [PATCH] buzz-host: start turns from operator wake files
+
+A JSON file in $BUZZ_ACP_WAKE_DIR starts a turn: in a chat or thread's own
+session when it names a channel (after any turn or queued message there), or
+as an independent turn in a fresh session on the heartbeat path. The outcome
+is written to results/<id>.json. Messages arriving in a chat during its wake
+wait instead of steering into it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/buzz-acp/src/host_wake.rs | 328 +++++++++++++++++++++++++++++++
+ crates/buzz-acp/src/lib.rs       | 139 +++++++++++++
+ crates/buzz-acp/src/queue.rs     |  18 ++
+ 3 files changed, 485 insertions(+)
+ create mode 100644 crates/buzz-acp/src/host_wake.rs
+
+diff --git a/crates/buzz-acp/src/host_wake.rs b/crates/buzz-acp/src/host_wake.rs
+new file mode 100644
+index 000000000..d8fc618a4
+--- /dev/null
++++ b/crates/buzz-acp/src/host_wake.rs
+@@ -0,0 +1,328 @@
++//! buzz-host patch: operator wakes.
++//!
++//! A control plane outside the harness (buzz-host's Attention service) starts
++//! a turn by dropping a JSON file into `$BUZZ_ACP_WAKE_DIR`:
++//!
++//! ```json
++//! {"id": "…", "channel": "<uuid>", "root": "<64-hex>", "prompt": "…"}
++//! ```
++//!
++//! * With `channel` (and optionally `root`), the turn runs in that chat's or
++//!   thread's own session, after any turn already running there, and with no
++//!   relay event: the prompt is the wake text under a `<context>` header naming
++//!   the channel, as a mention's prompt would.
++//! * Without `channel`, it runs as an independent turn on the heartbeat path,
++//!   in a fresh session.
++//!
++//! The main loop scans the directory every two seconds. A request is removed
++//! when its turn starts; its outcome is written to `results/<id>.json`.
++//! Messages that arrive in a chat while a wake runs there wait for it rather
++//! than steering into it (a steer would cancel the wake's work).
++
++use std::path::{Path, PathBuf};
++use std::sync::Mutex;
++
++use serde::Deserialize;
++use uuid::Uuid;
++
++use crate::pool::PromptOutcome;
++use crate::scope::SessionScope;
++
++/// Largest accepted wake prompt.
++const MAX_PROMPT_BYTES: usize = 64 * 1024;
++
++#[derive(Debug, Clone, Deserialize)]
++#[serde(deny_unknown_fields)]
++pub struct WakeRequest {
++    pub id: String,
++    #[serde(default)]
++    pub channel: Option<Uuid>,
++    #[serde(default)]
++    pub root: Option<String>,
++    pub prompt: String,
++}
++
++#[derive(Debug)]
++pub struct PendingWake {
++    pub path: PathBuf,
++    pub request: WakeRequest,
++}
++
++/// Wake turns in flight, by turn id: the wake id and its scope.
++static IN_FLIGHT: Mutex<Vec<(String, String, Option<SessionScope>)>> = Mutex::new(Vec::new());
++
++pub fn wake_dir() -> Option<PathBuf> {
++    std::env::var_os("BUZZ_ACP_WAKE_DIR")
++        .filter(|dir| !dir.is_empty())
++        .map(PathBuf::from)
++}
++
++fn valid_id(id: &str) -> bool {
++    (1..=128).contains(&id.len())
++        && id
++            .bytes()
++            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
++}
++
++fn valid_root(root: &str) -> bool {
++    root.len() == 64 && root.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
++}
++
++impl WakeRequest {
++    fn check(&self) -> Result<(), String> {
++        if !valid_id(&self.id) {
++            return Err("id must be 1-128 characters of [A-Za-z0-9._-]".into());
++        }
++        if self.prompt.trim().is_empty() {
++            return Err("prompt is empty".into());
++        }
++        if self.prompt.len() > MAX_PROMPT_BYTES {
++            return Err(format!("prompt is longer than {MAX_PROMPT_BYTES} bytes"));
++        }
++        match (&self.channel, &self.root) {
++            (None, Some(_)) => Err("root requires channel".into()),
++            (_, Some(root)) if !valid_root(root) => Err("root must be 64 lowercase hex".into()),
++            _ => Ok(()),
++        }
++    }
++
++    /// The session this wake runs in; `None` for an independent turn.
++    pub fn scope(&self) -> Option<SessionScope> {
++        let channel_id = self.channel?;
++        Some(match &self.root {
++            Some(root) => SessionScope::Thread {
++                channel_id,
++                root_event_id: root.clone(),
++            },
++            None => SessionScope::Conversation { channel_id },
++        })
++    }
++
++    /// The turn's prompt. A chat wake gets the `<context>` header that a
++    /// mention's prompt carries, so tools that key on it (and the agent) know
++    /// where the turn is.
++    pub fn prompt_text(&self) -> String {
++        let Some(channel_id) = self.channel else {
++            return self.prompt.clone();
++        };
++        let mut context = match &self.root {
++            Some(root) => format!(
++                "Scope: thread\nSession scope: thread\nChannel: {channel_id} (#{channel_id})\nThread root: {root}\n\
++                 This turn was started by your Attention, not by a message. Use `buzz messages thread --channel {channel_id} --event {root}` for thread context; reply in this thread with `--reply-to {root}`."
++            ),
++            None => format!(
++                "Scope: channel\nSession scope: channel\nChannel: {channel_id} (#{channel_id})\n\
++                 This turn was started by your Attention, not by a message. Use `buzz messages get --channel {channel_id}` for recent messages if needed."
++            ),
++        };
++        context.push('\n');
++        format!(
++            "{}\n\n{}",
++            crate::prompt_framing::semantic_section("context", context.trim_end()),
++            self.prompt
++        )
++    }
++}
++
++/// Wake requests waiting in `dir`, oldest name first. Malformed files are
++/// answered with an `invalid` result and removed.
++pub fn scan(dir: &Path) -> Vec<PendingWake> {
++    let Ok(entries) = std::fs::read_dir(dir) else {
++        return Vec::new();
++    };
++    let mut paths: Vec<PathBuf> = entries
++        .filter_map(Result::ok)
++        .map(|entry| entry.path())
++        .filter(|path| {
++            path.extension().is_some_and(|ext| ext == "json")
++                && path
++                    .file_name()
++                    .and_then(|name| name.to_str())
++                    .is_some_and(|name| !name.starts_with('.'))
++                && path.is_file()
++        })
++        .collect();
++    paths.sort();
++    let mut pending = Vec::new();
++    for path in paths {
++        let parsed = std::fs::read_to_string(&path)
++            .map_err(|error| error.to_string())
++            .and_then(|text| {
++                serde_json::from_str::<WakeRequest>(&text).map_err(|error| error.to_string())
++            })
++            .and_then(|request| request.check().map(|()| request));
++        match parsed {
++            Ok(request) => pending.push(PendingWake { path, request }),
++            Err(detail) => {
++                let stem = path
++                    .file_stem()
++                    .and_then(|stem| stem.to_str())
++                    .filter(|stem| valid_id(stem))
++                    .unwrap_or("invalid")
++                    .to_string();
++                tracing::warn!(target: "host_wake", path = %path.display(), "invalid wake request: {detail}");
++                write_result(dir, &stem, None, "invalid", &detail);
++                let _ = std::fs::remove_file(&path);
++            }
++        }
++    }
++    pending
++}
++
++/// Takes the request: true when this call removed its file.
++pub fn claim(wake: &PendingWake) -> bool {
++    std::fs::remove_file(&wake.path).is_ok()
++}
++
++pub fn register(turn_id: &str, wake: &WakeRequest) {
++    if let Ok(mut in_flight) = IN_FLIGHT.lock() {
++        in_flight.push((turn_id.to_string(), wake.id.clone(), wake.scope()));
++    }
++    tracing::info!(target: "host_wake", wake = %wake.id, turn = %turn_id, channel = ?wake.channel, "wake_started");
++}
++
++/// Whether a wake turn is running in `scope`.
++pub fn is_wake_scope(scope: &SessionScope) -> bool {
++    IN_FLIGHT.lock().is_ok_and(|in_flight| {
++        in_flight
++            .iter()
++            .any(|(_, _, wake_scope)| wake_scope.as_ref() == Some(scope))
++    })
++}
++
++/// Records the outcome of turn `turn_id` if it was a wake. Returns true when
++/// it was, so the caller drops its (empty) batch instead of requeueing it.
++pub fn finish(turn_id: &str, outcome: &PromptOutcome) -> bool {
++    let Some((_, wake_id, _)) = IN_FLIGHT.lock().ok().and_then(|mut in_flight| {
++        let index = in_flight.iter().position(|(turn, _, _)| turn == turn_id)?;
++        Some(in_flight.remove(index))
++    }) else {
++        return false;
++    };
++    let (label, detail) = match outcome {
++        PromptOutcome::Ok(reason) => ("ok", format!("{reason:?}")),
++        PromptOutcome::Cancelled | PromptOutcome::CancelDrainTimeout(_) => {
++            ("cancelled", String::new())
++        }
++        PromptOutcome::Timeout(_) => ("timeout", String::new()),
++        PromptOutcome::Error(error) => ("error", error.to_string()),
++        PromptOutcome::ProjectContextIndeterminate(detail) => ("error", detail.clone()),
++        PromptOutcome::AgentExited => ("error", "agent exited".into()),
++    };
++    tracing::info!(target: "host_wake", wake = %wake_id, turn = %turn_id, outcome = label, "wake_finished");
++    if let Some(dir) = wake_dir() {
++        write_result(&dir, &wake_id, Some(turn_id), label, &detail);
++    }
++    true
++}
++
++fn write_result(dir: &Path, id: &str, turn_id: Option<&str>, outcome: &str, detail: &str) {
++    let results = dir.join("results");
++    if std::fs::create_dir_all(&results).is_err() {
++        return;
++    }
++    let body = serde_json::json!({
++        "id": id,
++        "turn_id": turn_id,
++        "outcome": outcome,
++        "detail": detail,
++        "finished_at": chrono::Utc::now().timestamp(),
++    });
++    let tmp = results.join(format!(".{id}.tmp"));
++    if std::fs::write(&tmp, body.to_string()).is_ok() {
++        let _ = std::fs::rename(&tmp, results.join(format!("{id}.json")));
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn request(json: &str) -> Result<WakeRequest, String> {
++        serde_json::from_str::<WakeRequest>(json)
++            .map_err(|error| error.to_string())
++            .and_then(|request| request.check().map(|()| request))
++    }
++
++    const CHANNEL: &str = "0b4e2c1a-5d6f-4a8b-9c0d-1e2f3a4b5c6d";
++
++    #[test]
++    fn scopes_follow_the_delivery_address() {
++        let independent = request(r#"{"id":"t1","prompt":"hi"}"#).unwrap();
++        assert_eq!(independent.scope(), None);
++        assert_eq!(independent.prompt_text(), "hi");
++
++        let chat = request(&format!(
++            r#"{{"id":"t2","channel":"{CHANNEL}","prompt":"hi"}}"#
++        ))
++        .unwrap();
++        assert!(matches!(
++            chat.scope(),
++            Some(SessionScope::Conversation { .. })
++        ));
++        let text = chat.prompt_text();
++        assert!(text.contains(&format!("Channel: {CHANNEL} (#{CHANNEL})")));
++        assert!(text.ends_with("\n\nhi"));
++
++        let root = "a".repeat(64);
++        let thread = request(&format!(
++            r#"{{"id":"t3","channel":"{CHANNEL}","root":"{root}","prompt":"hi"}}"#
++        ))
++        .unwrap();
++        assert!(matches!(thread.scope(), Some(SessionScope::Thread { .. })));
++        assert!(thread
++            .prompt_text()
++            .contains(&format!("Thread root: {root}")));
++    }
++
++    #[test]
++    fn rejects_malformed_requests() {
++        assert!(request(r#"{"id":"","prompt":"hi"}"#).is_err());
++        assert!(request(r#"{"id":"a/b","prompt":"hi"}"#).is_err());
++        assert!(request(r#"{"id":"x","prompt":"  "}"#).is_err());
++        assert!(request(r#"{"id":"x","root":"aa","prompt":"hi"}"#).is_err());
++        assert!(request(&format!(
++            r#"{{"id":"x","channel":"{CHANNEL}","root":"AB","prompt":"hi"}}"#
++        ))
++        .is_err());
++        assert!(request(r#"{"id":"x","prompt":"hi","extra":1}"#).is_err());
++    }
++
++    #[test]
++    fn scan_orders_by_name_and_answers_invalid_files() {
++        let dir = std::env::temp_dir().join(format!("host-wake-{}", Uuid::new_v4()));
++        std::fs::create_dir_all(&dir).unwrap();
++        std::fs::write(dir.join("2-b.json"), r#"{"id":"b","prompt":"second"}"#).unwrap();
++        std::fs::write(dir.join("1-a.json"), r#"{"id":"a","prompt":"first"}"#).unwrap();
++        std::fs::write(dir.join("bad.json"), "not json").unwrap();
++        std::fs::write(dir.join(".partial.json"), "{").unwrap();
++        let pending = scan(&dir);
++        let ids: Vec<_> = pending
++            .iter()
++            .map(|wake| wake.request.id.as_str())
++            .collect();
++        assert_eq!(ids, ["a", "b"]);
++        assert!(!dir.join("bad.json").exists());
++        let result: serde_json::Value =
++            serde_json::from_str(&std::fs::read_to_string(dir.join("results/bad.json")).unwrap())
++                .unwrap();
++        assert_eq!(result["outcome"], "invalid");
++        assert!(claim(&pending[0]));
++        assert!(!claim(&pending[0]));
++        std::fs::remove_dir_all(&dir).unwrap();
++    }
++
++    #[test]
++    fn wake_scopes_are_tracked_until_finished() {
++        let chat = request(&format!(
++            r#"{{"id":"w1","channel":"{CHANNEL}","prompt":"hi"}}"#
++        ))
++        .unwrap();
++        let scope = chat.scope().unwrap();
++        register("turn-w1", &chat);
++        assert!(is_wake_scope(&scope));
++        assert!(finish("turn-w1", &PromptOutcome::Cancelled));
++        assert!(!is_wake_scope(&scope));
++        assert!(!finish("turn-w1", &PromptOutcome::Cancelled));
++    }
++}
+diff --git a/crates/buzz-acp/src/lib.rs b/crates/buzz-acp/src/lib.rs
+index 8d6849246..c2e35fd92 100644
+--- a/crates/buzz-acp/src/lib.rs
++++ b/crates/buzz-acp/src/lib.rs
+@@ -9,6 +9,7 @@ mod config;
+ mod edit_routing;
+ mod engram_fetch;
+ mod filter;
++mod host_wake;
+ mod isolated_execution;
+ mod observer;
+ mod pool;
+@@ -854,6 +855,11 @@ impl QueuedNormalListenerEvent {
+         if !self.accepted || !queue.is_scope_in_flight(&self.scope) {
+             return;
+         }
++        // buzz-host patch: a message for a chat whose wake turn is running
++        // waits for it; steering would cancel the wake's work.
++        if host_wake::is_wake_scope(&self.scope) {
++            return;
++        }
+         let Some(signal) = mode_gate_signal(handling, &self.effective_author, owner) else {
+             return;
+         };
+@@ -3121,6 +3127,12 @@ async fn run_harness(
+         None
+     };
+     let mut heartbeat_in_flight = false;
++    // buzz-host patch: operator wakes from $BUZZ_ACP_WAKE_DIR (see host_wake).
++    let mut host_wake_tick = host_wake::wake_dir().map(|_| {
++        let mut tick = tokio::time::interval(Duration::from_secs(2));
++        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
++        tick
++    });
+ 
+     let mut presence_heartbeat = if config.presence_enabled {
+         let interval = Duration::from_secs(60);
+@@ -3928,6 +3940,25 @@ async fn run_harness(
+                     }
+                     None
+                 }
++                _ = async {
++                    match host_wake_tick.as_mut() {
++                        Some(tick) => tick.tick().await,
++                        None => std::future::pending().await,
++                    }
++                } => {
++                    if pool_ready {
++                        for (scope, thread_tags) in dispatch_host_wakes(
++                            &mut pool,
++                            &mut queue,
++                            &ctx,
++                            &mut heartbeat_in_flight,
++                            &mut last_activity,
++                        ) {
++                            typing_channels.insert(scope, thread_tags);
++                        }
++                    }
++                    None
++                }
+                 _ = async {
+                     match presence_heartbeat.as_mut() {
+                         Some(t) => t.tick().await,
+@@ -5285,6 +5316,11 @@ fn handle_prompt_result(
+     rest_client: Option<&relay::RestClient>,
+     last_activity: &mut tokio::time::Instant,
+ ) -> LoopAction {
++    // buzz-host patch: a wake turn reports its outcome and has no events to
++    // requeue.
++    if host_wake::finish(&result.turn_id, &result.outcome) {
++        result.batch = None;
++    }
+     // Start a full idle interval when channel work settles, before releasing
+     // its in-flight guard. Heartbeats must not keep an otherwise idle pool alive.
+     match &result.source {
+@@ -5898,6 +5934,109 @@ fn dispatch_heartbeat(
+     tracing::info!(agent = agent_index, "heartbeat_fired");
+ }
+ 
++/// buzz-host patch: start the operator wakes waiting in `$BUZZ_ACP_WAKE_DIR`
++/// that can run now (see [`host_wake`]). A chat wake waits while its scope has
++/// a turn in flight or queued events, so people's messages go first; an
++/// independent wake runs on the heartbeat path, one at a time, each in a
++/// fresh session. Returns the scopes to show typing in.
++fn dispatch_host_wakes(
++    pool: &mut AgentPool,
++    queue: &mut EventQueue,
++    ctx: &Arc<PromptContext>,
++    heartbeat_in_flight: &mut bool,
++    last_activity: &mut tokio::time::Instant,
++) -> Vec<(scope::SessionScope, ThreadTags)> {
++    let Some(dir) = host_wake::wake_dir() else {
++        return Vec::new();
++    };
++    let mut typing = Vec::new();
++    for wake in host_wake::scan(&dir) {
++        let scope = wake.request.scope();
++        if let Some(scope) = &scope {
++            if queue.is_scope_in_flight(scope)
++                || queue.has_pending_for(scope)
++                || host_wake::is_wake_scope(scope)
++            {
++                continue;
++            }
++        } else if *heartbeat_in_flight {
++            continue;
++        }
++        let Some(mut agent) = pool.try_claim(scope.as_ref()) else {
++            break;
++        };
++        if !host_wake::claim(&wake) {
++            pool.return_agent(agent);
++            continue;
++        }
++        let prompt_text = wake.request.prompt_text();
++        let (control_tx, control_rx) = tokio::sync::oneshot::channel::<ControlSignal>();
++        let turn_id = Uuid::new_v4().to_string();
++        let task_turn_id = turn_id.clone();
++        let agent_index = agent.index;
++        let result_tx = pool.result_tx();
++        let ctx_clone = Arc::clone(ctx);
++        let batch = match &scope {
++            Some(scope) => {
++                queue.begin_host_wake(scope);
++                let owner_generation = pool.record_scope_owner(scope.clone(), agent.index);
++                agent
++                    .state
++                    .set_scope_owner_generation(scope.clone(), owner_generation);
++                Some(queue::FlushBatch {
++                    channel_id: scope.channel_id(),
++                    scope: scope.clone(),
++                    events: Vec::new(),
++                    cancelled_events: Vec::new(),
++                    cancel_reason: None,
++                })
++            }
++            None => {
++                agent.state.invalidate(&PromptSource::Heartbeat);
++                *heartbeat_in_flight = true;
++                None
++            }
++        };
++        host_wake::register(&turn_id, &wake.request);
++        let abort_handle = pool.join_set.spawn(async move {
++            pool::run_prompt_task(
++                agent,
++                batch,
++                Some(prompt_text),
++                ctx_clone,
++                result_tx,
++                Some(control_rx),
++                task_turn_id,
++                Default::default(),
++            )
++            .await;
++        });
++        pool.task_map_mut().insert(
++            abort_handle.id(),
++            pool::TaskMeta {
++                agent_index,
++                channel_id: scope.as_ref().map(scope::SessionScope::channel_id),
++                scope: scope.clone(),
++                turn_id,
++                recoverable_batch: None,
++                control_tx: Some(control_tx),
++                steer_tx: None,
++                successful_steer_deliveries: HashSet::new(),
++            },
++        );
++        *last_activity = tokio::time::Instant::now();
++        if let Some(scope) = scope {
++            let thread_tags = ThreadTags {
++                root_event_id: scope.root_event_id().map(str::to_string),
++                parent_event_id: scope.root_event_id().map(str::to_string),
++                ..Default::default()
++            };
++            typing.push((scope, thread_tags));
++        }
++    }
++    typing
++}
++
+ #[cfg(test)]
+ mod agent_draft_prompt_tests {
+     #[test]
+diff --git a/crates/buzz-acp/src/queue.rs b/crates/buzz-acp/src/queue.rs
+index d02da9f62..5af468a54 100644
+--- a/crates/buzz-acp/src/queue.rs
++++ b/crates/buzz-acp/src/queue.rs
+@@ -623,6 +623,24 @@ impl EventQueue {
+         })
+     }
+ 
++    /// buzz-host patch: mark `scope` in flight for an operator wake turn,
++    /// which has no queued events. `mark_complete` releases it as usual.
++    pub fn begin_host_wake(&mut self, scope: &SessionScope) {
++        self.in_flight_scopes.insert(scope.clone());
++        self.in_flight_deadlines
++            .insert(scope.clone(), Instant::now() + self.in_flight_deadline);
++        self.in_flight_batch_sizes.insert(scope.clone(), 0);
++    }
++
++    /// buzz-host patch: whether `scope` has queued or cancelled events
++    /// waiting, which an operator wake lets go first.
++    pub fn has_pending_for(&self, scope: &SessionScope) -> bool {
++        self.queues
++            .get(scope)
++            .is_some_and(|queue| !queue.is_empty())
++            || self.cancelled_batches.contains_key(scope)
++    }
++
+     /// Earliest retry throttle for queued work not already in flight.
+     ///
+     /// Includes expired deadlines: an event-loop iteration can cross eligibility
+-- 
+2.56.0
+
