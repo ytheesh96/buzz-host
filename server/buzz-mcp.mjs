@@ -22,7 +22,10 @@ import { ORCHESTRATOR_TOOLS } from "./orchestrator.mjs";
 const pubkey = process.argv[2] ?? process.env.BUZZHOST_AGENT ?? "";
 const withAttention = process.argv.includes("--attention");
 const withComputer = process.argv.includes("--computer");
-const withOrchestrate = process.argv.includes("--orchestrate");
+// Worker Solo chats set BUZZHOST_NO_ORCHESTRATE=1 via acp-proxy so even an
+// orchestrator delegating to itself has zero orch_* tools (MAX_DEPTH = 1).
+const withOrchestrate =
+  process.argv.includes("--orchestrate") && process.env.BUZZHOST_NO_ORCHESTRATE !== "1";
 if (!/^[0-9a-f]{64}$/.test(pubkey)) {
   process.stderr.write("buzz-mcp: usage: buzz-mcp.mjs <agent-pubkey> [--attention] [--computer] [--orchestrate]\n");
   process.exit(2);
@@ -141,7 +144,7 @@ async function handle(request) {
           ...(computerModule ? [computerModule.instructions(pubkey)] : []),
           ...(withOrchestrate
             ? [
-                "Orchestration: you can spawn ephemeral worker sessions on other runtimes (claude, codex, hermes, antigravity) with orch_capabilities, orch_delegate, orch_wait, orch_status, orch_list, orch_steer, and orch_cancel.",
+                "Orchestration: you can delegate tasks to real Solo-chat workers on other runtimes (claude, codex, hermes, antigravity) with orch_capabilities, orch_delegate, orch_wait, orch_status, orch_list, orch_steer, and orch_cancel. Workers see no history from this chat, so write each orch_delegate prompt as a self-contained brief and put background (decisions, constraints, findings so far) in its optional context field. Each delegated task opens a real Solo chat that links back to the owner's message here, with a buzz://message link — include that link verbatim in your chat updates so the owner can open and inspect the worker chat directly.",
               ]
             : []),
         ].join("\n"),

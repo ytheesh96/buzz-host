@@ -71,7 +71,7 @@
 
 Everything else passes through byte for byte.
 """
-import json, os, re, shlex, signal, socket, subprocess, sys, threading, time
+import atexit, contextlib, errno, json, os, re, shlex, signal, socket, subprocess, sys, threading, time
 
 CHANNEL_RE = re.compile(r"^Channel: .*\(#([0-9a-f-]{36})\)\s*$", re.M)
 THREAD_RE = re.compile(r"^Thread root: ([0-9a-f]{64})\s*$", re.M)
@@ -88,15 +88,45 @@ agent_dir = os.environ.get("BUZZ_HOST_AGENT_DIR", "")
 settings_file = os.path.join(agent_dir, "chat-settings.json") if agent_dir else ""
 fresh_dir = os.environ.get("BUZZ_ACP_FRESH_SESSION_DIR", "")
 owner = os.environ.get("BUZZ_ACP_AGENT_OWNER", "").lower()
+control_dir = os.environ.get("BUZZ_HOST_CONTROL_DIR", "")
 control_sock = os.environ.get("BUZZ_HOST_CONTROL_SOCK", "")
 agent_pubkey = os.environ.get("BUZZ_HOST_AGENT", "")
+host_lib = os.environ.get("BUZZ_HOST_LIB") or os.path.expanduser("~/.local/lib/buzz-host")
 host_sock = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}",
                          "buzz-host", "attention.sock")
 ADAPTER = os.path.basename(sys.argv[1]) if len(sys.argv) > 1 else ""
+ADAPTER_TO_RUNTIME = {
+    "claude-agent-acp": "claude",
+    "codex-acp": "codex",
+    "hermes-acp": "hermes",
+    "agy": "antigravity",
+    "antigravity": "antigravity",
+    "antigravity-acp": "antigravity",
+}
+DEFAULT_RUNTIME = ADAPTER_TO_RUNTIME.get(ADAPTER, ADAPTER)
+KNOWN_RUNTIMES = ("claude", "codex", "hermes", "antigravity")
+
+
+def runtime_starts_in_folder(rt_or_adapter):
+    return rt_or_adapter in ("claude", "codex", "antigravity", "claude-agent-acp", "codex-acp", "agy")
+
+
+def runtime_extra_dirs(rt_or_adapter):
+    return rt_or_adapter in ("claude", "antigravity", "claude-agent-acp", "agy")
+
+
+def runtime_default_compact(rt_or_adapter):
+    if rt_or_adapter in ("hermes", "hermes-acp"):
+        return "compress"
+    if rt_or_adapter in ("claude", "codex", "antigravity", "claude-agent-acp", "codex-acp", "agy"):
+        return "compact"
+    return None
+
+
 # Runtimes whose session may start in a chat's folder. Hermes keys its agent
 # identity on the session cwd (hermes-plugin), so it keeps the agent's own.
-STARTS_IN_FOLDER = ADAPTER in ("claude-agent-acp", "codex-acp", "agy", "antigravity")
-EXTRA_DIRS = ADAPTER in ("claude-agent-acp", "agy", "antigravity")  # ACP additionalDirectories
+STARTS_IN_FOLDER = runtime_starts_in_folder(ADAPTER)
+EXTRA_DIRS = runtime_extra_dirs(ADAPTER)  # ACP additionalDirectories
 _here = os.path.dirname(os.path.abspath(__file__))
 # Installed: bin/acp-proxy beside ../workspace.mjs. In the repo: server/ holds both.
 WORKSPACE_HELPER = next((p for p in (os.path.join(_here, "workspace.mjs"),
@@ -118,36 +148,101 @@ DEFAULT_COMPACT = {
     "hermes-acp": "compress",
     "agy": "compact",
     "antigravity": "compact",
+    "claude": "compact",
+    "codex": "compact",
+    "hermes": "compress",
 }
 COMPACT_TIMEOUT = 900
+LOCK_TIMEOUT = 5.0
+LOCK_STALE = 10.0
 
 lock = threading.RLock()
 to_adapter_lock = threading.Lock()
 to_client_lock = threading.Lock()
-sessions = {}        # sid -> {"options": [...], "key": str|None, "running": int}
-pending_new = {}     # client request id -> sid for load/resume (None for new)
+sessions = {}        # sid -> {"options": [...], "key": str|None, "running": int, "runtime": str}
+pending_new = {}     # client request id -> {"sid": sid|None, "runtime": str}
 pending_prompt = {}  # client request id -> sid
-waiters = {}         # proxy request id -> [threading.Event, response]
-pending_ws = {}      # client request id -> {"key", "start", "home"} for session/new
+pending_adapter_req = {}  # external req id -> (runtime_id, orig_adapter_rid) for secondary adapter -> client requests
+waiters = {}         # proxy request id -> [threading.Event, response, runtime_id]
+pending_ws = {}      # client request id -> {"key", "start", "home", "runtime"} for session/new
 pending_cfg = {}     # client request id -> (sid, method, params): buzz-acp's own model/effort changes
 canvas_cache = {}    # channel -> (time, workspace.mjs result)
 turns = {}           # client request id -> a turn that may need its reply posted (reply fallback)
+turn_notify = {}     # client request id -> {"channel", "root", "runtime"} for host turn-done notifications
 next_id = [0]
 REPLY_LIMIT = 30000  # characters of a fallback reply
+init_params_saved = None  # latest initialize params from buzz-acp, replayed to lazy secondary adapters
+adapters = {}        # runtime_id -> {"runtime": str, "proc": Popen, "lock": Lock, "ready": bool}
+adapter_spawn_lock = threading.Lock()
+adapter_init_locks = {}  # runtime_id -> Lock (per-runtime, never held globally across initialize wait)
+child = None         # default adapter Popen (set in __main__)
+bound_control_sock = ""  # active Unix socket path bound by serve_control
 
 
 def log(msg):
     print(f"acp-proxy: {msg}", file=sys.stderr, flush=True)
 
 
-def send_adapter_raw(data):
-    with to_adapter_lock:
-        child.stdin.write(data)
-        child.stdin.flush()
+def split_sid(ext_sid):
+    """Split a proxy session id into (runtime_id, adapter_session_id)."""
+    if isinstance(ext_sid, str) and ext_sid.startswith("rt:"):
+        parts = ext_sid.split(":", 2)
+        if len(parts) == 3 and parts[1] in KNOWN_RUNTIMES and parts[2]:
+            return parts[1], parts[2]
+    return DEFAULT_RUNTIME, ext_sid
 
 
-def send_adapter(obj):
-    send_adapter_raw((json.dumps(obj, separators=(",", ":")) + "\n").encode())
+def join_sid(runtime_id, real_sid):
+    """Map an adapter session id to the external id buzz-acp sees."""
+    if not real_sid or not runtime_id or runtime_id == DEFAULT_RUNTIME:
+        return real_sid
+    return f"rt:{runtime_id}:{real_sid}"
+
+
+def resolve_adapter_spec(runtime_id):
+    """Return (argv, extra_env) for spawning `runtime_id` directly (without nesting acp-proxy)."""
+    override = os.environ.get("BUZZ_HOST_ADAPTERS_JSON", "")
+    if override:
+        try:
+            mapping = json.loads(override)
+            entry = mapping.get(runtime_id)
+            if isinstance(entry, list) and entry:
+                return [str(x) for x in entry], {}
+            if isinstance(entry, dict) and entry.get("cmd"):
+                return [str(x) for x in entry["cmd"]], dict(entry.get("env") or {})
+        except ValueError:
+            pass
+    if runtime_id == "claude":
+        return [os.path.join(host_lib, "npm", "node_modules", ".bin", "claude-agent-acp")], {}
+    if runtime_id == "codex":
+        return [os.path.join(host_lib, "npm", "node_modules", ".bin", "codex-acp")], {}
+    if runtime_id == "hermes":
+        return [os.path.expanduser("~/.local/bin/hermes-acp")], {
+            "HERMES_ACP_SKIP_CONFIGURED_MCP": os.environ.get("HERMES_ACP_SKIP_CONFIGURED_MCP", "1"),
+        }
+    if runtime_id == "antigravity":
+        agy = os.path.expanduser("~/.local/share/mise/installs/antigravity-cli/latest/agy")
+        if not (os.path.isfile(agy) and os.access(agy, os.X_OK)):
+            agy = os.path.expanduser("~/.local/share/mise/shims/agy")
+        return [agy, "acp", "--dangerously-skip-permissions"], {}
+    raise RuntimeError(f"Unknown runtime: {runtime_id}")
+
+
+def send_adapter_raw(data, runtime_id=None):
+    rt = runtime_id or DEFAULT_RUNTIME
+    if rt == DEFAULT_RUNTIME:
+        with to_adapter_lock:
+            child.stdin.write(data)
+            child.stdin.flush()
+        return
+    ad = ensure_adapter(rt)
+    with ad["lock"]:
+        ad["proc"].stdin.write(data)
+        ad["proc"].stdin.flush()
+
+
+def send_adapter(obj, runtime_id=None):
+    send_adapter_raw((json.dumps(obj, separators=(",", ":")) + "\n").encode(), runtime_id=runtime_id)
 
 
 def send_client(obj):
@@ -157,16 +252,218 @@ def send_client(obj):
         sys.stdout.buffer.flush()
 
 
-def proxy_request(method, params, timeout=20):
+def proxy_request(method, params, timeout=20, runtime_id=None):
+    rt = runtime_id or DEFAULT_RUNTIME
     with lock:
         next_id[0] += 1
         rid = f"buzz-host-{next_id[0]}"
         ev = threading.Event()
-        waiters[rid] = [ev, None]
-    send_adapter({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
+        waiters[rid] = [ev, None, rt]
+    send_adapter({"jsonrpc": "2.0", "id": rid, "method": method, "params": params}, runtime_id=runtime_id)
     ev.wait(timeout)
     with lock:
-        return waiters.pop(rid, [None, None])[1]
+        entry = waiters.pop(rid, None)
+        return entry[1] if entry else None
+
+
+def _reap_proc(proc):
+    try:
+        proc.terminate()
+    except OSError:
+        pass
+    try:
+        proc.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
+    except OSError:
+        pass
+
+
+def ensure_adapter(runtime_id):
+    """Lazily spawn and ACP-v1 initialize a secondary runtime adapter."""
+    if runtime_id == DEFAULT_RUNTIME:
+        return None
+    with adapter_spawn_lock:
+        existing = adapters.get(runtime_id)
+        if existing and existing["proc"].poll() is None and existing["ready"]:
+            return existing
+        rt_lock = adapter_init_locks.setdefault(runtime_id, threading.Lock())
+    with rt_lock:
+        existing = adapters.get(runtime_id)
+        if existing and existing["proc"].poll() is None and existing["ready"]:
+            return existing
+        argv, extra_env = resolve_adapter_spec(runtime_id)
+        env = dict(os.environ)
+        env.update(extra_env)
+        proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0, env=env)
+        ad = {
+            "runtime": runtime_id,
+            "proc": proc,
+            "lock": threading.Lock(),
+            "ready": False,
+        }
+        with adapter_spawn_lock:
+            adapters[runtime_id] = ad
+        threading.Thread(target=pump_adapter_proc, args=(proc, runtime_id), daemon=True).start()
+        params = dict(init_params_saved or {"protocolVersion": 1, "clientCapabilities": {}})
+        params["protocolVersion"] = 1
+        params.pop("info", None)
+        with lock:
+            next_id[0] += 1
+            rid = f"buzz-host-{next_id[0]}"
+            ev = threading.Event()
+            waiters[rid] = [ev, None, runtime_id]
+        try:
+            with ad["lock"]:
+                proc.stdin.write((json.dumps({"jsonrpc": "2.0", "id": rid, "method": "initialize", "params": params},
+                                             separators=(",", ":")) + "\n").encode())
+                proc.stdin.flush()
+        except OSError as e:
+            with lock:
+                waiters.pop(rid, None)
+            with adapter_spawn_lock:
+                if adapters.get(runtime_id) is ad:
+                    adapters.pop(runtime_id, None)
+            _reap_proc(proc)
+            raise RuntimeError(f"{runtime_id} adapter failed during initialize: {e}") from e
+        ev.wait(60)
+        with lock:
+            entry = waiters.pop(rid, None)
+            resp = entry[1] if entry else None
+        if not resp or "error" in resp:
+            with adapter_spawn_lock:
+                if adapters.get(runtime_id) is ad:
+                    adapters.pop(runtime_id, None)
+            _reap_proc(proc)
+            err = (resp or {}).get("error") or {}
+            raise RuntimeError(err.get("message") or f"{runtime_id} adapter failed to initialize")
+        ad["ready"] = True
+        log(f"started secondary adapter for runtime {runtime_id}")
+        return ad
+
+
+# ---------- cross-process file lock ----------
+
+def _pid_alive(pid):
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError as e:
+        return e.errno == errno.EPERM
+
+
+def _lock_is_stale(lock_path):
+    try:
+        st = os.stat(lock_path)
+        try:
+            with open(lock_path) as f:
+                raw = f.read().strip()
+            pid = int(raw) if raw.isdigit() else 0
+            if pid > 0 and not _pid_alive(pid):
+                return True
+        except OSError:
+            pass
+        return (time.time() - st.st_mtime) > LOCK_STALE
+    except OSError:
+        return False
+
+
+def _try_reap_stale_lock(lock_path):
+    reap_path = lock_path + ".reap"
+    try:
+        fd = os.open(reap_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        try:
+            os.write(fd, f"{os.getpid()}\n".encode())
+        finally:
+            os.close(fd)
+    except FileExistsError:
+        if _lock_is_stale(reap_path):
+            try:
+                os.unlink(reap_path)
+            except OSError:
+                pass
+        return
+    except OSError:
+        return
+    try:
+        if _lock_is_stale(lock_path):
+            try:
+                os.unlink(lock_path)
+            except OSError:
+                pass
+    finally:
+        try:
+            os.unlink(reap_path)
+        except OSError:
+            pass
+
+
+@contextlib.contextmanager
+def file_lock(path):
+    """Advisory cross-process lock matching server/file-lock.mjs (<path>.lock)."""
+    lock_path = path + ".lock"
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, mode=0o700, exist_ok=True)
+    deadline = time.monotonic() + LOCK_TIMEOUT
+    our_ino = None
+    while our_ino is None:
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            try:
+                os.write(fd, f"{os.getpid()}\n".encode())
+                our_ino = os.fstat(fd).st_ino
+            finally:
+                os.close(fd)
+        except FileExistsError:
+            if _lock_is_stale(lock_path):
+                _try_reap_stale_lock(lock_path)
+                continue
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"timed out waiting for lock {lock_path}")
+            time.sleep(0.01)
+    try:
+        yield
+    finally:
+        try:
+            if os.stat(lock_path).st_ino == our_ino:
+                os.unlink(lock_path)
+        except OSError:
+            pass
+
+
+def write_private_json(path, data):
+    tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(data, f, indent=2)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+def update_json_locked(path, mutator):
+    with file_lock(path):
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                data = {}
+        except (OSError, ValueError):
+            data = {}
+        result = mutator(data)
+        if result is not None:
+            write_private_json(path, result)
+            return result
+        return data
 
 
 # ---------- config options ----------
@@ -193,19 +490,38 @@ def choices(o):
 
 
 def load_settings():
+    if not settings_file:
+        return {}
     try:
         with open(settings_file) as f:
-            return json.load(f)
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
     except (OSError, ValueError):
         return {}
 
 
 def save_settings(all_settings):
-    tmp = settings_file + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(all_settings, f, indent=2)
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, settings_file)
+    if not settings_file:
+        return
+    with file_lock(settings_file):
+        write_private_json(settings_file, all_settings)
+
+
+def update_settings(key, mutator):
+    """Atomically read-modify-write one chat's entry in chat-settings.json."""
+    if not settings_file:
+        return {}
+
+    def _mutate(data):
+        entry = dict(data.get(key) or {}) if isinstance(data.get(key), dict) else {}
+        mutator(entry)
+        if entry:
+            data[key] = entry
+        else:
+            data.pop(key, None)
+        return data
+
+    return update_json_locked(settings_file, _mutate)
 
 
 def wanted_for(key, settings):
@@ -213,6 +529,14 @@ def wanted_for(key, settings):
     base = dict(settings.get(key.split("_", 1)[0], {})) if "_" in key else {}
     base.update(settings.get(key, {}))
     return base
+
+
+def chat_runtime(key):
+    """Configured runtime for `key` if valid, else DEFAULT_RUNTIME."""
+    if not key or not settings_file:
+        return DEFAULT_RUNTIME
+    rt = str(wanted_for(key, load_settings()).get("runtime") or "").strip().lower()
+    return rt if rt in KNOWN_RUNTIMES else DEFAULT_RUNTIME
 
 
 def load_restore():
@@ -236,25 +560,23 @@ def restore_point(sid):
 def save_restore_point(sid, restore):
     with lock:
         sessions.setdefault(sid, {})["restore"] = dict(restore)
-        if not restore_file:
-            return
-        everything = load_restore()
-        if restore:
-            everything[sid] = dict(restore)
-        else:
-            everything.pop(sid, None)
-        try:
-            tmp = restore_file + ".tmp"
-            with open(tmp, "w") as f:
-                json.dump(everything, f, indent=2)
-            os.replace(tmp, restore_file)
-        except OSError as e:
-            log(f"saving {restore_file} failed: {e}")
+    if not restore_file:
+        return
+    try:
+        def _mutate(everything):
+            if restore:
+                everything[sid] = dict(restore)
+            else:
+                everything.pop(sid, None)
+            return everything
+        update_json_locked(restore_file, _mutate)
+    except (OSError, TimeoutError) as e:
+        log(f"saving {restore_file} failed: {e}")
 
 
 def record_turn_author(key, author, event_id=""):
     """Persist the latest person-authored turn per chat for orchestrator's
-    owner-initiated chat gate and the plugin's per-message card."""
+    owner-initiated chat gate."""
     if not turn_authors_file or not key:
         return
     author = str(author or "").lower()
@@ -265,31 +587,20 @@ def record_turn_author(key, author, event_id=""):
     event_id = str(event_id or "").lower()
     if not HEX64_RE.match(event_id):
         event_id = ""
-    with lock:
-        try:
-            with open(turn_authors_file) as f:
-                data = json.load(f)
-            if not isinstance(data, dict):
-                data = {}
-        except (OSError, ValueError):
-            data = {}
-        data[key] = {"author": author, "eventId": event_id, "at": int(time.time())}
-        if len(data) > TURN_AUTHORS_CAP:
-            keep = sorted(
-                data.items(),
-                key=lambda kv: (kv[1].get("at", 0) if isinstance(kv[1], dict) else 0),
-                reverse=True,
-            )[:TURN_AUTHORS_CAP]
-            data = dict(keep)
-        try:
-            tmp = f"{turn_authors_file}.{os.getpid()}.{threading.get_ident()}.tmp"
-            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-            with os.fdopen(fd, "w") as f:
-                json.dump(data, f, indent=2)
-            os.chmod(tmp, 0o600)
-            os.replace(tmp, turn_authors_file)
-        except OSError as e:
-            log(f"saving {turn_authors_file} failed: {e}")
+    try:
+        def _mutate(data):
+            data[key] = {"author": author, "eventId": event_id, "at": int(time.time())}
+            if len(data) > TURN_AUTHORS_CAP:
+                keep = sorted(
+                    data.items(),
+                    key=lambda kv: (kv[1].get("at", 0) if isinstance(kv[1], dict) else 0),
+                    reverse=True,
+                )[:TURN_AUTHORS_CAP]
+                data = dict(keep)
+            return data
+        update_json_locked(turn_authors_file, _mutate)
+    except (OSError, TimeoutError) as e:
+        log(f"saving {turn_authors_file} failed: {e}")
 
 
 def load_session_chats():
@@ -303,33 +614,29 @@ def load_session_chats():
         return {}
 
 
-def save_session_chat(sid, key):
-    """Remember sessionId -> chatKey across restarts so session/load and
-    session/resume still label buzz-mcp with BUZZHOST_CHAT."""
+def save_session_chat(sid, key, runtime_id=None):
+    """Remember sessionId -> {key, runtime} across restarts so session/load and
+    session/resume still label buzz-mcp with BUZZHOST_CHAT and route to the right runtime."""
     if not session_chats_file or not sid or not key:
         return
-    with lock:
-        data = load_session_chats()
-        prev = data.get(sid)
-        if isinstance(prev, dict) and prev.get("key") == key:
-            return
-        data[sid] = {"key": key, "at": int(time.time())}
-        if len(data) > SESSION_CHATS_CAP:
-            keep = sorted(
-                data.items(),
-                key=lambda kv: (kv[1].get("at", 0) if isinstance(kv[1], dict) else 0),
-                reverse=True,
-            )[:SESSION_CHATS_CAP]
-            data = dict(keep)
-        try:
-            tmp = f"{session_chats_file}.{os.getpid()}.{threading.get_ident()}.tmp"
-            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-            with os.fdopen(fd, "w") as f:
-                json.dump(data, f, indent=2)
-            os.chmod(tmp, 0o600)
-            os.replace(tmp, session_chats_file)
-        except OSError as e:
-            log(f"saving {session_chats_file} failed: {e}")
+    rt = runtime_id or split_sid(sid)[0]
+    try:
+        def _mutate(data):
+            prev = data.get(sid)
+            if isinstance(prev, dict) and prev.get("key") == key and prev.get("runtime", DEFAULT_RUNTIME) == rt:
+                return None
+            data[sid] = {"key": key, "runtime": rt, "at": int(time.time())}
+            if len(data) > SESSION_CHATS_CAP:
+                keep = sorted(
+                    data.items(),
+                    key=lambda kv: (kv[1].get("at", 0) if isinstance(kv[1], dict) else 0),
+                    reverse=True,
+                )[:SESSION_CHATS_CAP]
+                data = dict(keep)
+            return data
+        update_json_locked(session_chats_file, _mutate)
+    except (OSError, TimeoutError) as e:
+        log(f"saving {session_chats_file} failed: {e}")
 
 
 def session_chat_for(sid):
@@ -339,6 +646,20 @@ def session_chat_for(sid):
     if isinstance(entry, str):
         return entry
     return ""
+
+
+def session_runtime_for(sid):
+    rt, _ = split_sid(sid)
+    if rt != DEFAULT_RUNTIME:
+        return rt
+    with lock:
+        saved = sessions.get(sid, {}).get("runtime")
+    if saved in KNOWN_RUNTIMES:
+        return saved
+    entry = load_session_chats().get(sid)
+    if isinstance(entry, dict) and entry.get("runtime") in KNOWN_RUNTIMES:
+        return entry["runtime"]
+    return DEFAULT_RUNTIME
 
 
 def picks_of(events):
@@ -369,6 +690,7 @@ def apply_settings(sid, key, picks=None):
     want = wanted_for(key, load_settings()) if key and settings_file else {}
     picks = picks or {}
     restore = restore_point(sid)
+    rt, real_sid = split_sid(sid)
     for kind, keyset in (("model", MODEL_KEYS), ("effort", EFFORT_KEYS)):
         with lock:
             options = list(sessions.get(sid, {}).get("options") or [])
@@ -393,8 +715,10 @@ def apply_settings(sid, key, picks=None):
                 restore.pop(kind)
                 save_restore_point(sid, restore)
             continue
-        resp = proxy_request("session/set_config_option",
-                             {"sessionId": sid, "configId": option_id(opt), "value": value})
+        req_params = {"sessionId": real_sid, "configId": option_id(opt), "value": value}
+        resp = (proxy_request("session/set_config_option", req_params)
+                if rt == DEFAULT_RUNTIME
+                else proxy_request("session/set_config_option", req_params, runtime_id=rt))
         if resp and "result" in resp:
             new = (resp["result"] or {}).get("configOptions")
             with lock:
@@ -541,18 +865,20 @@ def workspace_note(sid, key):
 
 
 def start_in_workspace(msg_id, params):
-    """session/new: take buzz-acp's `_meta.buzzHost` and, for Claude/Codex,
+    """session/new: take buzz-acp's `_meta.buzzHost`, pick the chat's runtime
+    (defaulting to this proxy's runtime), and for Claude/Codex/Antigravity
     start the session in the chat's first folder found here."""
     meta = params.get("_meta")
     conv = meta.pop("buzzHost", None) if isinstance(meta, dict) else None
     if isinstance(meta, dict) and not meta:
         params.pop("_meta")
     if not isinstance(conv, dict):
-        return
+        return DEFAULT_RUNTIME
     channel, root = conv.get("channelId") or "", conv.get("rootEventId")
     if not UUID_RE.match(channel) or (root and not re.fullmatch(r"[0-9a-f]{64}", root)):
-        return
+        return DEFAULT_RUNTIME
     key = f"{channel}_{root}" if root else channel
+    target_runtime = chat_runtime(key)
     label_mcp(params, key)
     home = params.get("cwd")
     start = None
@@ -560,20 +886,21 @@ def start_in_workspace(msg_id, params):
         ws = chat_workspace(key, fresh=True)
         dirs = workspace_dirs(ws)
         found = [d for d in (ws["local"].get(f) for f in ws["folders"]) if d]
-        if STARTS_IN_FOLDER and found:
+        if runtime_starts_in_folder(target_runtime) and found:
             start = found[0]
             params["cwd"] = start
-            if EXTRA_DIRS:
+            if runtime_extra_dirs(target_runtime):
                 extra = list(params.get("additionalDirectories") or [])
                 for d in [home] + dirs[1:]:
                     if d and d != start and d not in extra:
                         extra.append(d)
                 params["additionalDirectories"] = extra
-            log(f"{key}: session starts in {start}")
+            log(f"{key}: session starts in {start} ({target_runtime})")
     except Exception as e:  # never block a session on its workspace
         log(f"{key}: workspace lookup failed: {e}")
     with lock:
-        pending_ws[msg_id] = {"key": key, "start": start, "home": home}
+        pending_ws[msg_id] = {"key": key, "start": start, "home": home, "runtime": target_runtime}
+    return target_runtime
 
 
 # ---------- chat commands ----------
@@ -661,6 +988,12 @@ def addresses_agent(event):
                for t in event.get("tags") or [])
 
 
+def _is_orch_prompt(event):
+    """True for the visible prompt posted by the orchestrator when opening/steering a Solo worker."""
+    return any(isinstance(t, list) and len(t) >= 2 and t[0] == "t" and t[1] == "buzz.orch.prompt"
+               for t in event.get("tags") or [])
+
+
 def agent_posted(channel, since):
     """Whether the agent posted in `channel` after `since` (unix seconds).
     Raises when the relay can't be asked."""
@@ -671,33 +1004,73 @@ def agent_posted(channel, since):
         raise RuntimeError((r.stderr or r.stdout).strip()[:200] or f"exit {r.returncode}")
     events = json.loads(r.stdout or "[]")
     return any(isinstance(e, dict) and str(e.get("pubkey", "")).lower() == agent_pubkey
-               and (e.get("created_at") or 0) >= int(since) for e in events)
+               and (e.get("created_at") or 0) >= int(since)
+               and not _is_orch_prompt(e) for e in events)
 
 
-def reply_fallback(turn):
-    """Post a finished turn's final text when the agent didn't reply itself."""
-    text = turn["text"].strip()
-    if not text:
+def notify_host(name, args):
+    """Best-effort fire-and-forget notification to buzz-host over attention.sock."""
+    if not HEX64_RE.match(agent_pubkey or "") or not host_sock:
         return
     try:
-        if agent_posted(turn["channel"], turn["start"]):
-            return
-    except Exception as e:
-        log(f"{turn['channel']}: reply fallback skipped, can't tell whether the agent replied: {e}")
-        return
-    if len(text) > REPLY_LIMIT:
-        text = text[:REPLY_LIMIT].rstrip() + "…"
-    log(f"{turn['channel']}: the agent ended its turn without replying; posting its final text ({len(text)} chars)")
-    reply(turn["channel"], turn["root"], text)
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as c:
+            c.settimeout(3)
+            c.connect(host_sock)
+            c.sendall((json.dumps({"pubkey": agent_pubkey, "name": name, "args": args}) + "\n").encode())
+            buf = b""
+            while b"\n" not in buf:
+                chunk = c.recv(4096)
+                if not chunk:
+                    break
+                buf += chunk
+    except Exception:
+        pass
+
+
+def current_model_effort(sid):
+    with lock:
+        options = list(sessions.get(sid, {}).get("options") or [])
+    m = option_by(options, MODEL_KEYS)
+    e = option_by(options, EFFORT_KEYS)
+    return (m.get("currentValue") or "") if m else "", (e.get("currentValue") or "") if e else ""
+
+
+def reply_fallback(turn, done_payload=None):
+    """Post a finished turn's final text when the agent didn't reply itself."""
+    posted = False
+    text = turn["text"].strip()
+    if text:
+        should_post = False
+        try:
+            should_post = not agent_posted(turn["channel"], turn["start"])
+        except Exception as e:
+            log(f"{turn['channel']}: reply fallback skipped, can't tell whether the agent replied: {e}")
+        if should_post:
+            if len(text) > REPLY_LIMIT:
+                text = text[:REPLY_LIMIT].rstrip() + "…"
+            log(f"{turn['channel']}: the agent ended its turn without replying; posting its final text ({len(text)} chars)")
+            reply(turn["channel"], turn["root"], text)
+            posted = True
+    if done_payload is not None:
+        done_payload = dict(done_payload)
+        done_payload["fallbackPosted"] = posted
+        notify_host("_acp_turn_done", done_payload)
 
 
 def label_mcp(params, key):
-    """Tell the session's buzz MCP server which chat it serves (BUZZHOST_CHAT)."""
+    """Tell the session's buzz MCP server which chat it serves (BUZZHOST_CHAT)
+    and suppress orch_* tools when this chat is a delegated worker Solo chat."""
+    no_orch = bool(key and settings_file and wanted_for(key, load_settings()).get("noOrchestrate"))
     for server in params.get("mcpServers") or []:
         if not isinstance(server, dict) or server.get("name") != "buzz":
             continue
-        env = [e for e in server.get("env") or [] if not (isinstance(e, dict) and e.get("name") == "BUZZHOST_CHAT")]
+        env = [
+            e for e in server.get("env") or []
+            if not (isinstance(e, dict) and e.get("name") in ("BUZZHOST_CHAT", "BUZZHOST_NO_ORCHESTRATE"))
+        ]
         env.append({"name": "BUZZHOST_CHAT", "value": key})
+        if no_orch:
+            env.append({"name": "BUZZHOST_NO_ORCHESTRATE", "value": "1"})
         server["env"] = env
 
 
@@ -742,31 +1115,24 @@ def describe_workspace(ws, where, start):
 
 def set_workspace(args, key, where):
     host, home = socket.gethostname(), os.path.expanduser("~")
-    all_settings = load_settings()
-    entry = dict(all_settings.get(key, {}))
     word = args[0].lower()
     if word in ("default", "canvas"):
-        entry.pop("workspace", None)
+        update_settings(key, lambda entry: entry.pop("workspace", None))
         text = f"Workspace for {where}: its Canvas's (Buzz workspace folders), if it has any."
     elif word in ("off", "none"):
-        entry["workspace"] = []
+        update_settings(key, lambda entry: entry.__setitem__("workspace", []))
         text = f"Workspace for {where}: none; the agent works in its own folder and ignores Canvas folders."
     else:
         missing = [f for f in args if not local_path(f)]
         if missing:
             return ("Not found on " + host + ": " + ", ".join(f"`{f}`" for f in missing)
                     + f". Folders must exist on {host} (`~` is `{home}`). Nothing changed.")
-        entry["workspace"] = list(args)
+        update_settings(key, lambda entry: entry.__setitem__("workspace", list(args)))
         text = f"Workspace for {where}: " + ", ".join(
             f"`{f}`" + (f" → `{local_path(f)}`" if local_path(f) != f else "") for f in args) + "."
-    if entry:
-        all_settings[key] = entry
-    else:
-        all_settings.pop(key, None)
-    save_settings(all_settings)
     with lock:
         canvas_cache.pop(key.split("_", 1)[0], None)
-    if STARTS_IN_FOLDER and fresh_dir:
+    if runtime_starts_in_folder(chat_runtime(key)) and fresh_dir:
         os.makedirs(fresh_dir, exist_ok=True)
         open(os.path.join(fresh_dir, key), "w").close()
         return text + " The next message starts a fresh session there."
@@ -822,24 +1188,22 @@ def run_command(cmd, args, sid, key, root):
             return f"`{value}` models: {names}. Set with `/model {value} <model>`."
         if groups and len(args) >= 2 and value in groups:
             value = f"{value}:{args[1]}"
-        all_settings = load_settings()
-        entry = dict(all_settings.get(key, {}))
-        if value.lower() == "default":
-            entry.pop(cmd, None)
-        else:
-            if offered and value not in {v for v, _ in offered}:
-                if groups:
-                    return (f"`{value}` isn't offered. Providers: "
-                            + ", ".join(f"`{p}`" for p in sorted(groups))
-                            + ". List one with `/model <provider>`.")
-                return f"`{value}` isn't offered. Options: " + ", ".join(f"`{v}`" for v, _ in offered)
-            entry[cmd] = value
-        if entry:
-            all_settings[key] = entry
-        else:
-            all_settings.pop(key, None)
-        save_settings(all_settings)
-        return f"{cmd.title()} for {where}: {entry.get(cmd, 'default')}. Applies from the next message."
+        if value.lower() != "default" and offered and value not in {v for v, _ in offered}:
+            if groups:
+                return (f"`{value}` isn't offered. Providers: "
+                        + ", ".join(f"`{p}`" for p in sorted(groups))
+                        + ". List one with `/model <provider>`.")
+            return f"`{value}` isn't offered. Options: " + ", ".join(f"`{v}`" for v, _ in offered)
+        final_val = ["default"]
+        def _apply(entry):
+            if value.lower() == "default":
+                entry.pop(cmd, None)
+                final_val[0] = "default"
+            else:
+                entry[cmd] = value
+                final_val[0] = value
+        update_settings(key, _apply)
+        return f"{cmd.title()} for {where}: {final_val[0]}. Applies from the next message."
     if cmd == "workspace":
         if args:
             return set_workspace(args, key, where)
@@ -856,7 +1220,11 @@ def run_command(cmd, args, sid, key, root):
         with lock:
             running = [s for s, st in sessions.items() if in_scope(st.get("key"), key) and st.get("running", 0) > 0]
         for s in running:
-            send_adapter({"jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": s}})
+            rt, real_sid = split_sid(s)
+            if rt == DEFAULT_RUNTIME:
+                send_adapter({"jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": real_sid}})
+            else:
+                send_adapter({"jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": real_sid}}, runtime_id=rt)
         return f"Stopped the running turn in {where}." if running else f"Nothing is running in {where}."
     if cmd == "status":
         lines = describe(sid, key)
@@ -892,16 +1260,24 @@ def handle_command(msg_id, cmd, args, sid, key, root):
 
 # ---------- control socket (buzz-host: Buzz's Stop for remote agents) ----------
 
-def cancel_conversation(channel, root):
+def cancel_conversation(channel, root, match_all=False):
     """Cancel the running turn of one conversation: the thread rooted at
-    `root`, else the channel's own session (a Solo chat or DM, where Buzz
-    names the conversation by a top-level message). True if one was running."""
+    `root`, else the channel's own session (or every session in `channel` when
+    `match_all` is True, which covers Solo chats scoped as `channel_root`
+    before the relay's solo label arrived). True if one was running."""
     with lock:
         def running(key):
             return [s for s, st in sessions.items() if st.get("key") == key and st.get("running", 0) > 0]
-        targets = (running(f"{channel}_{root}") if root else []) or running(channel)
+        if match_all:
+            targets = [s for s, st in sessions.items() if in_scope(st.get("key"), channel) and st.get("running", 0) > 0]
+        else:
+            targets = (running(f"{channel}_{root}") if root else []) or running(channel)
     for sid in targets:
-        send_adapter({"jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": sid}})
+        rt, real_sid = split_sid(sid)
+        if rt == DEFAULT_RUNTIME:
+            send_adapter({"jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": real_sid}})
+        else:
+            send_adapter({"jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": real_sid}}, runtime_id=rt)
     if targets:
         log(f"{channel}{'_' + root if root else ''}: stop from Buzz")
     return bool(targets)
@@ -927,6 +1303,21 @@ def conversation_state(channel, root):
     return "idle"
 
 
+def conversation_state_info(channel, root):
+    """State plus session ownership metadata for multi-worker control routing."""
+    sids = conversation_sessions(channel, root)
+    with lock:
+        states = [sessions.get(sid, {}) for sid in sids]
+        last_used = max((st.get("last_used", 0) for st in states), default=0)
+    if any(st.get("compacting") for st in states):
+        st = "compacting"
+    elif any(st.get("running", 0) > 0 for st in states):
+        st = "active"
+    else:
+        st = "idle"
+    return {"state": st, "hasSession": bool(sids), "lastUsed": last_used}
+
+
 def fresh_conversation(channel, root):
     """Buzz's New session: the next message starts a fresh session (/new)."""
     if not fresh_dir:
@@ -949,9 +1340,12 @@ def end_compaction(sid):
         held = s.pop("held", [])
     for raw in held:
         try:
-            out = handle_client_line(raw)
+            rt, out = dispatch_client_line(raw)
             if out is not None:
-                send_adapter_raw(out)
+                if rt == DEFAULT_RUNTIME:
+                    send_adapter_raw(out)
+                else:
+                    send_adapter_raw(out, runtime_id=rt)
         except Exception as e:
             log(f"sending a held prompt failed: {e}")
 
@@ -963,13 +1357,14 @@ def compact_conversation(channel, root):
     if not sids:
         return {"error": "No session here yet: it starts with the next message."}
     sid = sids[0]
+    rt, real_sid = split_sid(sid)
     with lock:
         s = sessions.setdefault(sid, {})
         if s.get("compacting") or s.get("running", 0) > 0:
             return {"error": "Wait for the turn to finish before compacting."}
         listed = s.get("commands")
         name = (next((c for c in COMPACT_COMMANDS if c in listed), None) if listed is not None
-                else DEFAULT_COMPACT.get(ADAPTER))
+                else (runtime_default_compact(rt) or DEFAULT_COMPACT.get(ADAPTER)))
         if not name:
             return {"error": "This runtime can't compact a session."}
         s["compacting"] = True
@@ -977,8 +1372,10 @@ def compact_conversation(channel, root):
     key = f"{channel}_{root}" if root else channel
     log(f"{key}: /{name} from Buzz")
     try:
-        resp = proxy_request("session/prompt", {"sessionId": sid, "prompt": [{"type": "text", "text": f"/{name}"}]},
-                             timeout=COMPACT_TIMEOUT)
+        req = {"sessionId": real_sid, "prompt": [{"type": "text", "text": f"/{name}"}]}
+        resp = (proxy_request("session/prompt", req, timeout=COMPACT_TIMEOUT)
+                if rt == DEFAULT_RUNTIME
+                else proxy_request("session/prompt", req, timeout=COMPACT_TIMEOUT, runtime_id=rt))
     finally:
         end_compaction(sid)
     if not resp:
@@ -998,26 +1395,54 @@ def control(req):
     if not UUID_RE.match(channel) or (root and not HEX64_RE.match(str(root))):
         return {"error": "invalid conversation"}
     if op == "cancel":
-        return {"cancelled": cancel_conversation(channel, root)}
+        return {"cancelled": cancel_conversation(channel, root, match_all=bool(req.get("all")))}
     if op == "state":
+        if req.get("detail"):
+            return conversation_state_info(channel, root)
         return {"state": conversation_state(channel, root)}
     if op == "new":
         return fresh_conversation(channel, root)
     return compact_conversation(channel, root)
 
 
+def effective_control_sock():
+    if control_dir:
+        os.makedirs(control_dir, mode=0o700, exist_ok=True)
+        return os.path.join(control_dir, f"{os.getpid()}.sock")
+    return control_sock
+
+
+def cleanup_control_sock():
+    global bound_control_sock
+    path = bound_control_sock
+    bound_control_sock = ""
+    if path:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
 def serve_control():
+    global bound_control_sock
     try:
-        os.unlink(control_sock)
-    except OSError:
-        pass
-    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    srv.bind(control_sock)
-    os.chmod(control_sock, 0o600)
-    srv.listen(8)
-    while True:
-        conn, _ = srv.accept()
-        threading.Thread(target=control_conn, args=(conn,), daemon=True).start()
+        sock_path = effective_control_sock()
+        if not sock_path:
+            return
+        try:
+            os.unlink(sock_path)
+        except OSError:
+            pass
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        srv.bind(sock_path)
+        os.chmod(sock_path, 0o600)
+        bound_control_sock = sock_path
+        srv.listen(8)
+        while True:
+            conn, _ = srv.accept()
+            threading.Thread(target=control_conn, args=(conn,), daemon=True).start()
+    except Exception as e:
+        log(f"control socket failed: {e}")
 
 
 def control_conn(conn):
@@ -1081,61 +1506,90 @@ def attention_note():
         return ""
 
 
-def handle_client_line(line):
-    """buzz-acp -> adapter. Returns bytes to forward, or None if handled here."""
+def dispatch_client_line(line):
+    """buzz-acp -> adapter. Returns (runtime_id, bytes) or (None, None) if handled here."""
+    global init_params_saved
     try:
         msg = json.loads(line)
     except ValueError:
-        return line
+        return DEFAULT_RUNTIME, line
     method = msg.get("method")
+    # Client response to a secondary adapter's JSON-RPC request (e.g. session/request_permission).
+    if not method and "id" in msg:
+        with lock:
+            mapped = pending_adapter_req.pop(msg["id"], None)
+        if mapped is not None:
+            target_rt, orig_rid = mapped
+            msg["id"] = orig_rid
+            return target_rt, (json.dumps(msg, separators=(",", ":")) + "\n").encode()
+        return DEFAULT_RUNTIME, line
     params = msg.get("params") or {}
     if method == "initialize":
         params["protocolVersion"] = 1
         params.pop("info", None)
+        init_params_saved = dict(params)
         msg["params"] = params
-        return (json.dumps(msg, separators=(",", ":")) + "\n").encode()
+        return DEFAULT_RUNTIME, (json.dumps(msg, separators=(",", ":")) + "\n").encode()
     if method in ("session/new", "session/load", "session/resume") and "id" in msg:
         sid = params.get("sessionId")
-        with lock:
-            pending_new[msg["id"]] = sid
-        if method == "session/new" and "buzzHost" in (params.get("_meta") or {}):
-            start_in_workspace(msg["id"], params)
+        if method == "session/new":
+            has_meta = "buzzHost" in (params.get("_meta") or {})
+            target_rt = start_in_workspace(msg["id"], params) if has_meta else DEFAULT_RUNTIME
+            with lock:
+                pending_new[msg["id"]] = {"sid": sid, "runtime": target_rt}
+            if not has_meta:
+                return target_rt, line
             msg["params"] = params
-            return (json.dumps(msg, separators=(",", ":")) + "\n").encode()
-        if method in ("session/load", "session/resume"):
-            key = ""
-            stripped_meta = False
-            meta = params.get("_meta")
-            if isinstance(meta, dict) and "buzzHost" in meta:
-                conv = meta.pop("buzzHost", None)
-                stripped_meta = True
-                if not meta:
-                    params.pop("_meta")
-                if isinstance(conv, dict):
-                    ch, rt = conv.get("channelId") or "", conv.get("rootEventId")
-                    if UUID_RE.match(ch) and (not rt or HEX64_RE.match(str(rt))):
-                        key = f"{ch}_{rt}" if rt else ch
-            if not key and sid:
-                key = session_chat_for(sid)
-            if key:
-                label_mcp(params, key)
-                if sid:
-                    with lock:
-                        sessions.setdefault(sid, {})["key"] = key
-                    save_session_chat(sid, key)
-                msg["params"] = params
-                return (json.dumps(msg, separators=(",", ":")) + "\n").encode()
-            if stripped_meta:
-                msg["params"] = params
-                return (json.dumps(msg, separators=(",", ":")) + "\n").encode()
+            return target_rt, (json.dumps(msg, separators=(",", ":")) + "\n").encode()
+        # session/load or session/resume
+        target_rt, real_sid = split_sid(sid)
+        if target_rt == DEFAULT_RUNTIME and sid:
+            target_rt = session_runtime_for(sid)
+        with lock:
+            pending_new[msg["id"]] = {"sid": sid, "runtime": target_rt}
+        changed = False
+        if sid and real_sid != sid:
+            params["sessionId"] = real_sid
+            changed = True
+        key = ""
+        meta = params.get("_meta")
+        if isinstance(meta, dict) and "buzzHost" in meta:
+            conv = meta.pop("buzzHost", None)
+            changed = True
+            if not meta:
+                params.pop("_meta")
+            if isinstance(conv, dict):
+                ch, rt_ev = conv.get("channelId") or "", conv.get("rootEventId")
+                if UUID_RE.match(ch) and (not rt_ev or HEX64_RE.match(str(rt_ev))):
+                    key = f"{ch}_{rt_ev}" if rt_ev else ch
+        if not key and sid:
+            key = session_chat_for(sid)
+        if key:
+            label_mcp(params, key)
+            changed = True
+            if sid:
+                with lock:
+                    s = sessions.setdefault(sid, {})
+                    s["key"] = key
+                    s["runtime"] = target_rt
+                save_session_chat(sid, key, target_rt)
+        if changed:
+            msg["params"] = params
+            return target_rt, (json.dumps(msg, separators=(",", ":")) + "\n").encode()
+        return target_rt, line
     elif method == "session/prompt" and "id" in msg:
         sid = params.get("sessionId")
+        target_rt, real_sid = split_sid(sid)
         with lock:
             s = sessions.setdefault(sid, {})
+            if target_rt != DEFAULT_RUNTIME:
+                s["runtime"] = target_rt
+            elif s.get("runtime") in KNOWN_RUNTIMES:
+                target_rt = s["runtime"]
             # Compacting: it runs once the compaction ends (end_compaction).
             if s.get("compacting"):
                 s.setdefault("held", []).append(line)
-                return None
+                return None, None
         stripped, turn = take_turn_meta(params)
         text = "\n".join(b.get("text", "") for b in params.get("prompt") or [] if isinstance(b, dict))
         if turn:
@@ -1154,7 +1608,7 @@ def handle_client_line(line):
             key = s.get("key")
             s["last_used"] = time.monotonic()
         if turn and sid and key:
-            save_session_chat(sid, key)
+            save_session_chat(sid, key, target_rt)
         command = command_of(last) if key else None
         if command:
             event_id = last[0]
@@ -1169,7 +1623,7 @@ def handle_client_line(line):
                 threading.Thread(target=handle_command,
                                  args=(msg["id"], command[0], command[1], sid, settings_key, root or None),
                                  daemon=True).start()
-                return None
+                return None, None
             handle_command(None, command[0], command[1], sid, settings_key, root or None)
         # Only trust structured _meta.buzzHost events (never untrusted prompt text)
         # for the owner-initiated chat gate.
@@ -1180,18 +1634,36 @@ def handle_client_line(line):
                 if HEX64_RE.match(author) and (not me or author != me):
                     record_turn_author(key, author, item.get("id", ""))
                     break
+        is_worker_chat = bool(key and settings_file and wanted_for(key, load_settings()).get("noOrchestrate"))
         with lock:
             s["running"] = s.get("running", 0) + 1
             pending_prompt[msg["id"]] = sid
-            # Reply fallback: a turn someone asked this agent for.
-            if turn and key and any(addresses_agent(e) for e in events):
+            # Reply fallback: a turn someone asked this agent for, OR a wake-driven
+            # delegated worker Solo chat (so final text still lands if the worker
+            # didn't invoke `buzz messages send`).
+            if key and ((turn and any(addresses_agent(e) for e in events)) or is_worker_chat):
                 turns[msg["id"]] = {"channel": key.split("_", 1)[0], "root": root or None,
                                     "start": time.time(), "text": ""}
                 s["turn"] = msg["id"]
+            if key:
+                turn_notify[msg["id"]] = {
+                    "channel": key.split("_", 1)[0],
+                    "root": root or "",
+                    "runtime": target_rt,
+                }
         try:
             apply_settings(sid, key, picks_of(events))
         except Exception as e:  # never block a turn on settings
             log(f"applying settings failed: {e}")
+        if key:
+            cur_model, cur_effort = current_model_effort(sid)
+            spawn(notify_host, "_acp_turn_start", {
+                "channel": key.split("_", 1)[0],
+                "root": root or "",
+                "runtime": target_rt,
+                "model": cur_model,
+                "effort": cur_effort,
+            })
         extra = []
         # Memory: once per session in this process, as Buzz's prompt has it.
         with lock:
@@ -1216,22 +1688,48 @@ def handle_client_line(line):
             extra.append(note)
         if extra and isinstance(params.get("prompt"), list):
             params["prompt"] += [{"type": "text", "text": t} for t in extra]
-        if extra or stripped:
+        sid_changed = bool(sid and real_sid != sid)
+        if sid_changed:
+            params["sessionId"] = real_sid
+        if extra or stripped or sid_changed:
             msg["params"] = params
-            return (json.dumps(msg, separators=(",", ":")) + "\n").encode()
+            return target_rt, (json.dumps(msg, separators=(",", ":")) + "\n").encode()
+        return target_rt, line
     elif method in ("session/set_config_option", "session/set_model") and "id" in msg:
+        sid = params.get("sessionId")
+        target_rt, real_sid = split_sid(sid)
         with lock:
-            pending_cfg[msg["id"]] = (params.get("sessionId"), method, params)
-    return line
+            pending_cfg[msg["id"]] = (sid, method, dict(params))
+        if sid and real_sid != sid:
+            params["sessionId"] = real_sid
+            msg["params"] = params
+            return target_rt, (json.dumps(msg, separators=(",", ":")) + "\n").encode()
+        return target_rt, line
+    elif isinstance(params, dict) and params.get("sessionId"):
+        sid = params.get("sessionId")
+        target_rt, real_sid = split_sid(sid)
+        if sid and real_sid != sid:
+            params["sessionId"] = real_sid
+            msg["params"] = params
+            return target_rt, (json.dumps(msg, separators=(",", ":")) + "\n").encode()
+        return target_rt, line
+    return DEFAULT_RUNTIME, line
 
 
-def handle_adapter_line(line):
+def handle_client_line(line):
+    """Compatibility wrapper: returns bytes to forward, or None if handled here."""
+    return dispatch_client_line(line)[1]
+
+
+def handle_adapter_line(line, adapter_runtime=None):
     """adapter -> buzz-acp. Returns None to swallow."""
+    rt = adapter_runtime or DEFAULT_RUNTIME
     try:
         msg = json.loads(line)
     except ValueError:
         return line
     rid = msg.get("id")
+    rewritten = False
     if isinstance(rid, str) and rid.startswith("buzz-host-") and "method" not in msg:
         with lock:
             w = waiters.get(rid)
@@ -1240,6 +1738,7 @@ def handle_adapter_line(line):
                 w[0].set()
         return None
     if "method" not in msg and rid is not None:
+        save_chat_args = None
         with lock:
             if rid in pending_cfg:
                 sid, method, params = pending_cfg.pop(rid)
@@ -1257,16 +1756,43 @@ def handle_adapter_line(line):
                         if o:
                             o["currentValue"] = params.get("modelId")
             elif rid in pending_new:
-                sid = (msg.get("result") or {}).get("sessionId") or pending_new[rid]
-                pending_new.pop(rid)
+                info = pending_new.pop(rid)
+                if isinstance(info, dict):
+                    orig_sid = info.get("sid")
+                    new_rt = info.get("runtime") or rt
+                else:
+                    orig_sid = info
+                    new_rt = rt
                 ws = pending_ws.pop(rid, None)
-                if sid:
-                    s = sessions.setdefault(sid, {})
+                err = msg.get("error")
+                if err and ws and ws.get("key"):
+                    err_msg = (err.get("data") or {}).get("details") if isinstance(err, dict) else None
+                    if not err_msg and isinstance(err, dict):
+                        err_msg = err.get("message")
+                    spawn(notify_host, "_acp_turn_done", {
+                        "channel": ws["key"].split("_", 1)[0],
+                        "root": ws["key"].split("_", 1)[1] if "_" in ws["key"] else "",
+                        "runtime": new_rt,
+                        "stopReason": "",
+                        "error": str(err_msg or "session/new failed"),
+                        "errorCode": err.get("code") if isinstance(err, dict) else None,
+                        "model": "",
+                        "effort": "",
+                        "finalText": "",
+                    })
+                raw_sid = (msg.get("result") or {}).get("sessionId")
+                ext_sid = join_sid(new_rt, raw_sid) if raw_sid else orig_sid
+                if raw_sid and ext_sid != raw_sid and isinstance(msg.get("result"), dict):
+                    msg["result"]["sessionId"] = ext_sid
+                    rewritten = True
+                if ext_sid:
+                    s = sessions.setdefault(ext_sid, {})
+                    s["runtime"] = new_rt
                     s["options"] = (msg.get("result") or {}).get("configOptions") or s.get("options") or []
                     if ws:
                         s.update(ws)
                         if ws.get("key"):
-                            save_session_chat(sid, ws["key"])
+                            save_chat_args = (ext_sid, ws["key"], new_rt)
             elif rid in pending_prompt:
                 sid = pending_prompt.pop(rid)
                 if sid in sessions:
@@ -1274,13 +1800,49 @@ def handle_adapter_line(line):
                     if sessions[sid].get("turn") == rid:
                         sessions[sid].pop("turn")
                 turn = turns.pop(rid, None)
-                if turn and (msg.get("result") or {}).get("stopReason") == "end_turn" and turn["text"].strip():
-                    spawn(reply_fallback, turn)
+                tn = turn_notify.pop(rid, None)
+                stop_reason = (msg.get("result") or {}).get("stopReason") or ""
+                err = msg.get("error")
+                err_msg = ""
+                err_code = None
+                if isinstance(err, dict):
+                    err_msg = str((err.get("data") or {}).get("details") or err.get("message") or "ACP error")
+                    err_code = err.get("code")
+                elif err:
+                    err_msg = str(err)
+                done_payload = None
+                if tn:
+                    cur_model, cur_effort = current_model_effort(sid)
+                    done_payload = {
+                        "channel": tn["channel"],
+                        "root": tn["root"],
+                        "runtime": tn["runtime"],
+                        "stopReason": stop_reason,
+                        "error": err_msg,
+                        "errorCode": err_code,
+                        "model": cur_model,
+                        "effort": cur_effort,
+                        "finalText": (turn["text"].strip() if turn else "")[:REPLY_LIMIT],
+                    }
+                if turn and stop_reason == "end_turn" and turn["text"].strip():
+                    if done_payload is not None:
+                        spawn(reply_fallback, turn, done_payload)
+                    else:
+                        spawn(reply_fallback, turn)
+                elif done_payload is not None:
+                    spawn(notify_host, "_acp_turn_done", done_payload)
+        if save_chat_args is not None:
+            save_session_chat(*save_chat_args)
     elif msg.get("method") == "session/update":
         p = msg.get("params") or {}
+        raw_sid = p.get("sessionId")
+        ext_sid = join_sid(rt, raw_sid) if raw_sid else raw_sid
+        if raw_sid and ext_sid != raw_sid:
+            p["sessionId"] = ext_sid
+            rewritten = True
         upd = p.get("update") or {}
         with lock:
-            s = sessions.setdefault(p.get("sessionId"), {})
+            s = sessions.setdefault(ext_sid, {})
             if upd.get("sessionUpdate") == "config_option_update" and upd.get("configOptions"):
                 s["options"] = upd["configOptions"]
             elif upd.get("sessionUpdate") == "available_commands_update":
@@ -1298,55 +1860,236 @@ def handle_adapter_line(line):
             if s.get("compacting"):
                 return None
     elif "method" in msg and rid is not None:
-        sid = (msg.get("params") or {}).get("sessionId")
+        p = msg.get("params") or {}
+        raw_sid = p.get("sessionId") if isinstance(p, dict) else None
+        ext_sid = join_sid(rt, raw_sid) if raw_sid else raw_sid
+        if raw_sid and ext_sid != raw_sid and isinstance(p, dict):
+            p["sessionId"] = ext_sid
+            rewritten = True
         with lock:
-            compacting = bool(sid and sessions.get(sid, {}).get("compacting"))
+            compacting = bool(ext_sid and sessions.get(ext_sid, {}).get("compacting"))
         if compacting:  # nothing in buzz-acp is waiting to answer it
-            send_adapter({"jsonrpc": "2.0", "id": rid,
-                          "error": {"code": -32603, "message": "The session is compacting"}})
+            if rt == DEFAULT_RUNTIME:
+                send_adapter({"jsonrpc": "2.0", "id": rid,
+                              "error": {"code": -32603, "message": "The session is compacting"}})
+            else:
+                send_adapter({"jsonrpc": "2.0", "id": rid,
+                              "error": {"code": -32603, "message": "The session is compacting"}}, runtime_id=rt)
             return None
+        if rt != DEFAULT_RUNTIME:
+            with lock:
+                next_id[0] += 1
+                ext_rid = f"buzz-req-{next_id[0]}"
+                pending_adapter_req[ext_rid] = (rt, rid)
+            msg["id"] = ext_rid
+            rewritten = True
+    if rewritten:
+        return (json.dumps(msg, separators=(",", ":")) + "\n").encode()
     return line
 
 
 def pump_client():
     for line in sys.stdin.buffer:
-        out = handle_client_line(line)
+        target_rt, out = dispatch_client_line(line)
         if out is None:
             continue
         try:
-            send_adapter_raw(out)
+            if target_rt == DEFAULT_RUNTIME:
+                send_adapter_raw(out)
+            else:
+                send_adapter_raw(out, runtime_id=target_rt)
         except BrokenPipeError:
-            break
+            if target_rt == DEFAULT_RUNTIME:
+                break
+            _fail_secondary_dispatch(line, target_rt, "Secondary runtime adapter closed stdin")
+        except Exception as e:
+            if target_rt == DEFAULT_RUNTIME:
+                break
+            _fail_secondary_dispatch(line, target_rt, str(e))
     try:
         child.stdin.close()
     except OSError:
         pass
+    with adapter_spawn_lock:
+        secondary = list(adapters.values())
+    for ad in secondary:
+        try:
+            ad["proc"].stdin.close()
+        except OSError:
+            pass
 
 
-def pump_adapter():
-    for line in child.stdout:
-        out = handle_adapter_line(line)
+def _fail_secondary_dispatch(line, target_rt, err_text):
+    log(f"secondary adapter {target_rt} failed: {err_text}")
+    try:
+        msg = json.loads(line)
+    except ValueError:
+        return
+    rid = msg.get("id")
+    ws = None
+    tn = None
+    with lock:
+        if rid is not None:
+            pending_new.pop(rid, None)
+            ws = pending_ws.pop(rid, None)
+            sid = pending_prompt.pop(rid, None)
+            if sid and sid in sessions:
+                sessions[sid]["running"] = max(0, sessions[sid].get("running", 1) - 1)
+                if sessions[sid].get("turn") == rid:
+                    sessions[sid].pop("turn")
+            turns.pop(rid, None)
+            tn = turn_notify.pop(rid, None)
+    if rid is not None:
+        send_client({"jsonrpc": "2.0", "id": rid, "error": {"code": -32000, "message": err_text}})
+    key = (ws or {}).get("key") or ""
+    channel = (tn or {}).get("channel") or (key.split("_", 1)[0] if key else "")
+    root = (tn or {}).get("root") or (key.split("_", 1)[1] if "_" in key else "")
+    if channel:
+        spawn(notify_host, "_acp_turn_done", {
+            "channel": channel,
+            "root": root,
+            "runtime": target_rt,
+            "stopReason": "",
+            "error": err_text,
+            "errorCode": -32000,
+            "model": "",
+            "effort": "",
+            "finalText": "",
+        })
+
+
+def _fail_adapter_exit(adapter_runtime, exit_code):
+    """Fail every in-flight request/prompt/waiter belonging to a crashed secondary adapter."""
+    err_text = f"{adapter_runtime} adapter exited unexpectedly ({exit_code})"
+    log(err_text)
+    client_rids = []
+    done_notifications = []
+    with lock:
+        # Wake any proxy_request / initialize waiters targeting this runtime.
+        for wid, entry in list(waiters.items()):
+            if len(entry) >= 3 and entry[2] == adapter_runtime:
+                entry[1] = {"error": {"code": -32000, "message": err_text}}
+                entry[0].set()
+        # Drop any pending adapter-initiated requests for this runtime.
+        for ext_rid, (rt_item, _) in list(pending_adapter_req.items()):
+            if rt_item == adapter_runtime:
+                pending_adapter_req.pop(ext_rid, None)
+        # Fail pending session/new, session/load, session/resume for this runtime.
+        for rid, info in list(pending_new.items()):
+            rt_item = info.get("runtime") if isinstance(info, dict) else DEFAULT_RUNTIME
+            if rt_item == adapter_runtime:
+                pending_new.pop(rid, None)
+                ws = pending_ws.pop(rid, None)
+                client_rids.append(rid)
+                if ws and ws.get("key"):
+                    key = ws["key"]
+                    done_notifications.append({
+                        "channel": key.split("_", 1)[0],
+                        "root": key.split("_", 1)[1] if "_" in key else "",
+                        "runtime": adapter_runtime,
+                        "stopReason": "",
+                        "error": err_text,
+                        "errorCode": -32000,
+                        "model": "",
+                        "effort": "",
+                        "finalText": "",
+                    })
+        # Fail pending session/set_config_option / session/set_model for this runtime.
+        for rid, (sid, _m, _p) in list(pending_cfg.items()):
+            if split_sid(sid)[0] == adapter_runtime:
+                pending_cfg.pop(rid, None)
+                client_rids.append(rid)
+        # Fail pending session/prompt turns for this runtime.
+        for rid, sid in list(pending_prompt.items()):
+            if split_sid(sid)[0] == adapter_runtime:
+                pending_prompt.pop(rid, None)
+                client_rids.append(rid)
+                if sid in sessions:
+                    sessions[sid]["running"] = max(0, sessions[sid].get("running", 1) - 1)
+                    if sessions[sid].get("turn") == rid:
+                        sessions[sid].pop("turn")
+                turns.pop(rid, None)
+                tn = turn_notify.pop(rid, None)
+                if tn:
+                    done_notifications.append({
+                        "channel": tn["channel"],
+                        "root": tn["root"],
+                        "runtime": adapter_runtime,
+                        "stopReason": "",
+                        "error": err_text,
+                        "errorCode": -32000,
+                        "model": "",
+                        "effort": "",
+                        "finalText": "",
+                    })
+    for rid in client_rids:
+        try:
+            send_client({"jsonrpc": "2.0", "id": rid, "error": {"code": -32000, "message": err_text}})
+        except OSError:
+            pass
+    for payload in done_notifications:
+        spawn(notify_host, "_acp_turn_done", payload)
+
+
+def pump_adapter_proc(proc, adapter_runtime):
+    for line in proc.stdout:
+        out = handle_adapter_line(line, adapter_runtime=adapter_runtime)
         if out is not None:
             with to_client_lock:
                 sys.stdout.buffer.write(out)
                 sys.stdout.buffer.flush()
+    if adapter_runtime != DEFAULT_RUNTIME:
+        try:
+            exit_code = proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            _reap_proc(proc)
+            exit_code = proc.poll()
+        except OSError:
+            exit_code = None
+        with adapter_spawn_lock:
+            cur = adapters.get(adapter_runtime)
+            if cur and cur["proc"] is proc:
+                adapters.pop(adapter_runtime, None)
+        _fail_adapter_exit(adapter_runtime, exit_code)
+
+
+def pump_adapter():
+    pump_adapter_proc(child, DEFAULT_RUNTIME)
 
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         sys.exit("usage: acp-proxy <adapter> [args...]")
+    atexit.register(cleanup_control_sock)
     child = subprocess.Popen(sys.argv[1:], stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0)
     def _forward_term(_signum, _frame):
+        # Never acquire threading.Locks inside a signal handler (can self-deadlock).
+        cleanup_control_sock()
         try:
             child.terminate()
         except OSError:
             pass
+        try:
+            for ad in list(adapters.values()):
+                try:
+                    ad["proc"].terminate()
+                except OSError:
+                    pass
+        except RuntimeError:
+            pass
     signal.signal(signal.SIGTERM, _forward_term)
-    if control_sock:
+    if control_dir or control_sock:
         threading.Thread(target=serve_control, daemon=True).start()
     threading.Thread(target=pump_client, daemon=True).start()
     reader = threading.Thread(target=pump_adapter, daemon=True)
     reader.start()
-    code = child.wait()
-    reader.join(5)
+    try:
+        code = child.wait()
+        reader.join(5)
+    finally:
+        cleanup_control_sock()
+        with adapter_spawn_lock:
+            secondary = list(adapters.values())
+        for ad in secondary:
+            _reap_proc(ad["proc"])
     sys.exit(code)

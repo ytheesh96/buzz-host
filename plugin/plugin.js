@@ -16,7 +16,13 @@ const RUNTIMES = [
   { id: "hermes", title: "Hermes" },
   { id: "antigravity", title: "Antigravity" },
 ];
-const EMPTY = { runtime: "claude", model: "", instructions: "", profile: "" };
+const DEFAULT_CONCURRENCY = 4;
+const CONCURRENCY_VALUES = [1, 2, 4, 6, 8, 12, 16];
+const CONCURRENCY_OPTIONS = CONCURRENCY_VALUES.map((n) => ({
+  value: String(n),
+  label: n === 1 ? "1 (sequential)" : n === DEFAULT_CONCURRENCY ? `${n} (default)` : `${n} parallel`,
+}));
+const EMPTY = { runtime: "claude", model: "", instructions: "", profile: "", concurrency: DEFAULT_CONCURRENCY };
 
 function storedUrl() {
   try {
@@ -478,6 +484,14 @@ export function apply(ctx) {
         ...(error ? { description: `Model list unavailable: ${error}` } : {}),
         onChange: (model) => onChange({ ...draft, model }),
       }),
+      h(ui.Select, {
+        label: "Parallel conversations",
+        variant: "preference",
+        value: String(draft.concurrency ?? DEFAULT_CONCURRENCY),
+        disabled,
+        groups: one(CONCURRENCY_OPTIONS),
+        onValueChange: (v) => onChange({ ...draft, concurrency: Number(v) || DEFAULT_CONCURRENCY }),
+      }),
     );
   }
 
@@ -618,6 +632,16 @@ export function apply(ctx) {
           onChange: (model) => change({ model }),
         }),
       ),
+      h(
+        Row,
+        { label: "Parallel conversations", hint: "How many chats or threads this agent can answer at once." },
+        h(Select, {
+          value: String(draft.concurrency ?? DEFAULT_CONCURRENCY),
+          disabled,
+          options: CONCURRENCY_OPTIONS,
+          onChange: (v) => change({ concurrency: Number(v) || DEFAULT_CONCURRENCY }),
+        }),
+      ),
     );
   }
 
@@ -645,7 +669,14 @@ export function apply(ctx) {
       ]).then(
         ([s, i]) =>
           !signal.aborted &&
-          setLoaded({ runtime: s.runtime, model: s.model ?? "", profile: s.profile ?? "", instructions: i.instructions, status: s.status }),
+          setLoaded({
+            runtime: s.runtime,
+            model: s.model ?? "",
+            profile: s.profile ?? "",
+            concurrency: Number(s.concurrency) || DEFAULT_CONCURRENCY,
+            instructions: i.instructions,
+            status: s.status,
+          }),
         (e) => !signal.aborted && setError(String(e.message ?? e)),
       );
       return () => controller.abort();
@@ -705,7 +736,10 @@ export function apply(ctx) {
             subtitle: `buzz-host on ${host}`,
             trailing: h("span", { className: "text-body-sm text-secondary" }, `Service ${loaded.status}`),
           }),
-          h(ui.PreferenceRow, { title: "Sessions", subtitle: "One session per thread; Solo chats and DMs keep one." }),
+          h(ui.PreferenceRow, {
+            title: "Sessions",
+            subtitle: `One session per thread; Solo chats and DMs keep one. Runs up to ${loaded.concurrency} conversation${loaded.concurrency === 1 ? "" : "s"} in parallel.`,
+          }),
           h(ui.PreferenceRow, {
             title: "Restart",
             subtitle: "A turn in progress is cut short.",
@@ -765,7 +799,10 @@ export function apply(ctx) {
       );
     }
     const runtimeChanged =
-      draft.runtime !== loaded.runtime || draft.model.trim() !== loaded.model || draft.profile !== loaded.profile;
+      draft.runtime !== loaded.runtime ||
+      draft.model.trim() !== loaded.model ||
+      draft.profile !== loaded.profile ||
+      (draft.concurrency ?? DEFAULT_CONCURRENCY) !== loaded.concurrency;
     const instructionsChanged = draft.instructions !== loaded.instructions;
     const dirty = runtimeChanged || instructionsChanged;
     const save = () =>
@@ -775,7 +812,13 @@ export function apply(ctx) {
         let status = loaded.status;
         if (runtimeChanged) {
           status = (
-            await client.call("settings.set", { pubkey, runtime: draft.runtime, model: draft.model.trim(), profile: draft.profile })
+            await client.call("settings.set", {
+              pubkey,
+              runtime: draft.runtime,
+              model: draft.model.trim(),
+              profile: draft.profile,
+              concurrency: draft.concurrency ?? DEFAULT_CONCURRENCY,
+            })
           ).status;
           invalidateCatalog(pubkey);
         }
@@ -830,7 +873,14 @@ export function apply(ctx) {
       ]).then(
         ([s, i]) => {
           if (signal.aborted) return;
-          const value = { runtime: s.runtime, model: s.model ?? "", profile: s.profile ?? "", instructions: i.instructions, status: s.status };
+          const value = {
+            runtime: s.runtime,
+            model: s.model ?? "",
+            profile: s.profile ?? "",
+            concurrency: Number(s.concurrency) || DEFAULT_CONCURRENCY,
+            instructions: i.instructions,
+            status: s.status,
+          };
           setLoaded(value);
           setDraft(value);
         },
@@ -859,7 +909,10 @@ export function apply(ctx) {
         !settingsSection && settingsContent,
       );
     const runtimeChanged =
-      draft.runtime !== loaded.runtime || draft.model.trim() !== loaded.model || draft.profile !== loaded.profile;
+      draft.runtime !== loaded.runtime ||
+      draft.model.trim() !== loaded.model ||
+      draft.profile !== loaded.profile ||
+      (draft.concurrency ?? DEFAULT_CONCURRENCY) !== loaded.concurrency;
     const instructionsChanged = draft.instructions !== loaded.instructions;
     const dirty = runtimeChanged || instructionsChanged;
     const save = () =>
@@ -873,7 +926,13 @@ export function apply(ctx) {
         let status = loaded.status;
         if (runtimeChanged) {
           status = (
-            await client.call("settings.set", { pubkey, runtime: draft.runtime, model: draft.model.trim(), profile: draft.profile })
+            await client.call("settings.set", {
+              pubkey,
+              runtime: draft.runtime,
+              model: draft.model.trim(),
+              profile: draft.profile,
+              concurrency: draft.concurrency ?? DEFAULT_CONCURRENCY,
+            })
           ).status;
           invalidateCatalog(pubkey);
         }
@@ -888,7 +947,7 @@ export function apply(ctx) {
       h(
         Note,
         null,
-        `Runs on buzz-host (${client.snapshot().url.replace(/^wss:\/\//, "")})${loaded.runtime === "hermes" ? ` · Hermes profile ${loaded.profile || "default"}` : ""} · service ${loaded.status}. One session per thread.`,
+        `Runs on buzz-host (${client.snapshot().url.replace(/^wss:\/\//, "")})${loaded.runtime === "hermes" ? ` · Hermes profile ${loaded.profile || "default"}` : ""} · service ${loaded.status}. Up to ${loaded.concurrency} parallel conversations.`,
       ),
       h(
         Row,
@@ -923,6 +982,16 @@ export function apply(ctx) {
           value: draft.model,
           disabled: !!busy,
           onChange: (model) => setDraft({ ...draft, model }),
+        }),
+      ),
+      h(
+        Row,
+        { label: "Parallel conversations", hint: "How many chats or threads this agent can answer at once." },
+        h(Select, {
+          value: String(draft.concurrency ?? DEFAULT_CONCURRENCY),
+          disabled: !!busy,
+          options: CONCURRENCY_OPTIONS,
+          onChange: (v) => setDraft({ ...draft, concurrency: Number(v) || DEFAULT_CONCURRENCY }),
         }),
       ),
       h(
@@ -1741,120 +1810,8 @@ export function apply(ctx) {
     );
   }
 
-  // ----- Orchestrator, in Settings and as an in-chat worker card -----
+  // ----- Orchestrator, in Settings (Solo-chat workers) -----
   const ORCH_LIVE_STATUSES = new Set(["queued", "starting", "running"]);
-  const ORCH_RUNTIME_TITLES = {
-    claude: "Claude Code",
-    codex: "Codex",
-    hermes: "Hermes",
-    antigravity: "Antigravity",
-  };
-  const orchRuntimeTitle = (id) => ORCH_RUNTIME_TITLES[id] ?? (id || "Worker");
-  const orchBadgeText = (task) =>
-    [orchRuntimeTitle(task?.runtime), task?.model || "", task?.effort || ""].filter(Boolean).join(" · ");
-  function orchFormatElapsed(ms) {
-    const s = Math.max(0, Math.floor((Number(ms) || 0) / 1000));
-    if (s < 60) return `${s}s`;
-    const m = Math.floor(s / 60);
-    if (m < 60) return `${m}m ${String(s % 60).padStart(2, "0")}s`;
-    const hr = Math.floor(m / 60);
-    return `${hr}h ${String(m % 60).padStart(2, "0")}m`;
-  }
-  function orchStatusMeta(status) {
-    switch (status) {
-      case "queued":
-        return { label: "Queued", color: "var(--text-secondary)", bg: "var(--surface-inset)" };
-      case "starting":
-        return { label: "Starting", color: "var(--accent, #3b82f6)", bg: "rgba(59, 130, 246, 0.12)" };
-      case "running":
-        return { label: "Running", color: "var(--accent, #3b82f6)", bg: "rgba(59, 130, 246, 0.14)" };
-      case "completed":
-        return { label: "Done", color: "#30a46c", bg: "rgba(48, 164, 108, 0.14)" };
-      case "failed":
-        return { label: "Failed", color: "#e5484d", bg: "rgba(229, 72, 77, 0.14)" };
-      case "timed_out":
-        return { label: "Timed out", color: "#e5484d", bg: "rgba(229, 72, 77, 0.14)" };
-      case "cancelled":
-        return { label: "Stopped", color: "var(--text-secondary)", bg: "var(--surface-inset)" };
-      case "interrupted":
-        return { label: "Interrupted", color: "#d97706", bg: "rgba(217, 119, 6, 0.14)" };
-      default:
-        return { label: String(status || "Unknown"), color: "var(--text-secondary)", bg: "var(--surface-inset)" };
-    }
-  }
-  function orchSelectTasks(tasks, { messageId, since, live = false }) {
-    const list = Array.isArray(tasks) ? tasks : [];
-    const exact = messageId ? list.filter((t) => t.originEventId === messageId) : [];
-    const chosen = exact.length
-      ? exact
-      : live
-        ? list.filter(
-            (t) =>
-              !t.originEventId &&
-              (ORCH_LIVE_STATUSES.has(t.status) || (Number.isFinite(since) && (t.createdAt || t.startedAt || 0) >= since)),
-          )
-        : [];
-    return [...chosen].sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
-  }
-
-  // Coalesce concurrent/rapid orchestrator.tasks RPCs for the same agent+chat
-  // across multiple rendered message rows in the channel.
-  const orchChatFetches = new Map(); // key -> { at, promise }
-  function fetchOrchChatTasks(pubkey, channelId, threadRootId) {
-    const key = `${pubkey}:${channelId || ""}:${threadRootId || ""}`;
-    const hit = orchChatFetches.get(key);
-    if (hit && Date.now() - hit.at < 1000) return hit.promise;
-    const promise = client
-      .call("orchestrator.tasks", { pubkey, channelId, threadRootId: threadRootId || undefined }, { timeoutMs: 15000 })
-      .catch((err) => {
-        if (orchChatFetches.get(key)?.promise === promise) orchChatFetches.delete(key);
-        throw err;
-      });
-    orchChatFetches.set(key, { at: Date.now(), promise });
-    return promise;
-  }
-
-  const orchestratorAgents = (() => {
-    let agents = new Set();
-    let checkedAt = 0;
-    let loading = null;
-    const listeners = new Set();
-    const notify = () => {
-      for (const l of listeners) l();
-    };
-    const load = () => {
-      if (loading || Date.now() - checkedAt < 60000) return;
-      loading = client
-        .call("list", {}, { timeoutMs: 20000 })
-        .then((r) => {
-          const next = new Set(r.agents.filter((a) => a.orchestrate).map((a) => a.pubkey));
-          checkedAt = Date.now();
-          if (next.size !== agents.size || [...next].some((p) => !agents.has(p))) {
-            agents = next;
-            notify();
-          }
-        })
-        .catch(() => (checkedAt = Date.now() - 45000))
-        .finally(() => (loading = null));
-    };
-    return {
-      subscribe(listener) {
-        listeners.add(listener);
-        load();
-        return () => listeners.delete(listener);
-      },
-      snapshot: () => agents,
-      set(pubkey, enabled) {
-        const next = new Set(agents);
-        if (enabled) next.add(pubkey);
-        else next.delete(pubkey);
-        agents = next;
-        checkedAt = Date.now();
-        notify();
-      },
-    };
-  })();
-  const orchTasksCache = new Map(); // turnId -> tasks[]
 
   function OrchestratorSettings({ ui, agent }) {
     const pubkey = agent.pubkey;
@@ -1892,8 +1849,7 @@ export function apply(ctx) {
     const toggle = () =>
       act("toggle", async () => {
         const enabled = !info.enabled;
-        const r = await client.call("orchestrator.set", { pubkey, enabled }, { timeoutMs: 90000 });
-        orchestratorAgents.set(pubkey, r.enabled === true);
+        await client.call("orchestrator.set", { pubkey, enabled }, { timeoutMs: 90000 });
         await refresh();
       });
     const stopAll = () =>
@@ -1914,6 +1870,7 @@ export function apply(ctx) {
         : tasks.length > 0
           ? ` ${tasks.length} recent task${tasks.length === 1 ? "" : "s"}.`
           : " No worker tasks yet.";
+
     const rows = [
       {
         key: "orchestrator",
@@ -1925,7 +1882,7 @@ export function apply(ctx) {
             : busy === "toggle"
               ? `Restarting ${name}…`
               : on
-                ? `${name} can delegate tasks to ephemeral ACP workers on Claude, Codex, Hermes, and Antigravity in your chats.${state} Turning it off restarts ${name}.`
+                ? `${name} delegates tasks as real Solo chats (on itself or any Omarchy agent) across Claude, Codex, Hermes, and Antigravity.${state} Turning it off restarts ${name}.`
                 : `Off: ${name} has no orchestration tools. Turning it on restarts ${name} and adds 7 orch_* tools to its sessions.`,
         trailing: info
           ? h(
@@ -1987,395 +1944,6 @@ export function apply(ctx) {
           ),
           row.trailing ?? (row.action && h("button", { type: "button", disabled: working, onClick: row.action.onClick }, row.action.label)),
         ),
-      ),
-    );
-  }
-
-  function OrchestratorCard(props) {
-    const { session, channelId, message } = props;
-    const agents = React.useSyncExternalStore(orchestratorAgents.subscribe, orchestratorAgents.snapshot);
-    const activity = session?.agentActivity;
-    const keys = React.useSyncExternalStore(activity?.subscribe ?? noSubscribe, () =>
-      previewKeys(activity?.snapshot(), channelId, message?.id, agents),
-    );
-    if (!keys) return null;
-    return h(
-      React.Fragment,
-      null,
-      ...keys.split("\n").map((k) =>
-        h(OrchestratorTurnCard, {
-          key: k.split(" ").slice(0, 2).join(" "),
-          entry: k,
-          session,
-          channelId,
-          messageId: message?.id || "",
-          layout: props.messageLayout,
-        }),
-      ),
-    );
-  }
-
-  function OrchestratorTurnCard({ entry, session, channelId, messageId, layout }) {
-    const [pubkey, turnId, phase, threadRootId] = entry.split(" ");
-    const live = phase === "live";
-    const since = React.useMemo(() => {
-      if (!turnStarts.has(turnId)) {
-        let at;
-        try {
-          at = buildTurns(session.agentActivity.snapshot().records, pubkey).find((t) => t.id === turnId)?.at;
-        } catch {}
-        turnStarts.set(turnId, Number.isFinite(at) ? at - 2000 : Date.now() - 5000);
-      }
-      return turnStarts.get(turnId);
-    }, [turnId, pubkey, session]);
-    const [tasks, setTasks] = React.useState(() => orchTasksCache.get(turnId) ?? []);
-    const [expanded, setExpanded] = React.useState(() => new Set());
-    const [fullTasks, setFullTasks] = React.useState(() => new Map());
-    const [loadingFull, setLoadingFull] = React.useState(() => new Set());
-    const [stoppingIds, setStoppingIds] = React.useState(() => new Set());
-    const [error, setError] = React.useState("");
-    const [now, setNow] = React.useState(() => Date.now());
-    const mountedRef = React.useRef(true);
-    const expandedRef = React.useRef(expanded);
-    expandedRef.current = expanded;
-    const fullTasksRef = React.useRef(fullTasks);
-    fullTasksRef.current = fullTasks;
-    const loadingFullRef = React.useRef(new Set());
-
-    React.useEffect(() => {
-      mountedRef.current = true;
-      return () => {
-        mountedRef.current = false;
-      };
-    }, []);
-
-    const loadFull = React.useCallback(
-      async (taskId) => {
-        if (loadingFullRef.current.has(taskId)) return;
-        loadingFullRef.current.add(taskId);
-        if (mountedRef.current) setLoadingFull((prev) => new Set(prev).add(taskId));
-        try {
-          const r = await client.call("orchestrator.tasks", { pubkey, taskId, full: true }, { timeoutMs: 15000 });
-          if (!mountedRef.current) return;
-          const full = r.task ?? (r.tasks ?? []).find((t) => t.taskId === taskId);
-          if (full) {
-            setFullTasks((prev) => {
-              const next = new Map(prev);
-              next.set(taskId, full);
-              return next;
-            });
-          }
-        } catch (e) {
-          if (mountedRef.current) setError(String(e.message ?? e));
-        } finally {
-          loadingFullRef.current.delete(taskId);
-          if (mountedRef.current) {
-            setLoadingFull((prev) => {
-              const next = new Set(prev);
-              next.delete(taskId);
-              return next;
-            });
-          }
-        }
-      },
-      [pubkey],
-    );
-
-    const hasLiveTask = tasks.some((t) => ORCH_LIVE_STATUSES.has(t.status));
-
-    React.useEffect(() => {
-      let stopped = false;
-      let timer;
-      const tick = async () => {
-        if (stopped) return;
-        let wait = 2500;
-        let keepPolling = live;
-        if (document.visibilityState !== "hidden") {
-          try {
-            const r = await fetchOrchChatTasks(pubkey, channelId, threadRootId);
-            if (stopped) return;
-            const selected = orchSelectTasks(r.tasks, { messageId, since, live });
-            orchTasksCache.set(turnId, selected);
-            setTasks(selected);
-            setError("");
-            const anyLive = selected.some((t) => ORCH_LIVE_STATUSES.has(t.status));
-            keepPolling = live || anyLive;
-            if (selected.length > 0) wait = 1500;
-            for (const tid of expandedRef.current) {
-              const match = selected.find((t) => t.taskId === tid);
-              const prevFull = fullTasksRef.current.get(tid);
-              if (
-                match &&
-                (ORCH_LIVE_STATUSES.has(match.status) ||
-                  !prevFull ||
-                  prevFull.status !== match.status ||
-                  prevFull.updatedAt !== match.updatedAt)
-              ) {
-                void loadFull(tid);
-              }
-            }
-          } catch {
-            wait = 5000;
-          }
-        }
-        if (!stopped && keepPolling) timer = setTimeout(tick, wait);
-      };
-      tick();
-      return () => {
-        stopped = true;
-        clearTimeout(timer);
-      };
-    }, [live, pubkey, turnId, channelId, threadRootId, messageId, since, loadFull]);
-
-    React.useEffect(() => {
-      if (!hasLiveTask) return undefined;
-      const id = setInterval(() => setNow(Date.now()), 1000);
-      return () => clearInterval(id);
-    }, [hasLiveTask]);
-
-    if (!tasks.length) return null;
-
-    const toggleExpand = (taskId) => {
-      const opening = !expandedRef.current.has(taskId);
-      setExpanded((prev) => {
-        const next = new Set(prev);
-        if (next.has(taskId)) next.delete(taskId);
-        else next.add(taskId);
-        return next;
-      });
-      if (opening) void loadFull(taskId);
-    };
-
-    const cancelTask = async (taskId) => {
-      setStoppingIds((prev) => new Set(prev).add(taskId));
-      setError("");
-      try {
-        const r = await client.call("orchestrator.cancel", { pubkey, taskId }, { timeoutMs: 20000 });
-        if (r?.task) {
-          setTasks((prev) => {
-            const next = prev.map((t) => (t.taskId === taskId ? { ...t, ...r.task } : t));
-            orchTasksCache.set(turnId, next);
-            return next;
-          });
-        }
-      } catch (e) {
-        setError(String(e.message ?? e));
-      } finally {
-        setStoppingIds((prev) => {
-          const next = new Set(prev);
-          next.delete(taskId);
-          return next;
-        });
-      }
-    };
-
-    const liveCount = tasks.filter((t) => ORCH_LIVE_STATUSES.has(t.status)).length;
-    const doneCount = tasks.length - liveCount;
-    const headerSummary = [
-      liveCount ? `${liveCount} running` : "",
-      doneCount ? `${doneCount} finished` : "",
-    ]
-      .filter(Boolean)
-      .join(" · ");
-
-    return h(
-      PreviewRow,
-      { layout },
-      h(
-        "div",
-        {
-          className: "ui-card",
-          "data-buzz-host-orchestrator": liveCount > 0 ? "live" : "done",
-          style: {
-            display: "grid",
-            gap: "var(--space-2)",
-            padding: "var(--space-2) var(--space-3)",
-            width: "min(560px, 100%)",
-            maxWidth: "100%",
-            minWidth: 0,
-          },
-        },
-        h(
-          "div",
-          { style: { display: "flex", alignItems: "center", gap: "var(--space-2)", justifyContent: "space-between", minWidth: 0 } },
-          h(
-            "span",
-            { className: "text-body-sm", style: { display: "inline-flex", alignItems: "center", gap: 6, fontWeight: 600 } },
-            liveCount > 0 && h("span", { style: { width: 7, height: 7, borderRadius: 999, background: "#3b82f6" } }),
-            "Workers",
-          ),
-          h("span", { className: "text-caption text-secondary" }, headerSummary),
-        ),
-        ...tasks.map((task) => {
-          const isLive = ORCH_LIVE_STATUSES.has(task.status);
-          const st = orchStatusMeta(task.status);
-          const isExpanded = expanded.has(task.taskId);
-          const full = fullTasks.get(task.taskId);
-          const isStopping = stoppingIds.has(task.taskId);
-          const elapsed =
-            isLive && task.startedAt
-              ? Math.max(task.elapsedMs || 0, now - task.startedAt)
-              : task.elapsedMs || (task.endedAt && task.startedAt ? task.endedAt - task.startedAt : 0);
-          const stepText = task.error
-            ? task.error
-            : task.latestStep?.title
-              ? `${task.latestStep.kind === "tool" ? "Tool: " : task.latestStep.kind === "thought" ? "Thinking: " : ""}${task.latestStep.title}`
-              : task.status === "queued"
-                ? "Waiting for a worker slot…"
-                : task.status === "starting"
-                  ? "Starting worker session…"
-                  : "";
-          const transcript = full?.transcript ?? task.transcript ?? [];
-          const resultText = full?.result?.text ?? task.result?.text ?? "";
-
-          return h(
-            "div",
-            {
-              key: task.taskId,
-              style: {
-                display: "grid",
-                gap: 4,
-                padding: "var(--space-2)",
-                borderRadius: "var(--radius-control, 8px)",
-                background: "var(--surface-inset)",
-                border: "1px solid var(--border-standard)",
-                minWidth: 0,
-              },
-            },
-            h(
-              "div",
-              // One line: the badge and label share the leftover width and
-              // truncate (badge capped so a long model id can't crowd out the
-              // label); status, elapsed and the buttons never shrink or wrap.
-              { style: { display: "flex", alignItems: "center", gap: "var(--space-2)", flexWrap: "nowrap", minWidth: 0 } },
-              h(
-                "span",
-                {
-                  className: "text-caption",
-                  title: orchBadgeText(task),
-                  style: {
-                    padding: "1px 6px",
-                    borderRadius: 999,
-                    background: "var(--surface-raised, rgba(127,127,127,0.14))",
-                    fontWeight: 500,
-                    whiteSpace: "nowrap",
-                    overflow: "hidden",
-                    textOverflow: "ellipsis",
-                    flex: "0 1 auto",
-                    minWidth: 0,
-                    maxWidth: "45%",
-                  },
-                },
-                orchBadgeText(task),
-              ),
-              h(
-                "span",
-                {
-                  className: "text-body-sm",
-                  style: { flex: "1 1 6em", minWidth: "4em", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontWeight: 500 },
-                  title: task.label || task.taskId,
-                },
-                task.label || task.taskId,
-              ),
-              h(
-                "span",
-                {
-                  className: "text-caption",
-                  style: {
-                    padding: "1px 6px",
-                    borderRadius: 999,
-                    color: st.color,
-                    background: st.bg,
-                    fontWeight: 500,
-                    whiteSpace: "nowrap",
-                    flexShrink: 0,
-                  },
-                },
-                st.label,
-              ),
-              h("span", { className: "text-caption text-secondary", style: { whiteSpace: "nowrap", flexShrink: 0, fontVariantNumeric: "tabular-nums" } }, orchFormatElapsed(elapsed)),
-              h(
-                "span",
-                { style: { display: "flex", alignItems: "center", gap: 2, flexShrink: 0 } },
-                isLive &&
-                  h(
-                    Btn,
-                    {
-                      size: "sm",
-                      variant: "ghost",
-                      disabled: isStopping,
-                      onClick: () => void cancelTask(task.taskId),
-                      "aria-label": `Stop worker ${task.label || task.taskId}`,
-                    },
-                    isStopping ? "Stopping…" : "Stop",
-                  ),
-                h(
-                  Btn,
-                  {
-                    size: "sm",
-                    variant: "ghost",
-                    onClick: () => toggleExpand(task.taskId),
-                    "aria-expanded": isExpanded,
-                  },
-                  isExpanded ? "Hide" : "Transcript",
-                ),
-              ),
-            ),
-            (stepText || task.steerQueued > 0) &&
-              h(
-                "div",
-                {
-                  className: task.error ? "text-caption text-danger" : "text-caption text-secondary",
-                  style: { overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0 },
-                  title: stepText,
-                },
-                stepText,
-                task.steerQueued > 0 ? `${stepText ? " · " : ""}${task.steerQueued} follow-up queued` : "",
-              ),
-            isExpanded &&
-              h(
-                "div",
-                {
-                  style: {
-                    display: "grid",
-                    gap: 4,
-                    marginTop: 4,
-                    padding: "var(--space-2)",
-                    borderRadius: "var(--radius-sm, 6px)",
-                    background: "var(--surface-base, rgba(0,0,0,0.12))",
-                    maxHeight: 240,
-                    overflow: "auto",
-                  },
-                },
-                loadingFull.has(task.taskId) && !full
-                  ? h("span", { className: "text-caption text-secondary" }, "Loading transcript…")
-                  : transcript.length > 0
-                    ? transcript.map((entry, idx) =>
-                        h(
-                          "div",
-                          {
-                            key: `${entry.at || 0}-${idx}`,
-                            className: "text-caption",
-                            style: { whiteSpace: "pre-wrap", wordBreak: "break-word", fontFamily: "var(--font-mono, monospace)" },
-                          },
-                          h("span", { className: "text-secondary" }, `[${entry.kind || "event"}] `),
-                          entry.text || "",
-                        ),
-                      )
-                    : resultText
-                      ? h(
-                          "pre",
-                          {
-                            className: "m-0 text-caption",
-                            style: { whiteSpace: "pre-wrap", wordBreak: "break-word", fontFamily: "var(--font-mono, monospace)" },
-                          },
-                          resultText,
-                        )
-                      : h("span", { className: "text-caption text-secondary" }, "No transcript entries yet."),
-              ),
-          );
-        }),
-        error && h(Note, { tone: "error" }, error),
       ),
     );
   }
@@ -3934,7 +3502,18 @@ export function apply(ctx) {
         const c = asConfig(config);
         return client.call(
           "provision",
-          { name, picture, community, config: { runtime: c.runtime, model: c.model.trim(), profile: c.runtime === "hermes" ? c.profile : "", instructions: c.instructions } },
+          {
+            name,
+            picture,
+            community,
+            config: {
+              runtime: c.runtime,
+              model: c.model.trim(),
+              profile: c.runtime === "hermes" ? c.profile : "",
+              concurrency: Number(c.concurrency) || DEFAULT_CONCURRENCY,
+              instructions: c.instructions,
+            },
+          },
           { signal },
         );
       },
@@ -3947,7 +3526,17 @@ export function apply(ctx) {
             name,
             community,
             auth,
-            ...(c ? { config: { runtime: c.runtime, model: c.model.trim(), profile: c.runtime === "hermes" ? c.profile : "", instructions: c.instructions } } : {}),
+            ...(c
+              ? {
+                  config: {
+                    runtime: c.runtime,
+                    model: c.model.trim(),
+                    profile: c.runtime === "hermes" ? c.profile : "",
+                    concurrency: Number(c.concurrency) || DEFAULT_CONCURRENCY,
+                    instructions: c.instructions,
+                  },
+                }
+              : {}),
           },
           { signal, timeoutMs: 180000 },
         );
@@ -3988,15 +3577,6 @@ export function apply(ctx) {
     placement: "response",
     order: 10,
     component: DesktopPreview,
-  });
-
-  // The in-chat orchestrator worker card, right after the desktop preview.
-  ctx.conversation.registerAccessory({
-    id: "orchestrator-tasks",
-    title: "Orchestrator workers",
-    placement: "response",
-    order: 11,
-    component: OrchestratorCard,
   });
 
   // ----- Settings → Omarchy agents: server address and status -----

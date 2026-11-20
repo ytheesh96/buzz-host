@@ -11,7 +11,7 @@ Restart=always
 RestartSec=10
 RestartPreventExitStatus=78
 UMask=0077
-MemoryMax=2G
+MemoryMax=4G
 
 [Install]
 WantedBy=default.target
