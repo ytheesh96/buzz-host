@@ -86,6 +86,7 @@ const emptyRecord = (pubkey) => ({
 });
 
 export function createAttention({ dataDir, runDir, log = console, extra }) {
+  const extras = Array.isArray(extra) ? extra.filter(Boolean) : extra ? [extra] : [];
   const agentDir = (pubkey) => path.join(dataDir, pubkey);
   const stateFile = (pubkey) => path.join(agentDir(pubkey), "attention.json");
   /** pubkey → Promise of { record, checkpoints, wakes, history }, as saved. */
@@ -233,7 +234,7 @@ export function createAttention({ dataDir, runDir, log = console, extra }) {
   }
 
   /** JSON lines on attention.sock: {pubkey, name, args} → {result} | {error}.
-   * `extra` (memory.mjs) answers the names it handles, Attention the rest. */
+   * `extra` (memory.mjs, orchestrator.mjs) answers the names it handles, Attention the rest. */
   async function listen() {
     await fs.mkdir(runDir, { recursive: true, mode: 0o700 });
     const sock = path.join(runDir, "attention.sock");
@@ -251,9 +252,10 @@ export function createAttention({ dataDir, runDir, log = console, extra }) {
           let reply;
           try {
             const { pubkey, name, args } = JSON.parse(line);
+            const handler = extras.find((e) => e?.handles?.(name));
             reply = {
-              result: extra?.handles(name)
-                ? await extra.call(pubkey, name, args ?? {})
+              result: handler
+                ? await handler.call(pubkey, name, args ?? {})
                 : await callTool(pubkey, name, args),
             };
           } catch (error) {

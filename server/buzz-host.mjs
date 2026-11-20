@@ -21,6 +21,7 @@ import path from "node:path";
 import os from "node:os";
 import { createAttention } from "./attention.mjs";
 import { createMemory } from "./memory.mjs";
+import { createOrchestrator } from "./orchestrator.mjs";
 import { createRelayWatcher } from "./attention-relay.mjs";
 import { catalogs, toModels } from "./catalog.mjs";
 import * as desktop from "./desktop/desktop.mjs";
@@ -274,19 +275,22 @@ async function writeRuntimeEnv(pubkey, m) {
 // The agent's Buzz MCP server: a per-agent wrapper, because buzz-acp starts
 // BUZZ_ACP_MCP_COMMAND without arguments and names the server after the file
 // ("buzz", as Buzz's own). Memory tools always; Attention tools while the
-// owner has Attention on; computer tools while the agent has a desktop
-// (turning either on or off restarts the agent).
+// owner has Attention on; computer tools while the agent has a desktop;
+// orchestrator tools while the owner has Orchestrator on (turning any on or
+// off restarts the agent).
 async function writeBuzzMcp(pubkey) {
   const mcp = path.join(dir(pubkey), "mcp");
   const file = path.join(mcp, "buzz");
   const withAttention = (await attention.load(pubkey)).record.attentionEnabled;
-  const withComputer = (await meta(pubkey).catch(() => ({}))).desktop === true;
+  const m = await meta(pubkey).catch(() => ({}));
+  const withComputer = m.desktop === true;
+  const withOrchestrate = m.orchestrate === true;
   await fs.mkdir(mcp, { recursive: true, mode: 0o700 });
   await fs.rm(path.join(mcp, "attention"), { force: true }); // before 2026-11-17
   await writePrivate(
     file,
     `#!/bin/sh\n# Buzz tools for buzz-host agent ${pubkey} (written by buzz-host).\n` +
-      `exec ${sq(process.execPath)} ${sq(path.join(LIB, "buzz-mcp.mjs"))} ${pubkey}${withAttention ? " --attention" : ""}${withComputer ? " --computer" : ""}\n`,
+      `exec ${sq(process.execPath)} ${sq(path.join(LIB, "buzz-mcp.mjs"))} ${pubkey}${withAttention ? " --attention" : ""}${withComputer ? " --computer" : ""}${withOrchestrate ? " --orchestrate" : ""}\n`,
   );
   await fs.chmod(file, 0o700);
   return file;
@@ -350,6 +354,20 @@ function checkName(name) {
 const PROBE_DIR = path.join(LIB, "probe");
 const catalog = catalogs({ dir: path.join(HOME, ".local/share/buzz-host/catalog") });
 
+async function runtimeCatalog(runtime, profile = "", configured = "") {
+  if (!Object.hasOwn(RUNTIMES, runtime)) throw new Error("Unknown runtime");
+  const home = runtime === "hermes" && profile ? hermesHome(profile) : "";
+  await fs.mkdir(PROBE_DIR, { recursive: true });
+  const probed = await catalog(`${runtime}:${profile}`, {
+    command: RUNTIMES[runtime].command,
+    env: { ...process.env, ...(home ? { HERMES_HOME: home } : {}) },
+    cwd: PROBE_DIR,
+    // hermes-acp lists one set of levels (reasoning_effort) for every model.
+    perModel: runtime !== "hermes",
+  });
+  return toModels(probed, configured);
+}
+
 function checkPlace(channelId, threadRootId) {
   if (typeof channelId !== "string" || !UUID.test(channelId)) throw new Error("Invalid channel id");
   if (threadRootId != null && (typeof threadRootId !== "string" || !HEX64.test(threadRootId)))
@@ -367,6 +385,8 @@ const UNSERIALIZED = new Set([
   "desktop.view",
   "desktop.lease",
   "desktop.snapshot",
+  "orchestrator.tasks",
+  "orchestrator.cancel",
 ]);
 
 // ---------- agent desktops (desktop/) ----------
@@ -660,6 +680,7 @@ const methods = {
           profile: m.profile || "",
           activated: m.activated,
           desktop: m.desktop === true,
+          orchestrate: m.orchestrate === true,
           status: m.activated ? await active(name) : "provisioned",
         });
     }
@@ -685,16 +706,7 @@ const methods = {
     checkPubkey(pubkey);
     const m = await meta(pubkey);
     const { runtime, profile } = settingsFrom(m);
-    const home = runtime === "hermes" && profile ? hermesHome(profile) : "";
-    await fs.mkdir(PROBE_DIR, { recursive: true });
-    const probed = await catalog(`${runtime}:${profile}`, {
-      command: RUNTIMES[runtime].command,
-      env: { ...process.env, ...(home ? { HERMES_HOME: home } : {}) },
-      cwd: PROBE_DIR,
-      // hermes-acp lists one set of levels (reasoning_effort) for every model.
-      perModel: runtime !== "hermes",
-    });
-    return toModels(probed, m.model || "");
+    return runtimeCatalog(runtime, profile, m.model || "");
   },
 
   // Buzz's session controls for one conversation (channel + thread root).
@@ -804,10 +816,52 @@ const methods = {
     return { lease: publicView(lease), mine: lease.holder === "human" && lease.viewer_id === viewer };
   },
 
+  // Cross-harness worker orchestration (orchestrator.mjs). Off by default;
+  // turning it on or off rewrites the agent's MCP wrapper and restarts it.
+  async "orchestrator.set"(config, { pubkey, enabled }) {
+    checkPubkey(pubkey);
+    const m = await meta(pubkey);
+    const next = { ...m, orchestrate: enabled === true };
+    await saveMeta(pubkey, next);
+    if (m.activated && next.orchestrate !== (m.orchestrate === true)) {
+      await writeRuntimeEnv(pubkey, next);
+      await systemctl("restart", unit(pubkey));
+    }
+    return { enabled: next.orchestrate };
+  },
+  async "orchestrator.tasks"(config, { pubkey, channelId, threadRootId, taskId, since, full }) {
+    checkPubkey(pubkey);
+    if (channelId != null) checkPlace(channelId, threadRootId);
+    if (taskId != null && (typeof taskId !== "string" || !taskId)) throw new Error("Invalid taskId");
+    const parsedSince = since != null ? Number(since) : undefined;
+    if (since != null && !Number.isFinite(parsedSince)) throw new Error("Invalid since timestamp");
+    const m = await meta(pubkey);
+    const view = await orchestrator.tasks({
+      pubkey,
+      channelId: channelId || undefined,
+      threadRootId: threadRootId || undefined,
+      taskId: taskId || undefined,
+      since: parsedSince,
+      full: full === true,
+    });
+    return {
+      enabled: m.orchestrate === true,
+      tasks: view?.tasks ?? [],
+      ...(view?.task !== undefined ? { task: view.task } : {}),
+    };
+  },
+  async "orchestrator.cancel"(config, { pubkey, taskId }) {
+    checkPubkey(pubkey);
+    await meta(pubkey);
+    if (typeof taskId !== "string" || !taskId) throw new Error("taskId is required");
+    return orchestrator.cancel({ pubkey, taskId });
+  },
+
   async remove(config, { pubkey }) {
     checkPubkey(pubkey);
-    await desktop.stop(pubkey).catch(() => {});
     await systemctl("disable", "--now", unit(pubkey)).catch(() => {});
+    await orchestrator.forget(pubkey).catch(() => {});
+    await desktop.stop(pubkey).catch(() => {});
     await fs.rm(dir(pubkey), { recursive: true, force: true });
     watcher.sync(pubkey, null);
     attention.forget(pubkey);
@@ -890,7 +944,13 @@ function serveSocket(socket, onText) {
 
 const config = await loadConfig();
 const memory = createMemory({ dataDir: DATA });
-const attention = createAttention({ dataDir: DATA, runDir: RUN_DIR, extra: memory });
+const orchestrator = createOrchestrator({
+  dataDir: DATA,
+  stateDir: path.join(HOME, ".local/share/buzz-host/orchestrator"),
+  shimsDir: SHIMS,
+  catalog: (runtime) => runtimeCatalog(runtime),
+});
+const attention = createAttention({ dataDir: DATA, runDir: RUN_DIR, extra: [memory, orchestrator] });
 // Event watches: one relay connection per agent that has any, fed to Attention.
 const watcher = createRelayWatcher({
   dataDir: DATA,
@@ -994,3 +1054,15 @@ server.on("upgrade", (req, socket) => {
 server.listen(config.port, "127.0.0.1", () =>
   console.log(`buzz-host listening on 127.0.0.1:${config.port}`),
 );
+
+let closing = false;
+async function shutdown(signal) {
+  if (closing) return;
+  closing = true;
+  console.log(`buzz-host shutting down (${signal})`);
+  server.close();
+  await orchestrator.close().catch(() => {});
+  process.exit(0);
+}
+process.on("SIGTERM", () => void shutdown("SIGTERM"));
+process.on("SIGINT", () => void shutdown("SIGINT"));
