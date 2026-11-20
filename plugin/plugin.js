@@ -1813,29 +1813,16 @@ export function apply(ctx) {
   // ----- Orchestrator, in Settings (Solo-chat workers) -----
   const ORCH_LIVE_STATUSES = new Set(["queued", "starting", "running"]);
 
-  function eligibleWorkerAgents(agents, selfPubkey) {
-    return (Array.isArray(agents) ? agents : [])
-      .filter((a) => a && a.pubkey && a.pubkey !== selfPubkey && a.activated && !a.orchestrate)
-      .sort((a, b) => String(a.name || "").localeCompare(String(b.name || "")));
-  }
-
   function OrchestratorSettings({ ui, agent }) {
     const pubkey = agent.pubkey;
     const name = agent.name || "the agent";
     const [info, setInfo] = React.useState();
-    const [allAgents, setAllAgents] = React.useState([]);
     const [busy, setBusy] = React.useState("");
     const [error, setError] = React.useState("");
     const refresh = React.useCallback(
       async (signal) => {
         try {
-          const [tasksInfo, listRes] = await Promise.all([
-            client.call("orchestrator.tasks", { pubkey }, { signal, timeoutMs: 30000 }),
-            client.call("list", {}, { signal, timeoutMs: 20000 }).catch(() => ({ agents: [] })),
-          ]);
-          if (signal?.aborted) return;
-          setInfo(tasksInfo);
-          setAllAgents(Array.isArray(listRes?.agents) ? listRes.agents : []);
+          setInfo(await client.call("orchestrator.tasks", { pubkey }, { signal, timeoutMs: 30000 }));
           setError("");
         } catch (e) {
           if (!signal?.aborted) setError(String(e.message ?? e));
@@ -1865,15 +1852,6 @@ export function apply(ctx) {
         await client.call("orchestrator.set", { pubkey, enabled }, { timeoutMs: 90000 });
         await refresh();
       });
-    const setWorker = (workerPubkey) =>
-      act("worker", async () => {
-        await client.call(
-          "orchestrator.set",
-          { pubkey, enabled: info?.enabled === true, workerPubkey },
-          { timeoutMs: 30000 },
-        );
-        await refresh();
-      });
     const stopAll = () =>
       act("stop", async () => {
         const live = (info?.tasks ?? []).filter((t) => ORCH_LIVE_STATUSES.has(t.status));
@@ -1882,19 +1860,6 @@ export function apply(ctx) {
       });
 
     const on = info?.enabled === true;
-    const workerPubkey = info?.workerPubkey || "";
-    const candidates = eligibleWorkerAgents(allAgents, pubkey);
-    const chosenWorker = candidates.find((a) => a.pubkey === workerPubkey);
-    const workerOptions = [
-      { value: "", label: "Not configured" },
-      ...candidates.map((a) => ({
-        value: a.pubkey,
-        label: `${a.name || a.pubkey.slice(0, 8)} (${a.concurrency || DEFAULT_CONCURRENCY} parallel)`,
-      })),
-    ];
-    if (workerPubkey && !chosenWorker) {
-      workerOptions.push({ value: workerPubkey, label: `${workerPubkey.slice(0, 8)}… (unavailable)` });
-    }
     const tasks = info?.tasks ?? [];
     const liveCount = tasks.filter((t) => ORCH_LIVE_STATUSES.has(t.status)).length;
     const working = Boolean(busy);
@@ -1905,9 +1870,6 @@ export function apply(ctx) {
         : tasks.length > 0
           ? ` ${tasks.length} recent task${tasks.length === 1 ? "" : "s"}.`
           : " No worker tasks yet.";
-    const workerSubtitle = chosenWorker
-      ? `Delegated tasks open as real Solo chats with ${chosenWorker.name} (up to ${chosenWorker.concurrency || DEFAULT_CONCURRENCY} in parallel) across Claude, Codex, Hermes, and Antigravity.`
-      : "Create an Omarchy agent (e.g. Workers) and select it here so delegated tasks open as real Solo chats you can inspect, stop, or steer.";
 
     const rows = [
       {
@@ -1920,7 +1882,7 @@ export function apply(ctx) {
             : busy === "toggle"
               ? `Restarting ${name}…`
               : on
-                ? `${name} delegates tasks to Solo-chat workers on Claude, Codex, Hermes, and Antigravity in your chats.${state} Turning it off restarts ${name}.`
+                ? `${name} delegates tasks as real Solo chats (on itself or any Omarchy agent) across Claude, Codex, Hermes, and Antigravity.${state} Turning it off restarts ${name}.`
                 : `Off: ${name} has no orchestration tools. Turning it on restarts ${name} and adds 7 orch_* tools to its sessions.`,
         trailing: info
           ? h(
@@ -1944,13 +1906,6 @@ export function apply(ctx) {
             ? h(ui?.Button ?? "button", { size: "sm", type: "button", onClick: () => refresh() }, "Retry")
             : null,
       },
-      info &&
-        on && {
-          key: "worker-agent",
-          title: "Worker agent",
-          subtitle: busy === "worker" ? "Saving worker agent…" : workerSubtitle,
-          select: { value: workerPubkey, options: workerOptions, onChange: (v) => void setWorker(v) },
-        },
       liveCount > 0 && {
         key: "stop-workers",
         title: "Stop active workers",
@@ -1964,25 +1919,14 @@ export function apply(ctx) {
         ui.SettingsGroup,
         null,
         ...rows.map((row) =>
-          row.select
-            ? h(ui.Select, {
-                key: row.key,
-                label: row.title,
-                description: row.subtitle,
-                variant: "preference",
-                value: row.select.value,
-                disabled: working,
-                groups: one(row.select.options),
-                onValueChange: row.select.onChange,
-              })
-            : h(ui.PreferenceRow, {
-                key: row.key,
-                title: row.title,
-                subtitle: row.subtitle,
-                trailing:
-                  row.trailing ??
-                  (row.action && h(ui.Button, { size: "sm", disabled: working, onClick: row.action.onClick }, row.action.label)),
-              }),
+          h(ui.PreferenceRow, {
+            key: row.key,
+            title: row.title,
+            subtitle: row.subtitle,
+            trailing:
+              row.trailing ??
+              (row.action && h(ui.Button, { size: "sm", disabled: working, onClick: row.action.onClick }, row.action.label)),
+          }),
         ),
       );
     return h(
@@ -1998,15 +1942,7 @@ export function apply(ctx) {
             h("strong", null, row.title),
             h(Note, { tone: row.key === "orchestrator" && error ? "error" : undefined }, row.subtitle),
           ),
-          row.trailing ??
-            (row.select
-              ? h(Select, {
-                  value: row.select.value,
-                  disabled: working,
-                  options: row.select.options,
-                  onChange: row.select.onChange,
-                })
-              : row.action && h("button", { type: "button", disabled: working, onClick: row.action.onClick }, row.action.label)),
+          row.trailing ?? (row.action && h("button", { type: "button", disabled: working, onClick: row.action.onClick }, row.action.label)),
         ),
       ),
     );

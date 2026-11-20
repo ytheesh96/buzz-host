@@ -132,6 +132,21 @@ test("buzz-mcp.mjs exposes orch_* only with --orchestrate and injects chat/cwd",
       await plain.close();
     }
 
+    // Even with --orchestrate, BUZZHOST_NO_ORCHESTRATE=1 hides orch_* (MAX_DEPTH = 1 for worker Solo chats).
+    const suppressed = startMcp(
+      [PUBKEY, "--orchestrate"],
+      { XDG_RUNTIME_DIR: xdgRun, BUZZHOST_CHAT: CHAT, BUZZHOST_NO_ORCHESTRATE: "1" },
+      workDir,
+    );
+    try {
+      const init = await suppressed.rpc("initialize");
+      assert.doesNotMatch(init.instructions, /Orchestration:/);
+      const list = await suppressed.rpc("tools/list");
+      assert.equal(list.tools.some((t) => t.name.startsWith("orch_")), false);
+    } finally {
+      await suppressed.close();
+    }
+
     const orch = startMcp([PUBKEY, "--orchestrate"], { XDG_RUNTIME_DIR: xdgRun, BUZZHOST_CHAT: CHAT }, workDir);
     try {
       const init = await orch.rpc("initialize");
@@ -179,7 +194,6 @@ test("end-to-end: buzz-mcp.mjs --orchestrate -> attention.sock -> Solo-chat work
   const owner = "9".repeat(64);
   const eventId = "7".repeat(64);
   await fs.mkdir(path.join(dataDir, PUBKEY), { recursive: true });
-  await fs.mkdir(path.join(dataDir, WORKER), { recursive: true });
   await fs.mkdir(workDir, { recursive: true });
 
   await fs.writeFile(
@@ -189,21 +203,9 @@ test("end-to-end: buzz-mcp.mjs --orchestrate -> attention.sock -> Solo-chat work
       name: "Conductor",
       owner,
       runtime: "claude",
-      activated: true,
-      orchestrate: true,
-      workerPubkey: WORKER,
-    }),
-  );
-  await fs.writeFile(
-    path.join(dataDir, WORKER, "meta.json"),
-    JSON.stringify({
-      pubkey: WORKER,
-      name: "Workers",
-      owner,
-      runtime: "claude",
       concurrency: 4,
       activated: true,
-      orchestrate: false,
+      orchestrate: true,
     }),
   );
   await fs.writeFile(
@@ -251,36 +253,42 @@ test("end-to-end: buzz-mcp.mjs --orchestrate -> attention.sock -> Solo-chat work
     assert.equal(del.isError, undefined);
     const task = JSON.parse(del.content[0].text);
     assert.equal(task.mode, "solo");
+    assert.equal(task.workerPubkey, PUBKEY);
     assert.equal(task.originEventId, eventId);
     assert.equal(task.workspace, workDir);
     assert.ok(task.workerChannelId);
     assert.equal(task.link, `buzz://message?channel=${task.workerChannelId}&id=${"2".repeat(64)}`);
 
-    // Verify worker chat-settings.json was written with runtime + workspace + expiresAt.
-    const settings = JSON.parse(await fs.readFile(path.join(dataDir, WORKER, "chat-settings.json"), "utf8"));
+    // Verify self-worker chat-settings.json was written with runtime + noOrchestrate + workspace + expiresAt.
+    const settings = JSON.parse(await fs.readFile(path.join(dataDir, PUBKEY, "chat-settings.json"), "utf8"));
     assert.equal(settings[task.workerChannelId].runtime, "hermes");
+    assert.equal(settings[task.workerChannelId].noOrchestrate, true);
     assert.deepEqual(settings[task.workerChannelId].workspace, [workDir]);
     assert.ok(settings[task.workerChannelId].expiresAt > Date.now());
 
-    // Simulate Workers's acp-proxy notifying start, posting reply on relay, then notifying done.
+    // Verify operator wake file was written to Conductor's wake dir.
+    const wakeFiles = (await fs.readdir(path.join(dataDir, PUBKEY, "wake"))).filter((f) => f.endsWith(".json"));
+    assert.equal(wakeFiles.length, 1);
+
+    // Simulate Conductor's self-worker acp-proxy notifying start, posting reply on relay, then notifying done.
     const waitPromise = mcp.rpc("tools/call", {
       name: "orch_wait",
       arguments: { taskId: task.taskId, timeoutMs: 5000 },
     });
     await sendSock(sock, {
-      pubkey: WORKER,
+      pubkey: PUBKEY,
       name: "_acp_turn_start",
       args: { channel: task.workerChannelId, root: "", runtime: "hermes", model: "deepseek", effort: "" },
     });
     const replyId = "3".repeat(64);
     watches.get(task.workerChannelId)?.({
       id: replyId,
-      pubkey: WORKER,
+      pubkey: PUBKEY,
       created_at: Math.floor(Date.now() / 1000),
       content: "solo-e2e-ok",
     });
     await sendSock(sock, {
-      pubkey: WORKER,
+      pubkey: PUBKEY,
       name: "_acp_turn_done",
       args: {
         channel: task.workerChannelId,

@@ -1,15 +1,17 @@
 // Orchestrator v1.5 — Solo-chat workers for an opted-in Omarchy agent.
 //
 // Contract: docs/orchestrator-contract.md.
-// Runs delegated workers as real Buzz Solo chats backed by a designated
-// Omarchy worker agent (meta.workerPubkey) with parallel conversations
-// (BUZZ_ACP_AGENTS >= 4) and per-chat runtime dispatch in acp-proxy.
+// Runs delegated workers as real Buzz Solo chats on any Omarchy agent on this
+// host — defaulting to the orchestrator agent itself (e.g. Conductor) — using
+// parallel conversations (BUZZ_ACP_AGENTS >= 4), operator wake files
+// ($BUZZ_ACP_WAKE_DIR), and per-chat runtime dispatch in acp-proxy.
 //
 // Preserves every v1 guardrail: opt-in (meta.orchestrate === true),
 // owner-initiated chats (turn-authors.json), concurrency cap 4 + FIFO queue 16,
-// per-prompt wall-clock timeout, MAX_DEPTH = 1 (worker agent cannot have
-// orchestrate enabled), auth failure cache (runtimes.json), quota-banner
-// refusal detection, and restart persistence.
+// per-prompt wall-clock timeout, MAX_DEPTH = 1 (enforced per worker Solo chat
+// via noOrchestrate: true -> BUZZHOST_NO_ORCHESTRATE=1 + server-side gate),
+// auth failure cache (runtimes.json), quota-banner refusal detection, and
+// restart persistence.
 
 import { randomBytes, randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
@@ -34,7 +36,7 @@ export const MAX_STEERS = 16;
 export const MAX_DEPTH = 1;
 
 const MAX_TASKS_SAVED = 200;
-const MAX_PROMPT_BYTES = 64 * 1024;
+const MAX_PROMPT_BYTES = 60 * 1024;
 const MAX_RESULT_BYTES = 256 * 1024;
 const MAX_TRANSCRIPT_ENTRIES = 300;
 const MAX_TRANSCRIPT_ENTRY_BYTES = 8 * 1024;
@@ -77,17 +79,18 @@ const tool = (name, description, properties, required = []) => ({
 export const ORCHESTRATOR_TOOLS = [
   tool(
     "orch_capabilities",
-    "Runtimes, models, effort levels, and the configured worker agent available for Solo-chat workers, plus active tasks.",
+    "Runtimes, models, effort levels, and Omarchy agents (including yourself) available for Solo-chat workers, plus active tasks.",
     {
       retry: { type: "boolean" },
     },
   ),
   tool(
     "orch_delegate",
-    "Delegate work to a real Solo-chat worker on another runtime (claude, codex, hermes, antigravity). Returns workerChannelId and a buzz://message link you can share in chat, then call orch_wait for the answer.",
+    "Delegate work to a real Solo-chat worker on another runtime (claude, codex, hermes, antigravity). Runs on yourself by default, or on any other Omarchy agent named by `agent`. Returns workerChannelId and a buzz://message link you can share in chat, then call orch_wait for the answer.",
     {
       runtime: str,
       prompt: str,
+      agent: str,
       model: str,
       effort: str,
       workspace: str,
@@ -570,8 +573,10 @@ function createRelayTransport({ dataDir, log = console }) {
         ["channel_type", "stream"],
         ["t", "buzz.solo"],
         ["p", ownerPubkey],
-        ["p", workerPubkey],
       ];
+      if (workerPubkey && workerPubkey !== pubkey && workerPubkey !== ownerPubkey) {
+        tags.push(["p", workerPubkey]);
+      }
       if (Number.isInteger(ttlSeconds) && ttlSeconds > 0) {
         tags.push(["ttl", String(ttlSeconds)]);
       }
@@ -579,11 +584,12 @@ function createRelayTransport({ dataDir, log = console }) {
       return { channelId, eventId: ev.id };
     },
 
-    async postMessage({ pubkey, channelId, mentionPubkey, content }) {
-      const tags = [
-        ["h", channelId],
-        ["p", mentionPubkey],
-      ];
+    async postMessage({ pubkey, channelId, mentionPubkey, content, extraTags = [] }) {
+      const tags = [["h", channelId]];
+      if (mentionPubkey) tags.push(["p", mentionPubkey]);
+      for (const t of extraTags) {
+        if (Array.isArray(t) && t.length > 0) tags.push(t);
+      }
       const ev = await publish(pubkey, { kind: 9, tags, content });
       return { eventId: ev.id, createdAt: ev.created_at };
     },
@@ -646,6 +652,7 @@ function createRelayTransport({ dataDir, log = console }) {
  * @param {(runtime: string) => Promise<object>} [options.catalog] cached models per runtime
  * @param {(profile: string) => Promise<void>} [options.ensureHermes] prepares Hermes plugin
  * @param {object} [options.relay]   relay transport override (tests)
+ * @param {(req: { workerPubkey: string, wakeId: string, channelId: string, prompt: string }) => Promise<{ id?: string, path?: string }>} [options.wakeWorker] override (tests)
  * @param {(workerPubkey: string, channelId: string) => Promise<object>} [options.cancelWorker] override (tests)
  * @param {object} [options.log]     console-like
  * @param {object} [options.limits]  test overrides
@@ -658,6 +665,7 @@ export function createOrchestrator({
   catalog,
   ensureHermes,
   relay: customRelay,
+  wakeWorker: customWakeWorker,
   cancelWorker: customCancelWorker,
   log = console,
   limits = {},
@@ -677,6 +685,23 @@ export function createOrchestrator({
   const checkShimAccess = limits.checkShimAccess ?? !customRelay;
 
   const relay = customRelay ?? createRelayTransport({ dataDir, log });
+  const wakeWorker =
+    customWakeWorker ??
+    (async ({ workerPubkey, wakeId, channelId, prompt }) => {
+      const wakeDir = path.join(dataDir, workerPubkey, "wake");
+      await fs.mkdir(path.join(wakeDir, "results"), { recursive: true, mode: 0o700 });
+      const cleanId = String(wakeId || "orch-wake")
+        .replace(/[^A-Za-z0-9._-]/g, "-")
+        .slice(0, 128);
+      const finalPath = path.join(wakeDir, `${cleanId}.json`);
+      const tmpPath = path.join(wakeDir, `.${cleanId}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`);
+      await fs.writeFile(tmpPath, `${JSON.stringify({ id: cleanId, channel: channelId, prompt })}\n`, {
+        mode: 0o600,
+      });
+      await fs.chmod(tmpPath, 0o600);
+      await fs.rename(tmpPath, finalPath);
+      return { id: cleanId, path: finalPath };
+    });
   const cancelWorker =
     customCancelWorker ??
     ((workerPubkey, channelId) =>
@@ -842,41 +867,67 @@ export function createOrchestrator({
     return meta;
   }
 
-  async function resolveWorkerAgent(orchPubkey, orchMeta) {
-    const raw = typeof orchMeta.workerPubkey === "string" ? orchMeta.workerPubkey.trim().toLowerCase() : "";
-    if (!raw) {
-      return {
-        worker: null,
-        error:
-          "No worker agent is configured for Solo-chat workers. Create an Omarchy agent (e.g. Workers) in Buzz Desktop and select it in Settings → Orchestrator.",
-      };
-    }
-    if (!HEX64.test(raw) || raw === orchPubkey) {
-      return { worker: null, error: "Configured worker agent pubkey is invalid." };
-    }
-    const wm = await readJson(agentMetaFile(raw), null);
-    if (!wm) return { worker: null, error: "Configured worker agent no longer exists on this host." };
-    if (!wm.activated) return { worker: null, error: `Worker agent ${wm.name || raw.slice(0, 8)} is not activated yet.` };
+  async function listEligibleAgents(orchPubkey, orchMeta) {
     const orchOwner = String(orchMeta.owner ?? "").toLowerCase();
-    const workerOwner = String(wm.owner ?? "").toLowerCase();
-    if (orchOwner && workerOwner && orchOwner !== workerOwner) {
-      return { worker: null, error: "Configured worker agent belongs to a different owner." };
+    const entries = await fs.readdir(dataDir, { withFileTypes: true }).catch(() => []);
+    const out = [];
+    for (const ent of entries) {
+      if (!ent.isDirectory() || !HEX64.test(ent.name)) continue;
+      const pk = ent.name.toLowerCase();
+      const m = await readJson(agentMetaFile(pk), null);
+      if (!m || !m.activated) continue;
+      const owner = String(m.owner ?? "").toLowerCase();
+      if (orchOwner && owner && owner !== orchOwner) continue;
+      out.push({
+        pubkey: pk,
+        name: m.name || pk.slice(0, 8),
+        runtime: m.runtime || "claude",
+        profile: m.profile || "",
+        concurrency: Number.isInteger(m.concurrency) ? m.concurrency : 4,
+        self: pk === orchPubkey,
+      });
     }
-    if (wm.orchestrate === true) {
+    out.sort((a, b) => (a.self === b.self ? a.name.localeCompare(b.name) : a.self ? -1 : 1));
+    return out;
+  }
+
+  async function resolveTargetAgent(orchPubkey, orchMeta, targetSpec = "") {
+    const spec = typeof targetSpec === "string" ? targetSpec.trim() : "";
+    const agents = await listEligibleAgents(orchPubkey, orchMeta);
+    if (!spec) {
+      const self = agents.find((a) => a.self);
+      if (!self) {
+        return {
+          worker: null,
+          error: "Orchestrator agent is not activated yet; activate it before delegating workers.",
+        };
+      }
+      return { worker: self, error: "" };
+    }
+    const lower = spec.toLowerCase();
+    if (HEX64.test(lower)) {
+      const hit = agents.find((a) => a.pubkey === lower);
+      if (!hit) {
+        return {
+          worker: null,
+          error: `Target agent ${lower.slice(0, 8)} was not found, is not activated, or belongs to a different owner.`,
+        };
+      }
+      return { worker: hit, error: "" };
+    }
+    const cleanName = lower.replace(/^@/, "");
+    const matches = agents.filter((a) => a.name.toLowerCase() === cleanName);
+    if (matches.length === 1) return { worker: matches[0], error: "" };
+    if (matches.length > 1) {
       return {
         worker: null,
-        error: `Worker agent ${wm.name || raw.slice(0, 8)} has Orchestrator enabled; workers cannot delegate (MAX_DEPTH = 1).`,
+        error: `Multiple Omarchy agents are named "${spec}". Pass the agent's 64-hex pubkey instead.`,
       };
     }
+    const available = agents.map((a) => a.name).join(", ") || "none";
     return {
-      worker: {
-        pubkey: raw,
-        name: wm.name || "Workers",
-        runtime: wm.runtime || "claude",
-        profile: wm.profile || "",
-        concurrency: Number.isInteger(wm.concurrency) ? wm.concurrency : 4,
-      },
-      error: "",
+      worker: null,
+      error: `Unknown target agent "${spec}". Available Omarchy agents: ${available}.`,
     };
   }
 
@@ -886,6 +937,16 @@ export function createOrchestrator({
     if (!HEX64.test(owner)) throw new Error("Agent has no verified owner.");
     const key = typeof chat === "string" ? chat.trim() : "";
     if (!key) throw new Error("Orchestration is only allowed in owner-initiated chats (missing chat context).");
+    // Defense-in-depth MAX_DEPTH = 1: never allow orchestration from inside a
+    // delegated worker Solo chat, even if the owner later steered it directly.
+    const { channelId } = parseChat(key);
+    if (soloByChannel.has(channelId) || soloByChannel.has(key)) {
+      throw new Error("Workers inside a delegated Solo chat cannot delegate further (MAX_DEPTH = 1).");
+    }
+    const chatSettings = await readJson(chatSettingsFile(pubkey), {});
+    if (chatSettings?.[channelId]?.noOrchestrate === true || chatSettings?.[key]?.noOrchestrate === true) {
+      throw new Error("Workers inside a delegated Solo chat cannot delegate further (MAX_DEPTH = 1).");
+    }
     const authors = await readJson(turnAuthorsFile(pubkey), {});
     const entry = authors && typeof authors === "object" ? authors[key] : null;
     if (!entry || typeof entry !== "object" || String(entry.author ?? "").toLowerCase() !== owner) {
@@ -922,7 +983,7 @@ export function createOrchestrator({
         task.updatedAt = Date.now();
         const orchMeta = await readJson(agentMetaFile(pubkey), null);
         const { worker, error } = orchMeta
-          ? await resolveWorkerAgent(pubkey, orchMeta)
+          ? await resolveTargetAgent(pubkey, orchMeta, task.workerPubkey || "")
           : { worker: null, error: "Orchestrator agent metadata missing." };
         if (closed || forgetting.has(pubkey) || startingCancelled.has(task.taskId) || task.status !== "starting") {
           startingCancelled.delete(task.taskId);
@@ -983,6 +1044,7 @@ export function createOrchestrator({
       const entry = {
         runtime: task.runtime,
         workspace: [task.workspace],
+        noOrchestrate: true,
         ...(expiresAt ? { expiresAt } : {}),
       };
       if (task.model) entry.model = task.model;
@@ -1033,6 +1095,40 @@ export function createOrchestrator({
     let turnMessages = [];
     let allOutputs = [];
     let unwatch = () => {};
+    let pendingWakePath = "";
+    let wakeSeq = 0;
+
+    const clearPendingWake = () => {
+      if (!pendingWakePath) return;
+      const p = pendingWakePath;
+      pendingWakePath = "";
+      void fs.unlink(p).catch(() => {});
+    };
+
+    const buildWakePrompt = (promptText, isFollowUp = false) => {
+      const header = isFollowUp
+        ? `<delegated-worker-followup channel="${channelId}" runtime="${task.runtime}">\n` +
+          `Follow-up instruction for your active delegated worker task in Solo chat #${channelId}.\n` +
+          `Complete the follow-up and post your reply directly in channel ${channelId} (use \`buzz messages send --channel ${channelId} --content -\` or a plain final answer). Do not delegate further tasks.\n` +
+          `</delegated-worker-followup>`
+        : `<delegated-worker-task channel="${channelId}" runtime="${task.runtime}">\n` +
+          `You are running as a Solo-chat worker for "${task.label}" in channel #${channelId} (workspace: ${task.workspace}).\n` +
+          `Complete the task below and post your final answer directly in channel ${channelId} (use \`buzz messages send --channel ${channelId} --content -\` or a plain final answer). Do not delegate further tasks.\n` +
+          `</delegated-worker-task>`;
+      return `${header}\n\n${promptText}`;
+    };
+
+    const dropWake = async (promptText, isFollowUp = false) => {
+      const wake = await wakeWorker({
+        workerPubkey: worker.pubkey,
+        wakeId: `orch-${task.taskId}-${++wakeSeq}`,
+        channelId,
+        prompt: buildWakePrompt(promptText, isFollowUp),
+      });
+      pendingWakePath = wake?.path || "";
+      if (finished || cancelling || timedOut) clearPendingWake();
+      return wake;
+    };
 
     const clearTimers = () => {
       if (turnTimer) {
@@ -1054,6 +1150,7 @@ export function createOrchestrator({
         cancelling = true;
         promptQueue.length = 0;
         task.steerQueued = 0;
+        clearPendingWake();
         appendTranscript(task, "status", `Timed out after ${Math.round(budget / 1000)}s; stopping worker.`);
         void cancelWorker(worker.pubkey, channelId).catch(() => {});
         cancelTimer = setTimeout(() => {
@@ -1086,6 +1183,7 @@ export function createOrchestrator({
       if (settlePromise) return settlePromise;
       finished = true;
       clearTimers();
+      clearPendingWake();
       soloByChannel.delete(channelId);
       try {
         unwatch();
@@ -1101,8 +1199,13 @@ export function createOrchestrator({
       return settlePromise;
     };
 
+    const isPromptEvent = (ev) =>
+      Array.isArray(ev?.tags) &&
+      ev.tags.some((t) => Array.isArray(t) && t.length >= 2 && t[0] === "t" && t[1] === "buzz.orch.prompt");
+
     const recordWorkerMessage = (ev) => {
       if (finished || !ev || !ev.id) return;
+      if (isPromptEvent(ev)) return;
       if (seenMessageIds.has(ev.id)) return;
       seenMessageIds.add(ev.id);
       const content = String(ev.content ?? "");
@@ -1116,23 +1219,32 @@ export function createOrchestrator({
       persistSoon(pubkey, state);
     };
 
-    const postToSolo = async (promptText) => {
+    const postVisiblePrompt = async (promptText) => {
       turnStartedSec = Math.floor(Date.now() / 1000);
       turnMessages = [];
-      const content = `@${worker.name}\n\n${promptText}`;
       const sent = await relay.postMessage({
         pubkey,
         channelId,
-        mentionPubkey: worker.pubkey,
-        content,
+        content: promptText,
+        extraTags: [["t", "buzz.orch.prompt"]],
       });
-      if (!task.promptEventId) {
-        task.promptEventId = sent.eventId;
-        task.link = buzzMessageLink(channelId, sent.eventId);
+      if (sent?.eventId) {
+        seenMessageIds.add(sent.eventId);
+        if (!task.promptEventId) {
+          task.promptEventId = sent.eventId;
+          task.link = buzzMessageLink(channelId, sent.eventId);
+        }
       }
       appendTranscript(task, "user", promptText);
       task.updatedAt = Date.now();
       void persistNow(pubkey, state);
+      return sent;
+    };
+
+    const postFollowUp = async (promptText) => {
+      const sent = await postVisiblePrompt(promptText);
+      if (finished || cancelling || timedOut) return sent;
+      await dropWake(promptText, true);
       if (!finished && !cancelling && !timedOut) resetTurnTimer();
       return sent;
     };
@@ -1145,6 +1257,7 @@ export function createOrchestrator({
 
       onTurnStart({ model, effort } = {}) {
         if (finished) return;
+        pendingWakePath = "";
         const now = Date.now();
         if (task.status === "starting") {
           task.status = "running";
@@ -1158,6 +1271,7 @@ export function createOrchestrator({
 
       async onTurnDone({ stopReason = "", error = "", model = "", effort = "", finalText = "", fallbackPosted = false } = {}) {
         if (finished || closed) return;
+        pendingWakePath = "";
         if (turnTimer) {
           clearTimeout(turnTimer);
           turnTimer = null;
@@ -1258,12 +1372,12 @@ export function createOrchestrator({
         if (turnText) allOutputs.push(turnText);
         turnMessages = [];
 
-        // If follow-up steer prompts are queued, post the next one in the same Solo chat.
+        // If follow-up steer prompts are queued, post + wake the next one in the same Solo chat.
         if (promptQueue.length > 0) {
           const nextPrompt = promptQueue.shift();
           task.steerQueued = promptQueue.length;
           try {
-            await postToSolo(nextPrompt);
+            await postFollowUp(nextPrompt);
             if (timedOut || cancelling) {
               await settle({
                 status: timedOut ? "timed_out" : "cancelled",
@@ -1304,6 +1418,7 @@ export function createOrchestrator({
         cancelling = true;
         promptQueue.length = 0;
         task.steerQueued = 0;
+        clearPendingWake();
         appendTranscript(task, "status", "Cancellation requested.");
         void cancelWorker(worker.pubkey, channelId).catch(() => {});
         await new Promise((resolve) => {
@@ -1333,6 +1448,7 @@ export function createOrchestrator({
         finished = true;
         cancelling = true;
         clearTimers();
+        clearPendingWake();
         soloByChannel.delete(channelId);
         try {
           unwatch();
@@ -1344,7 +1460,18 @@ export function createOrchestrator({
     soloByChannel.set(channelId, driver);
 
     try {
-      // 3. Watch the Solo chat for worker replies BEFORE posting the prompt.
+      // 3. Post the visible task prompt in the Solo chat (no p-tag, so buzz-acp
+      //    does not double-trigger) and record its eventId in seenMessageIds
+      //    before watching — critical when worker === self.
+      await postVisiblePrompt(task.prompt);
+
+      if (isAbortedBeforeStart()) {
+        startingCancelled.delete(task.taskId);
+        await settle({ status: "cancelled", stopReason: "cancelled" });
+        return;
+      }
+
+      // 4. Watch the Solo chat for worker replies BEFORE writing the wake file.
       unwatch = await relay.watchChannel({
         pubkey,
         channelId,
@@ -1358,12 +1485,14 @@ export function createOrchestrator({
         return;
       }
 
-      // 4. Post Conductor's prompt tagging the worker agent.
-      await postToSolo(task.prompt);
+      // 5. Trigger the worker turn via its operator wake directory ($BUZZ_ACP_WAKE_DIR).
+      await dropWake(task.prompt, false);
+      if (!finished && !cancelling && !timedOut) resetTurnTimer();
     } catch (error) {
       soloByChannel.delete(channelId);
       drivers.delete(task.taskId);
       clearTimers();
+      clearPendingWake();
       try {
         unwatch();
       } catch {}
@@ -1429,7 +1558,8 @@ export function createOrchestrator({
     const pubkey = checkPubkey(rawPubkey);
     const orchMeta = await requireOptIn(pubkey);
     if (retry === true) await clearRuntimeFailure();
-    const { worker, error: workerError } = await resolveWorkerAgent(pubkey, orchMeta);
+    const agents = await listEligibleAgents(pubkey, orchMeta);
+    const defaultAgent = agents.find((a) => a.self) || null;
     const state = await loadAgent(pubkey);
     const runtimes = await Promise.all(
       Object.entries(RUNTIMES).map(async ([id, info]) => {
@@ -1489,10 +1619,21 @@ export function createOrchestrator({
     const queued = activeTasks.filter((t) => t.status === "queued").length;
     return {
       mode: "solo",
-      workerAgent: worker
-        ? { pubkey: worker.pubkey, name: worker.name, concurrency: worker.concurrency, runtime: worker.runtime }
+      defaultAgent: defaultAgent
+        ? {
+            pubkey: defaultAgent.pubkey,
+            name: defaultAgent.name,
+            concurrency: defaultAgent.concurrency,
+            runtime: defaultAgent.runtime,
+          }
         : null,
-      ...(workerError ? { workerError } : {}),
+      agents: agents.map((a) => ({
+        pubkey: a.pubkey,
+        name: a.name,
+        concurrency: a.concurrency,
+        runtime: a.runtime,
+        self: a.self,
+      })),
       runtimes,
       limit: maxLive,
       maxDepth: MAX_DEPTH,
@@ -1505,7 +1646,7 @@ export function createOrchestrator({
   async function delegate(rawPubkey, args = {}) {
     const pubkey = checkPubkey(rawPubkey);
     const { meta: orchMeta, originEventId } = await requireOwnerChat(pubkey, args.chat);
-    const { worker, error: workerError } = await resolveWorkerAgent(pubkey, orchMeta);
+    const { worker, error: workerError } = await resolveTargetAgent(pubkey, orchMeta, args.agent);
     if (!worker) throw new Error(workerError);
 
     const runtime = String(args.runtime ?? "").trim();
@@ -1515,7 +1656,7 @@ export function createOrchestrator({
     const prompt = typeof args.prompt === "string" ? args.prompt : "";
     if (!prompt.trim()) throw new Error("prompt is required");
     if (Buffer.byteLength(prompt, "utf8") > MAX_PROMPT_BYTES) {
-      throw new Error("prompt exceeds 64 KiB limit");
+      throw new Error("prompt exceeds 60 KiB limit");
     }
     const fail = await activeAuthFailure(runtime);
     if (fail) {
@@ -1681,7 +1822,7 @@ export function createOrchestrator({
     await requireOwnerChat(pubkey, chat);
     if (typeof taskId !== "string" || !taskId) throw new Error("taskId is required");
     if (typeof prompt !== "string" || !prompt.trim()) throw new Error("prompt is required");
-    if (Buffer.byteLength(prompt, "utf8") > MAX_PROMPT_BYTES) throw new Error("prompt exceeds 64 KiB limit");
+    if (Buffer.byteLength(prompt, "utf8") > MAX_PROMPT_BYTES) throw new Error("prompt exceeds 60 KiB limit");
     const state = await loadAgent(pubkey);
     const task = state.tasks.get(taskId);
     if (!task) throw new Error(`Unknown taskId: ${taskId}`);
@@ -1757,8 +1898,10 @@ export function createOrchestrator({
     const pubkey = checkPubkey(rawPubkey);
     forgetting.add(pubkey);
     try {
-      // Fail any active tasks on other orchestrators whose worker pool is this removed agent.
-      const affected = [...soloByChannel.values()].filter((d) => d.workerPubkey === pubkey);
+      // Fail any active tasks on other orchestrators whose worker target is this removed agent.
+      const affected = [...soloByChannel.values()].filter(
+        (d) => d.workerPubkey === pubkey && d.orchestratorPubkey !== pubkey,
+      );
       await Promise.all(affected.map((d) => d.failWorkerRemoved?.().catch(() => {})));
 
       const timer = saveTimers.get(pubkey);

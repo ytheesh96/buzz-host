@@ -677,7 +677,6 @@ const methods = {
           activated: m.activated,
           desktop: m.desktop === true,
           orchestrate: m.orchestrate === true,
-          workerPubkey: m.workerPubkey || "",
           status: m.activated ? await active(name) : "provisioned",
         });
     }
@@ -815,64 +814,21 @@ const methods = {
 
   // Cross-harness worker orchestration (orchestrator.mjs). Off by default;
   // turning it on or off rewrites the agent's MCP wrapper and restarts it.
-  // Selecting or changing workerPubkey takes effect immediately without restart.
-  async "orchestrator.set"(config, { pubkey, enabled, workerPubkey }) {
+  async "orchestrator.set"(config, { pubkey, enabled }) {
     checkPubkey(pubkey);
     const m = await meta(pubkey);
-    const nextEnabled = enabled === undefined ? m.orchestrate === true : enabled === true;
-    let nextWorker =
-      workerPubkey === undefined
-        ? m.workerPubkey || ""
-        : typeof workerPubkey === "string"
-          ? workerPubkey.trim().toLowerCase()
-          : "";
+    const nextEnabled = enabled === true;
     if (nextEnabled) {
-      // Ensure this agent is not currently designated as another active orchestrator's
-      // worker pool (preserves MAX_DEPTH = 1: workers can never orchestrate).
-      const names = await fs.readdir(DATA).catch(() => []);
-      for (const other of names.filter((n) => HEX64.test(n) && n !== pubkey)) {
-        const om = await meta(other).catch(() => undefined);
-        if (om?.orchestrate === true && om?.workerPubkey === pubkey) {
-          throw new Error(
-            `${m.name || "This agent"} is used as ${om.name || "another agent"}'s worker pool; detach it there before turning Orchestrator on.`,
-          );
-        }
-      }
+      // Best-effort: prepare Hermes plugin so Hermes Solo-chat workers work.
+      await ensureSessionEnv(m.profile || "").catch(() => {});
     }
-    const explicitlySetWorker = workerPubkey !== undefined;
-    if (nextWorker && (nextEnabled || explicitlySetWorker)) {
-      const validateWorker = async () => {
-        checkPubkey(nextWorker);
-        if (nextWorker === pubkey) throw new Error("An agent cannot be its own worker pool");
-        const wm = await meta(nextWorker);
-        if (!wm.activated) throw new Error("Worker agent is not activated yet");
-        if (m.owner && wm.owner && wm.owner !== m.owner) {
-          throw new Error("Worker agent must belong to the same owner");
-        }
-        if (wm.orchestrate === true) {
-          throw new Error("An orchestrator agent cannot be used as a worker pool (workers cannot delegate)");
-        }
-        // Best-effort: prepare Hermes plugin on default/worker profile so Hermes worker chats work.
-        await ensureSessionEnv(wm.profile || "").catch(() => {});
-      };
-      if (explicitlySetWorker) {
-        await validateWorker();
-      } else {
-        // Re-enabling with a previously saved but now-stale workerPubkey: clear instead of blocking toggle.
-        try {
-          await validateWorker();
-        } catch {
-          nextWorker = "";
-        }
-      }
-    }
-    const next = { ...m, orchestrate: nextEnabled, workerPubkey: nextWorker };
+    const next = { ...m, orchestrate: nextEnabled };
     await saveMeta(pubkey, next);
     if (m.activated && next.orchestrate !== (m.orchestrate === true)) {
       await writeRuntimeEnv(pubkey, next);
       await systemctl("restart", unit(pubkey));
     }
-    return { enabled: next.orchestrate, workerPubkey: next.workerPubkey || "" };
+    return { enabled: next.orchestrate };
   },
   async "orchestrator.tasks"(config, { pubkey, channelId, threadRootId, taskId, since, full }) {
     checkPubkey(pubkey);
@@ -891,7 +847,6 @@ const methods = {
     });
     return {
       enabled: m.orchestrate === true,
-      workerPubkey: m.workerPubkey || "",
       tasks: view?.tasks ?? [],
       ...(view?.task !== undefined ? { task: view.task } : {}),
     };
@@ -909,16 +864,6 @@ const methods = {
     await orchestrator.forget(pubkey).catch(() => {});
     await desktop.stop(pubkey).catch(() => {});
     await fs.rm(dir(pubkey), { recursive: true, force: true });
-    // Detach if another orchestrator pointed to this removed agent as its worker pool.
-    const names = await fs.readdir(DATA).catch(() => []);
-    for (const other of names.filter((n) => HEX64.test(n) && n !== pubkey)) {
-      await serialized(other, async () => {
-        const om = await meta(other).catch(() => undefined);
-        if (om?.workerPubkey === pubkey) {
-          await saveMeta(other, { ...om, workerPubkey: "" }).catch(() => {});
-        }
-      });
-    }
     watcher.sync(pubkey, null);
     attention.forget(pubkey);
     return {};

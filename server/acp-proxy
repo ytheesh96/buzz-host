@@ -988,6 +988,12 @@ def addresses_agent(event):
                for t in event.get("tags") or [])
 
 
+def _is_orch_prompt(event):
+    """True for the visible prompt posted by the orchestrator when opening/steering a Solo worker."""
+    return any(isinstance(t, list) and len(t) >= 2 and t[0] == "t" and t[1] == "buzz.orch.prompt"
+               for t in event.get("tags") or [])
+
+
 def agent_posted(channel, since):
     """Whether the agent posted in `channel` after `since` (unix seconds).
     Raises when the relay can't be asked."""
@@ -998,7 +1004,8 @@ def agent_posted(channel, since):
         raise RuntimeError((r.stderr or r.stdout).strip()[:200] or f"exit {r.returncode}")
     events = json.loads(r.stdout or "[]")
     return any(isinstance(e, dict) and str(e.get("pubkey", "")).lower() == agent_pubkey
-               and (e.get("created_at") or 0) >= int(since) for e in events)
+               and (e.get("created_at") or 0) >= int(since)
+               and not _is_orch_prompt(e) for e in events)
 
 
 def notify_host(name, args):
@@ -1051,12 +1058,19 @@ def reply_fallback(turn, done_payload=None):
 
 
 def label_mcp(params, key):
-    """Tell the session's buzz MCP server which chat it serves (BUZZHOST_CHAT)."""
+    """Tell the session's buzz MCP server which chat it serves (BUZZHOST_CHAT)
+    and suppress orch_* tools when this chat is a delegated worker Solo chat."""
+    no_orch = bool(key and settings_file and wanted_for(key, load_settings()).get("noOrchestrate"))
     for server in params.get("mcpServers") or []:
         if not isinstance(server, dict) or server.get("name") != "buzz":
             continue
-        env = [e for e in server.get("env") or [] if not (isinstance(e, dict) and e.get("name") == "BUZZHOST_CHAT")]
+        env = [
+            e for e in server.get("env") or []
+            if not (isinstance(e, dict) and e.get("name") in ("BUZZHOST_CHAT", "BUZZHOST_NO_ORCHESTRATE"))
+        ]
         env.append({"name": "BUZZHOST_CHAT", "value": key})
+        if no_orch:
+            env.append({"name": "BUZZHOST_NO_ORCHESTRATE", "value": "1"})
         server["env"] = env
 
 
@@ -1620,11 +1634,14 @@ def dispatch_client_line(line):
                 if HEX64_RE.match(author) and (not me or author != me):
                     record_turn_author(key, author, item.get("id", ""))
                     break
+        is_worker_chat = bool(key and settings_file and wanted_for(key, load_settings()).get("noOrchestrate"))
         with lock:
             s["running"] = s.get("running", 0) + 1
             pending_prompt[msg["id"]] = sid
-            # Reply fallback: a turn someone asked this agent for.
-            if turn and key and any(addresses_agent(e) for e in events):
+            # Reply fallback: a turn someone asked this agent for, OR a wake-driven
+            # delegated worker Solo chat (so final text still lands if the worker
+            # didn't invoke `buzz messages send`).
+            if key and ((turn and any(addresses_agent(e) for e in events)) or is_worker_chat):
                 turns[msg["id"]] = {"channel": key.split("_", 1)[0], "root": root or None,
                                     "start": time.time(), "text": ""}
                 s["turn"] = msg["id"]

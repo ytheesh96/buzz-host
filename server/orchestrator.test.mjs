@@ -1,11 +1,12 @@
 // node --test server/orchestrator.test.mjs
-// Covers Solo-chat worker orchestration: full lifecycle (chat-settings.json,
-// kind:9007 Solo chat, kind:9 prompt, _acp_turn_start/_acp_turn_done, relay
-// reply capture + fallback query), concurrency cap + FIFO queue, steer queue,
-// cancel + control-socket routing, timeout, quota-banner refusal detection,
-// restart persistence (running -> interrupted), guardrails (opt-in, owner-chat,
-// worker agent validation & MAX_DEPTH = 1, auth failure cache), summary clipping,
-// and spoofing protection.
+// Covers Solo-chat worker orchestration: self-worker default and cross-agent
+// delegation via operator wake files ($BUZZ_ACP_WAKE_DIR), chat-settings.json
+// with per-chat noOrchestrate: true (MAX_DEPTH = 1), kind:9007 Solo chat,
+// visible kind:9 prompt without double-trigger, _acp_turn_start/_acp_turn_done,
+// relay reply capture + fallback query, concurrency cap + FIFO queue, steer
+// queue, cancel + wake-file cleanup + control-socket routing, timeout,
+// quota-banner refusal detection, restart persistence, guardrails, summary
+// clipping, and spoofing protection.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
@@ -16,7 +17,8 @@ import { createOrchestrator, MAX_DEPTH, MAX_LIVE, ORCHESTRATOR_TOOLS, runtimeRef
 const OWNER = "1".repeat(64);
 const OTHER = "2".repeat(64);
 const CONDUCTOR = "a".repeat(64);
-const WORKER = "c".repeat(64);
+const GIRAFFE = "c".repeat(64);
+const FOREIGN = "d".repeat(64);
 const CHANNEL = "123e4567-e89b-42d3-a456-426614174000";
 const ROOT = "f".repeat(64);
 const CHAT = `${CHANNEL}_${ROOT}`;
@@ -35,16 +37,16 @@ function makeFakeRelay() {
     created,
     posted,
     messagesByChannel,
-    deliver(channelId, authorPubkey, content, { id = nextId(), createdAt = Math.floor(Date.now() / 1000) } = {}) {
-      const ev = { id, pubkey: authorPubkey, created_at: createdAt, content };
+    deliver(channelId, authorPubkey, content, { id = nextId(), createdAt = Math.floor(Date.now() / 1000), tags = [] } = {}) {
+      const ev = { id, pubkey: authorPubkey, created_at: createdAt, content, tags };
       let list = messagesByChannel.get(channelId);
       if (!list) messagesByChannel.set(channelId, (list = []));
       list.push(ev);
       for (const fn of watches.get(channelId) ?? []) fn(ev);
       return ev;
     },
-    storeOnly(channelId, authorPubkey, content, { id = nextId(), createdAt = Math.floor(Date.now() / 1000) } = {}) {
-      const ev = { id, pubkey: authorPubkey, created_at: createdAt, content };
+    storeOnly(channelId, authorPubkey, content, { id = nextId(), createdAt = Math.floor(Date.now() / 1000), tags = [] } = {}) {
+      const ev = { id, pubkey: authorPubkey, created_at: createdAt, content, tags };
       let list = messagesByChannel.get(channelId);
       if (!list) messagesByChannel.set(channelId, (list = []));
       list.push(ev);
@@ -58,7 +60,14 @@ function makeFakeRelay() {
     async postMessage(req) {
       const eventId = nextId();
       const createdAt = Math.floor(Date.now() / 1000);
-      posted.push({ ...req, eventId, createdAt });
+      const tags = [["h", req.channelId], ...(req.mentionPubkey ? [["p", req.mentionPubkey]] : []), ...(req.extraTags ?? [])];
+      const ev = { id: eventId, pubkey: req.pubkey, created_at: createdAt, content: req.content, tags };
+      let list = messagesByChannel.get(req.channelId);
+      if (!list) messagesByChannel.set(req.channelId, (list = []));
+      list.push(ev);
+      // Mirror a real relay echoing the posted event to active watches (e.g. on self-worker steer!).
+      for (const fn of watches.get(req.channelId) ?? []) fn(ev);
+      posted.push({ ...req, eventId, createdAt, tags });
       return { eventId, createdAt };
     },
     async getMessages({ channelId, authorPubkey, since }) {
@@ -84,13 +93,26 @@ function makeFakeRelay() {
   };
 }
 
-async function setupHarness({ orchestrate = true, workerPubkey = WORKER, workerMetaOverride = {}, limits = {} } = {}) {
+async function listWakes(dataDir, pubkey) {
+  const dir = path.join(dataDir, pubkey, "wake");
+  const files = (await fs.readdir(dir).catch(() => [])).filter((f) => f.endsWith(".json") && !f.startsWith(".")).sort();
+  return Promise.all(
+    files.map(async (f) => ({
+      file: f,
+      path: path.join(dir, f),
+      data: JSON.parse(await fs.readFile(path.join(dir, f), "utf8")),
+    })),
+  );
+}
+
+async function setupHarness({ orchestrate = true, limits = {} } = {}) {
   const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "buzz-orch-solo-"));
   const dataDir = path.join(tmp, "agents");
   const stateDir = path.join(tmp, "orchestrator");
   const workDir = path.join(tmp, "work");
   await fs.mkdir(path.join(dataDir, CONDUCTOR), { recursive: true });
-  await fs.mkdir(path.join(dataDir, WORKER), { recursive: true });
+  await fs.mkdir(path.join(dataDir, GIRAFFE), { recursive: true });
+  await fs.mkdir(path.join(dataDir, FOREIGN), { recursive: true });
   await fs.mkdir(workDir, { recursive: true });
 
   await fs.writeFile(
@@ -100,22 +122,33 @@ async function setupHarness({ orchestrate = true, workerPubkey = WORKER, workerM
       name: "Conductor",
       owner: OWNER,
       runtime: "claude",
+      concurrency: 4,
       activated: true,
       orchestrate,
-      workerPubkey,
     }),
   );
   await fs.writeFile(
-    path.join(dataDir, WORKER, "meta.json"),
+    path.join(dataDir, GIRAFFE, "meta.json"),
     JSON.stringify({
-      pubkey: WORKER,
-      name: "Workers",
+      pubkey: GIRAFFE,
+      name: "Giraffe",
       owner: OWNER,
+      runtime: "codex",
+      concurrency: 4,
+      activated: true,
+      orchestrate: false,
+    }),
+  );
+  await fs.writeFile(
+    path.join(dataDir, FOREIGN, "meta.json"),
+    JSON.stringify({
+      pubkey: FOREIGN,
+      name: "Foreign",
+      owner: OTHER,
       runtime: "claude",
       concurrency: 4,
       activated: true,
       orchestrate: false,
-      ...workerMetaOverride,
     }),
   );
   await fs.writeFile(
@@ -155,7 +188,7 @@ async function setupHarness({ orchestrate = true, workerPubkey = WORKER, workerM
   return { tmp, dataDir, stateDir, workDir, relay, cancelled, hermesEnsured, orch, call, cleanup };
 }
 
-test("full Solo-chat lifecycle: capabilities, delegate, chat-settings, relay watch, wait, status, list", async () => {
+test("self-worker default lifecycle: capabilities, delegate, chat-settings + noOrchestrate, wake file, wait, status, list", async () => {
   const h = await setupHarness();
   try {
     assert.equal(ORCHESTRATOR_TOOLS.length, 7);
@@ -164,9 +197,17 @@ test("full Solo-chat lifecycle: capabilities, delegate, chat-settings, relay wat
 
     const caps = await h.call("orch_capabilities");
     assert.equal(caps.mode, "solo");
-    assert.equal(caps.workerAgent.pubkey, WORKER);
-    assert.equal(caps.workerAgent.name, "Workers");
-    assert.equal(caps.workerAgent.concurrency, 4);
+    assert.equal(caps.defaultAgent.pubkey, CONDUCTOR);
+    assert.equal(caps.defaultAgent.name, "Conductor");
+    assert.equal(caps.defaultAgent.concurrency, 4);
+    // Same-owner agents listed (self first), foreign-owner agent excluded.
+    assert.deepEqual(
+      caps.agents.map((a) => [a.name, a.self]),
+      [
+        ["Conductor", true],
+        ["Giraffe", false],
+      ],
+    );
     assert.equal(caps.runtimes.length, 4);
 
     const task = await h.call("orch_delegate", {
@@ -181,38 +222,46 @@ test("full Solo-chat lifecycle: capabilities, delegate, chat-settings, relay wat
     assert.equal(task.mode, "solo");
     assert.equal(task.status, "starting");
     assert.equal(task.originEventId, ORIGIN);
-    assert.equal(task.workerPubkey, WORKER);
-    assert.equal(task.workerName, "Workers");
+    assert.equal(task.workerPubkey, CONDUCTOR);
+    assert.equal(task.workerName, "Conductor");
     assert.ok(task.workerChannelId);
     assert.ok(task.promptEventId);
     assert.equal(task.link, `buzz://message?channel=${task.workerChannelId}&id=${task.promptEventId}`);
     assert.equal(h.hermesEnsured.length, 1);
 
-    // Worker's chat-settings.json was pre-populated for per-chat runtime dispatch.
-    const cs = JSON.parse(await fs.readFile(path.join(h.dataDir, WORKER, "chat-settings.json"), "utf8"));
+    // Conductor's chat-settings.json was pre-populated with noOrchestrate: true for per-chat runtime dispatch.
+    const cs = JSON.parse(await fs.readFile(path.join(h.dataDir, CONDUCTOR, "chat-settings.json"), "utf8"));
     assert.equal(cs[task.workerChannelId].runtime, "hermes");
     assert.equal(cs[task.workerChannelId].model, "hermes-fast");
     assert.equal(cs[task.workerChannelId].effort, "high");
+    assert.equal(cs[task.workerChannelId].noOrchestrate, true);
     assert.deepEqual(cs[task.workerChannelId].workspace, [h.workDir]);
     assert.ok(cs[task.workerChannelId].expiresAt > Date.now());
 
-    // Solo chat was created with owner + worker and prompt mentioned worker.
+    // Solo chat was created, visible prompt posted WITHOUT mentionPubkey (no double-trigger) and WITH buzz.orch.prompt tag.
     assert.equal(h.relay.created.length, 1);
     assert.equal(h.relay.created[0].name, "nostr-facts · Hermes");
     assert.equal(h.relay.created[0].ownerPubkey, OWNER);
-    assert.equal(h.relay.created[0].workerPubkey, WORKER);
     assert.equal(h.relay.posted.length, 1);
-    assert.equal(h.relay.posted[0].mentionPubkey, WORKER);
-    assert.match(h.relay.posted[0].content, /@Workers[\s\S]*Summarize Nostr NIP-29/);
+    assert.equal(h.relay.posted[0].mentionPubkey, undefined);
+    assert.equal(h.relay.posted[0].content, "Summarize Nostr NIP-29");
+    assert.ok(h.relay.posted[0].tags.some((t) => t[0] === "t" && t[1] === "buzz.orch.prompt"));
 
-    // Simulate turn start -> worker reply -> turn done.
+    // Operator wake file was written atomically to Conductor's wake dir with exact Patch 0004 fields.
+    const wakes = await listWakes(h.dataDir, CONDUCTOR);
+    assert.equal(wakes.length, 1);
+    assert.deepEqual(Object.keys(wakes[0].data).sort(), ["channel", "id", "prompt"]);
+    assert.equal(wakes[0].data.channel, task.workerChannelId);
+    assert.match(wakes[0].data.prompt, /<delegated-worker-task[\s\S]*Summarize Nostr NIP-29/);
+
+    // Simulate turn start -> self-worker reply -> turn done.
     const waiting = h.call("orch_wait", { taskId: task.taskId, timeoutMs: 5000 });
-    await h.call("_acp_turn_start", { channel: task.workerChannelId, runtime: "hermes", model: "hermes-fast" }, WORKER);
-    const replyEv = h.relay.deliver(task.workerChannelId, WORKER, "NIP-29 defines relay-based groups.");
+    await h.call("_acp_turn_start", { channel: task.workerChannelId, runtime: "hermes", model: "hermes-fast" }, CONDUCTOR);
+    const replyEv = h.relay.deliver(task.workerChannelId, CONDUCTOR, "NIP-29 defines relay-based groups.");
     await h.call(
       "_acp_turn_done",
       { channel: task.workerChannelId, runtime: "hermes", stopReason: "end_turn", finalText: "NIP-29 defines relay-based groups." },
-      WORKER,
+      CONDUCTOR,
     );
 
     const waited = await waiting;
@@ -235,16 +284,59 @@ test("full Solo-chat lifecycle: capabilities, delegate, chat-settings, relay wat
   }
 });
 
-test("concurrency cap (4) queues overflow FIFO, promotes on completion, and rejects beyond queue cap", async () => {
+test("cross-agent delegation by name, @name, or pubkey routes settings and wake file to target agent", async () => {
+  const h = await setupHarness();
+  try {
+    const t1 = await h.call("orch_delegate", {
+      runtime: "codex",
+      agent: "@giraffe",
+      prompt: "Check repo",
+      chat: CHAT,
+      cwd: h.workDir,
+    });
+    assert.equal(t1.workerPubkey, GIRAFFE);
+    assert.equal(t1.workerName, "Giraffe");
+
+    const cs = JSON.parse(await fs.readFile(path.join(h.dataDir, GIRAFFE, "chat-settings.json"), "utf8"));
+    assert.equal(cs[t1.workerChannelId].runtime, "codex");
+    assert.equal(cs[t1.workerChannelId].noOrchestrate, true);
+    const wakes = await listWakes(h.dataDir, GIRAFFE);
+    assert.equal(wakes.length, 1);
+    assert.equal(wakes[0].data.channel, t1.workerChannelId);
+
+    // Unknown or foreign-owner agent is refused clearly.
+    await assert.rejects(
+      () => h.call("orch_delegate", { runtime: "claude", agent: "NoSuchAgent", prompt: "hi", chat: CHAT, cwd: h.workDir }),
+      /Unknown target agent "NoSuchAgent"/,
+    );
+    await assert.rejects(
+      () => h.call("orch_delegate", { runtime: "claude", agent: FOREIGN, prompt: "hi", chat: CHAT, cwd: h.workDir }),
+      /not found, is not activated, or belongs to a different owner/,
+    );
+
+    // Complete Giraffe's turn.
+    const waitP = h.call("orch_wait", { taskId: t1.taskId, timeoutMs: 5000 });
+    h.relay.deliver(t1.workerChannelId, GIRAFFE, "Repo looks clean.");
+    await h.call("_acp_turn_done", { channel: t1.workerChannelId, stopReason: "end_turn" }, GIRAFFE);
+    const res = await waitP;
+    assert.equal(res.task.status, "completed");
+    assert.equal(res.task.result.text, "Repo looks clean.");
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("concurrency cap queues overflow FIFO, preserves target agent on promotion, and rejects beyond queue cap", async () => {
   const h = await setupHarness({ limits: { maxLive: 2, maxQueue: 2 } });
   try {
     const t1 = await h.call("orch_delegate", { runtime: "claude", prompt: "one", chat: CHAT, cwd: h.workDir });
     const t2 = await h.call("orch_delegate", { runtime: "codex", prompt: "two", chat: CHAT, cwd: h.workDir });
-    const t3 = await h.call("orch_delegate", { runtime: "hermes", prompt: "three", chat: CHAT, cwd: h.workDir });
+    const t3 = await h.call("orch_delegate", { runtime: "hermes", agent: "Giraffe", prompt: "three", chat: CHAT, cwd: h.workDir });
     const t4 = await h.call("orch_delegate", { runtime: "antigravity", prompt: "four", chat: CHAT, cwd: h.workDir });
     assert.equal(t1.status, "starting");
     assert.equal(t2.status, "starting");
     assert.equal(t3.status, "queued");
+    assert.equal(t3.workerPubkey, GIRAFFE);
     assert.equal(t4.status, "queued");
     assert.equal(h.relay.created.length, 2);
 
@@ -253,63 +345,70 @@ test("concurrency cap (4) queues overflow FIFO, promotes on completion, and reje
       /Worker queue is full/,
     );
 
-    // Finish t1 -> t3 promotes and opens its Solo chat.
-    h.relay.deliver(t1.workerChannelId, WORKER, "done-1");
-    await h.call("_acp_turn_done", { channel: t1.workerChannelId, stopReason: "end_turn" }, WORKER);
+    // Finish t1 -> t3 promotes and opens its Solo chat on Giraffe!
+    h.relay.deliver(t1.workerChannelId, CONDUCTOR, "done-1");
+    await h.call("_acp_turn_done", { channel: t1.workerChannelId, stopReason: "end_turn" }, CONDUCTOR);
     await new Promise((r) => setTimeout(r, 30));
 
     const t3Status = await h.call("orch_status", { taskId: t3.taskId });
     assert.equal(t3Status.task.status, "starting");
+    assert.equal(t3Status.task.workerPubkey, GIRAFFE);
     assert.ok(t3Status.task.workerChannelId);
     assert.equal(h.relay.created.length, 3);
+    assert.equal((await listWakes(h.dataDir, GIRAFFE)).length, 1);
   } finally {
     await h.cleanup();
   }
 });
 
-test("orch_steer queues follow-up and posts it into the same Solo chat after current turn finishes", async () => {
+test("orch_steer queues follow-up, posts visible message + second wake file, and ignores prompt echo on self-worker", async () => {
   const h = await setupHarness();
   try {
     const t = await h.call("orch_delegate", { runtime: "claude", prompt: "step 1", chat: CHAT, cwd: h.workDir });
     const steered = await h.call("orch_steer", { taskId: t.taskId, prompt: "step 2", chat: CHAT });
     assert.equal(steered.steerQueued, 1);
 
-    // Complete turn 1 -> orchestrator posts step 2 to the SAME workerChannelId instead of finishing!
-    h.relay.deliver(t.workerChannelId, WORKER, "answer 1");
-    await h.call("_acp_turn_done", { channel: t.workerChannelId, stopReason: "end_turn" }, WORKER);
+    // Complete turn 1 -> orchestrator posts step 2 + writes wake #2 in the SAME workerChannelId!
+    h.relay.deliver(t.workerChannelId, CONDUCTOR, "answer 1");
+    await h.call("_acp_turn_done", { channel: t.workerChannelId, stopReason: "end_turn" }, CONDUCTOR);
     await new Promise((r) => setTimeout(r, 20));
 
     assert.equal(h.relay.posted.length, 2);
     assert.equal(h.relay.posted[1].channelId, t.workerChannelId);
-    assert.match(h.relay.posted[1].content, /step 2/);
+    assert.equal(h.relay.posted[1].content, "step 2");
+    const wakes = await listWakes(h.dataDir, CONDUCTOR);
+    assert.equal(wakes.length, 2);
+    assert.match(wakes[1].data.prompt, /<delegated-worker-followup[\s\S]*step 2/);
 
-    // Complete turn 2 -> task finishes with combined output.
+    // Complete turn 2 -> result contains ONLY the worker's two answers, never the echoed prompt!
     const waitP = h.call("orch_wait", { taskId: t.taskId, timeoutMs: 5000 });
-    h.relay.deliver(t.workerChannelId, WORKER, "answer 2");
-    await h.call("_acp_turn_done", { channel: t.workerChannelId, stopReason: "end_turn" }, WORKER);
+    h.relay.deliver(t.workerChannelId, CONDUCTOR, "answer 2");
+    await h.call("_acp_turn_done", { channel: t.workerChannelId, stopReason: "end_turn" }, CONDUCTOR);
 
     const res = await waitP;
     assert.equal(res.task.status, "completed");
-    assert.match(res.task.result.text, /answer 1[\s\S]*answer 2/);
+    assert.equal(res.task.result.text, "answer 1\n\nanswer 2");
   } finally {
     await h.cleanup();
   }
 });
 
-test("orch_cancel and host cancel route cancel to worker control socket and settle cleanly", async () => {
+test("orch_cancel unlinks unclaimed wake file, routes cancel to worker control socket, and settles cleanly", async () => {
   const h = await setupHarness({ limits: { cancelGraceMs: 80 } });
   try {
     const t = await h.call("orch_delegate", { runtime: "claude", prompt: "long", chat: CHAT, cwd: h.workDir });
+    assert.equal((await listWakes(h.dataDir, CONDUCTOR)).length, 1);
     const cancelledTask = await h.call("orch_cancel", { taskId: t.taskId, chat: CHAT });
     assert.equal(cancelledTask.status, "cancelled");
     assert.equal(h.cancelled.length, 1);
-    assert.deepEqual(h.cancelled[0], { workerPk: WORKER, chId: t.workerChannelId });
+    assert.deepEqual(h.cancelled[0], { workerPk: CONDUCTOR, chId: t.workerChannelId });
+    assert.equal((await listWakes(h.dataDir, CONDUCTOR)).length, 0, "unclaimed wake file removed on cancel");
   } finally {
     await h.cleanup();
   }
 });
 
-test("per-task timeout sends cancel to worker and marks task timed_out", async () => {
+test("per-task timeout unlinks unclaimed wake file, sends cancel to worker, and marks task timed_out", async () => {
   const h = await setupHarness({ limits: { minTimeoutMs: 50, cancelGraceMs: 50 } });
   try {
     const t = await h.call("orch_delegate", {
@@ -324,6 +423,7 @@ test("per-task timeout sends cancel to worker and marks task timed_out", async (
     assert.equal(waited.task.status, "timed_out");
     assert.match(waited.task.error, /timed out/i);
     assert.equal(h.cancelled.length, 1);
+    assert.equal((await listWakes(h.dataDir, CONDUCTOR)).length, 0);
   } finally {
     await h.cleanup();
   }
@@ -338,8 +438,8 @@ test("quota-banner reply and auth errors mark task failed (and auth error blackl
     // Quota banner -> failed (not completed), runtime not auth-blacklisted.
     const t1 = await h.call("orch_delegate", { runtime: "antigravity", prompt: "hi", chat: CHAT, cwd: h.workDir });
     const w1 = h.call("orch_wait", { taskId: t1.taskId, timeoutMs: 5000 });
-    h.relay.deliver(t1.workerChannelId, WORKER, "⚠ Individual quota reached. Resets in 48m.");
-    await h.call("_acp_turn_done", { channel: t1.workerChannelId, stopReason: "end_turn" }, WORKER);
+    h.relay.deliver(t1.workerChannelId, CONDUCTOR, "⚠ Individual quota reached. Resets in 48m.");
+    await h.call("_acp_turn_done", { channel: t1.workerChannelId, stopReason: "end_turn" }, CONDUCTOR);
     const r1 = await w1;
     assert.equal(r1.task.status, "failed");
     assert.match(r1.task.error, /Individual quota reached/);
@@ -350,7 +450,7 @@ test("quota-banner reply and auth errors mark task failed (and auth error blackl
     await h.call(
       "_acp_turn_done",
       { channel: t2.workerChannelId, error: "Authentication required", errorCode: -32000 },
-      WORKER,
+      CONDUCTOR,
     );
     const r2 = await w2;
     assert.equal(r2.task.status, "failed");
@@ -363,17 +463,17 @@ test("quota-banner reply and auth errors mark task failed (and auth error blackl
   }
 });
 
-test("relay getMessages fallback captures worker reply when WS watch lags behind _acp_turn_done", async () => {
+test("relay getMessages fallback captures self-worker reply and ignores Conductor's own prompt event", async () => {
   const h = await setupHarness();
   try {
-    const t = await h.call("orch_delegate", { runtime: "claude", prompt: "hello", chat: CHAT, cwd: h.workDir });
+    const t = await h.call("orch_delegate", { runtime: "claude", prompt: "hello prompt", chat: CHAT, cwd: h.workDir });
     const waitP = h.call("orch_wait", { taskId: t.taskId, timeoutMs: 5000 });
     // Store reply in relay WITHOUT firing watchChannel callback.
-    const ev = h.relay.storeOnly(t.workerChannelId, WORKER, "fetched-via-query");
+    const ev = h.relay.storeOnly(t.workerChannelId, CONDUCTOR, "fetched-via-query");
     await h.call(
       "_acp_turn_done",
       { channel: t.workerChannelId, stopReason: "end_turn", fallbackPosted: true },
-      WORKER,
+      CONDUCTOR,
     );
     const res = await waitP;
     assert.equal(res.task.status, "completed");
@@ -384,44 +484,53 @@ test("relay getMessages fallback captures worker reply when WS watch lags behind
   }
 });
 
-test("guardrails: opt-in, owner-initiated chat, worker validation (MAX_DEPTH=1), and spoofed turn-done ignored", async () => {
-  // Missing workerPubkey refuses delegate cleanly.
-  const hNoWorker = await setupHarness({ workerPubkey: "" });
-  try {
-    const caps = await hNoWorker.call("orch_capabilities");
-    assert.equal(caps.workerAgent, null);
-    assert.match(caps.workerError, /No worker agent is configured/);
-    await assert.rejects(
-      () => hNoWorker.call("orch_delegate", { runtime: "claude", prompt: "hi", chat: CHAT, cwd: hNoWorker.workDir }),
-      /No worker agent is configured/,
-    );
-  } finally {
-    await hNoWorker.cleanup();
-  }
-
-  // Worker with orchestrate: true is refused (MAX_DEPTH = 1).
-  const hRecurse = await setupHarness({ workerMetaOverride: { orchestrate: true } });
+test("guardrails: opt-in, owner-initiated chat, per-chat MAX_DEPTH=1 even after owner steer, and spoofed turn-done ignored", async () => {
+  // Orchestrator off is refused.
+  const hOff = await setupHarness({ orchestrate: false });
   try {
     await assert.rejects(
-      () => hRecurse.call("orch_delegate", { runtime: "claude", prompt: "hi", chat: CHAT, cwd: hRecurse.workDir }),
-      /MAX_DEPTH = 1/,
+      () => hOff.call("orch_capabilities"),
+      /Orchestration is off/,
     );
   } finally {
-    await hRecurse.cleanup();
+    await hOff.cleanup();
   }
 
-  // Non-owner chat is refused; spoofed _acp_turn_done from another pubkey is ignored.
   const h = await setupHarness();
   try {
+    // Non-owner chat is refused.
     await assert.rejects(
       () => h.call("orch_delegate", { runtime: "claude", prompt: "hi", chat: "other_chat", cwd: h.workDir }),
       /owner-initiated chats/,
     );
+
     const t = await h.call("orch_delegate", { runtime: "claude", prompt: "hi", chat: CHAT, cwd: h.workDir });
+
+    // Even if the owner later posts in the worker Solo chat (recording OWNER in turn-authors.json),
+    // calling orch_delegate from inside that worker Solo chat MUST be refused (MAX_DEPTH = 1).
+    const authors = JSON.parse(await fs.readFile(path.join(h.dataDir, CONDUCTOR, "turn-authors.json"), "utf8"));
+    authors[t.workerChannelId] = { author: OWNER, eventId: ORIGIN, at: Math.floor(Date.now() / 1000) };
+    await fs.writeFile(path.join(h.dataDir, CONDUCTOR, "turn-authors.json"), JSON.stringify(authors));
+
+    await assert.rejects(
+      () => h.call("orch_delegate", { runtime: "claude", prompt: "recurse!", chat: t.workerChannelId, cwd: h.workDir }),
+      /MAX_DEPTH = 1/,
+    );
+
+    // Spoofed _acp_turn_done from another pubkey is ignored.
     const spoofed = await h.call("_acp_turn_done", { channel: t.workerChannelId, stopReason: "end_turn" }, OTHER);
     assert.equal(spoofed.ok, false);
     const st = await h.call("orch_status", { taskId: t.taskId });
     assert.equal(st.task.status, "starting");
+
+    // Finish task so it leaves soloByChannel, then verify chat-settings.json noOrchestrate STILL blocks recursion!
+    h.relay.deliver(t.workerChannelId, CONDUCTOR, "done");
+    await h.call("_acp_turn_done", { channel: t.workerChannelId, stopReason: "end_turn" }, CONDUCTOR);
+    await h.call("orch_wait", { taskId: t.taskId, timeoutMs: 5000 });
+    await assert.rejects(
+      () => h.call("orch_delegate", { runtime: "claude", prompt: "recurse after finish!", chat: t.workerChannelId, cwd: h.workDir }),
+      /MAX_DEPTH = 1/,
+    );
   } finally {
     await h.cleanup();
   }
@@ -431,8 +540,8 @@ test("persistence across restart marks active tasks interrupted and keeps comple
   const h = await setupHarness();
   try {
     const t1 = await h.call("orch_delegate", { runtime: "claude", prompt: "finish me", chat: CHAT, cwd: h.workDir });
-    h.relay.deliver(t1.workerChannelId, WORKER, "finished-ok");
-    await h.call("_acp_turn_done", { channel: t1.workerChannelId, stopReason: "end_turn" }, WORKER);
+    h.relay.deliver(t1.workerChannelId, CONDUCTOR, "finished-ok");
+    await h.call("_acp_turn_done", { channel: t1.workerChannelId, stopReason: "end_turn" }, CONDUCTOR);
     await h.call("orch_wait", { taskId: t1.taskId, timeoutMs: 5000 });
 
     const t2 = await h.call("orch_delegate", { runtime: "claude", prompt: "leave running", chat: CHAT, cwd: h.workDir });
@@ -463,8 +572,8 @@ test("summary view clips long result text to 2000 chars with resultTruncated fla
   try {
     const t = await h.call("orch_delegate", { runtime: "claude", prompt: "long output", chat: CHAT, cwd: h.workDir });
     const big = "x".repeat(3000);
-    h.relay.deliver(t.workerChannelId, WORKER, big);
-    await h.call("_acp_turn_done", { channel: t.workerChannelId, stopReason: "end_turn" }, WORKER);
+    h.relay.deliver(t.workerChannelId, CONDUCTOR, big);
+    await h.call("_acp_turn_done", { channel: t.workerChannelId, stopReason: "end_turn" }, CONDUCTOR);
     await h.call("orch_wait", { taskId: t.taskId, timeoutMs: 5000 });
 
     const listed = await h.call("orch_list", { chat: CHAT });
@@ -475,14 +584,14 @@ test("summary view clips long result text to 2000 chars with resultTruncated fla
   }
 });
 
-test("review regressions: concurrent delegate respects maxLive, expired chat-settings pruned, turn-2 dedup, forget worker fails tasks", async () => {
+test("review regressions: concurrent delegate respects maxLive, expired chat-settings pruned, turn-2 dedup, forget target fails tasks", async () => {
   const h = await setupHarness({ limits: { maxLive: 2, maxQueue: 4 } });
   try {
-    // Seed an expired orchestrated entry and a user-owned entry (no expiresAt) in worker chat-settings.json.
+    // Seed an expired orchestrated entry and a user-owned entry (no expiresAt) in Conductor's chat-settings.json.
     await fs.writeFile(
-      path.join(h.dataDir, WORKER, "chat-settings.json"),
+      path.join(h.dataDir, CONDUCTOR, "chat-settings.json"),
       JSON.stringify({
-        "expired-chat": { runtime: "claude", expiresAt: Date.now() - 10_000 },
+        "expired-chat": { runtime: "claude", noOrchestrate: true, expiresAt: Date.now() - 10_000 },
         "user-chat": { runtime: "claude", model: "opus" },
       }),
     );
@@ -490,7 +599,7 @@ test("review regressions: concurrent delegate respects maxLive, expired chat-set
     // Fire 4 concurrent orch_delegate calls simultaneously -> at most 2 may become "starting", 2 must be "queued".
     const results = await Promise.all([
       h.call("orch_delegate", { runtime: "claude", prompt: "c1", chat: CHAT, cwd: h.workDir }),
-      h.call("orch_delegate", { runtime: "claude", prompt: "c2", chat: CHAT, cwd: h.workDir }),
+      h.call("orch_delegate", { runtime: "claude", agent: "Giraffe", prompt: "c2", chat: CHAT, cwd: h.workDir }),
       h.call("orch_delegate", { runtime: "claude", prompt: "c3", chat: CHAT, cwd: h.workDir }),
       h.call("orch_delegate", { runtime: "claude", prompt: "c4", chat: CHAT, cwd: h.workDir }),
     ]);
@@ -500,29 +609,30 @@ test("review regressions: concurrent delegate respects maxLive, expired chat-set
     assert.equal(queued.length, 2);
 
     // Expired entry was pruned while user-owned entry survived.
-    const cs = JSON.parse(await fs.readFile(path.join(h.dataDir, WORKER, "chat-settings.json"), "utf8"));
+    const cs = JSON.parse(await fs.readFile(path.join(h.dataDir, CONDUCTOR, "chat-settings.json"), "utf8"));
     assert.equal(cs["expired-chat"], undefined);
     assert.deepEqual(cs["user-chat"], { runtime: "claude", model: "opus" });
 
     // Turn-2 relay query fallback must NOT re-ingest Turn 1's already-seen message ID.
-    const t = starting[0];
-    await h.call("orch_steer", { taskId: t.taskId, prompt: "follow-up", chat: CHAT });
-    h.relay.deliver(t.workerChannelId, WORKER, "turn-1-reply");
-    await h.call("_acp_turn_done", { channel: t.workerChannelId, stopReason: "end_turn" }, WORKER);
+    const tSelf = starting.find((t) => t.workerPubkey === CONDUCTOR);
+    const tGiraffe = starting.find((t) => t.workerPubkey === GIRAFFE);
+    assert.ok(tSelf && tGiraffe);
+    await h.call("orch_steer", { taskId: tSelf.taskId, prompt: "follow-up", chat: CHAT });
+    h.relay.deliver(tSelf.workerChannelId, CONDUCTOR, "turn-1-reply");
+    await h.call("_acp_turn_done", { channel: tSelf.workerChannelId, stopReason: "end_turn" }, CONDUCTOR);
     await new Promise((r) => setTimeout(r, 20));
     // Turn 2 completes without delivering a new WS message -> falls back to finalText, not duplicated turn-1-reply.
-    const waitT = h.call("orch_wait", { taskId: t.taskId, timeoutMs: 5000 });
-    await h.call("_acp_turn_done", { channel: t.workerChannelId, stopReason: "end_turn", finalText: "turn-2-reply" }, WORKER);
+    const waitT = h.call("orch_wait", { taskId: tSelf.taskId, timeoutMs: 5000 });
+    await h.call("_acp_turn_done", { channel: tSelf.workerChannelId, stopReason: "end_turn", finalText: "turn-2-reply" }, CONDUCTOR);
     const doneT = await waitT;
     assert.equal(doneT.task.result.text, "turn-1-reply\n\nturn-2-reply");
 
-    // Removing the worker agent fails active tasks running on that worker instead of orphaning them.
-    const tActive = starting[1];
-    const waitActive = h.call("orch_wait", { taskId: tActive.taskId, timeoutMs: 5000 });
-    await h.orch.forget(WORKER);
-    const failedActive = await waitActive;
-    assert.equal(failedActive.task.status, "failed");
-    assert.match(failedActive.task.error, /Worker agent was removed/);
+    // Removing Giraffe fails active tasks delegated to Giraffe instead of orphaning them.
+    const waitGiraffe = h.call("orch_wait", { taskId: tGiraffe.taskId, timeoutMs: 5000 });
+    await h.orch.forget(GIRAFFE);
+    const failedGiraffe = await waitGiraffe;
+    assert.equal(failedGiraffe.task.status, "failed");
+    assert.match(failedGiraffe.task.error, /Worker agent was removed/);
   } finally {
     await h.cleanup();
   }

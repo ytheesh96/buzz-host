@@ -703,6 +703,47 @@ class ParallelAndMultiRuntime(Base):
         self.assertEqual(len(sent), 1)
         self.assertEqual(sent[0][1]["method"], "session/cancel")
 
+    def test_no_orchestrate_sets_mcp_env_and_enables_wake_reply_fallback(self):
+        self.p.agent_pubkey = AGENT
+        posted = []
+        self.p.reply = lambda channel, root, text: posted.append((channel, root, text))
+        self.p.spawn = lambda fn, *args: fn(*args)
+        self.p.agent_posted = lambda ch, since: False
+        self.p.save_settings({CHANNEL: {"noOrchestrate": True}})
+
+        # session/new injects BUZZHOST_NO_ORCHESTRATE=1 onto the buzz MCP server.
+        req = line({"jsonrpc": "2.0", "id": "n-solo", "method": "session/new", "params": {
+            "cwd": self.own,
+            "mcpServers": [{"name": "buzz", "command": "/bin/buzz-mcp", "args": [], "env": []}],
+            "_meta": {"buzzHost": {"channelId": CHANNEL, "rootEventId": None}},
+        }})
+        out = json.loads(self.p.handle_client_line(req))
+        self.assertEqual(out["params"]["mcpServers"][0]["env"], [
+            {"name": "BUZZHOST_CHAT", "value": CHANNEL},
+            {"name": "BUZZHOST_NO_ORCHESTRATE", "value": "1"},
+        ])
+        self.p.handle_adapter_line(line({"jsonrpc": "2.0", "id": "n-solo", "result": {"sessionId": "s-solo"}}))
+
+        # Wake-driven turn (no _meta.buzzHost) still triggers reply_fallback in a worker Solo chat.
+        wake_text = f"<context>\nScope: channel\nSession scope: channel\nChannel: {CHANNEL} (#{CHANNEL})\n</context>\n\nDo work"
+        self.p.handle_client_line(line({
+            "jsonrpc": "2.0", "id": "p-wake", "method": "session/prompt",
+            "params": {"sessionId": "s-solo", "prompt": [{"type": "text", "text": wake_text}]},
+        }))
+        self.p.handle_adapter_line(line({
+            "jsonrpc": "2.0", "method": "session/update",
+            "params": {"sessionId": "s-solo", "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": "Wake answer."},
+            }},
+        }))
+        self.p.handle_adapter_line(line({"jsonrpc": "2.0", "id": "p-wake", "result": {"stopReason": "end_turn"}}))
+        self.assertEqual(posted, [(CHANNEL, None, "Wake answer.")])
+
+        # _is_orch_prompt ignores orchestrator-posted visible prompts when checking agent_posted.
+        self.assertTrue(self.p._is_orch_prompt({"tags": [["h", CHANNEL], ["t", "buzz.orch.prompt"]]}))
+        self.assertFalse(self.p._is_orch_prompt({"tags": [["h", CHANNEL]]}))
+
 
 if __name__ == "__main__":
     unittest.main()
