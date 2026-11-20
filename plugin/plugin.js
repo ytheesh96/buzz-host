@@ -2244,17 +2244,26 @@ export function apply(ctx) {
             },
             h(
               "div",
-              { style: { display: "flex", alignItems: "center", gap: "var(--space-2)", flexWrap: "wrap", minWidth: 0 } },
+              // One line: the badge and label share the leftover width and
+              // truncate (badge capped so a long model id can't crowd out the
+              // label); status, elapsed and the buttons never shrink or wrap.
+              { style: { display: "flex", alignItems: "center", gap: "var(--space-2)", flexWrap: "nowrap", minWidth: 0 } },
               h(
                 "span",
                 {
                   className: "text-caption",
+                  title: orchBadgeText(task),
                   style: {
                     padding: "1px 6px",
                     borderRadius: 999,
                     background: "var(--surface-raised, rgba(127,127,127,0.14))",
                     fontWeight: 500,
                     whiteSpace: "nowrap",
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                    flex: "0 1 auto",
+                    minWidth: 0,
+                    maxWidth: "45%",
                   },
                 },
                 orchBadgeText(task),
@@ -2263,7 +2272,7 @@ export function apply(ctx) {
                 "span",
                 {
                   className: "text-body-sm",
-                  style: { flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontWeight: 500 },
+                  style: { flex: "1 1 6em", minWidth: "4em", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontWeight: 500 },
                   title: task.label || task.taskId,
                 },
                 task.label || task.taskId,
@@ -2279,32 +2288,37 @@ export function apply(ctx) {
                     background: st.bg,
                     fontWeight: 500,
                     whiteSpace: "nowrap",
+                    flexShrink: 0,
                   },
                 },
                 st.label,
               ),
-              h("span", { className: "text-caption text-secondary", style: { whiteSpace: "nowrap", fontVariantNumeric: "tabular-nums" } }, orchFormatElapsed(elapsed)),
-              isLive &&
+              h("span", { className: "text-caption text-secondary", style: { whiteSpace: "nowrap", flexShrink: 0, fontVariantNumeric: "tabular-nums" } }, orchFormatElapsed(elapsed)),
+              h(
+                "span",
+                { style: { display: "flex", alignItems: "center", gap: 2, flexShrink: 0 } },
+                isLive &&
+                  h(
+                    Btn,
+                    {
+                      size: "sm",
+                      variant: "ghost",
+                      disabled: isStopping,
+                      onClick: () => void cancelTask(task.taskId),
+                      "aria-label": `Stop worker ${task.label || task.taskId}`,
+                    },
+                    isStopping ? "Stopping…" : "Stop",
+                  ),
                 h(
                   Btn,
                   {
                     size: "sm",
                     variant: "ghost",
-                    disabled: isStopping,
-                    onClick: () => void cancelTask(task.taskId),
-                    "aria-label": `Stop worker ${task.label || task.taskId}`,
+                    onClick: () => toggleExpand(task.taskId),
+                    "aria-expanded": isExpanded,
                   },
-                  isStopping ? "Stopping…" : "Stop",
+                  isExpanded ? "Hide" : "Transcript",
                 ),
-              h(
-                Btn,
-                {
-                  size: "sm",
-                  variant: "ghost",
-                  onClick: () => toggleExpand(task.taskId),
-                  "aria-expanded": isExpanded,
-                },
-                isExpanded ? "Hide" : "Transcript",
               ),
             ),
             (stepText || task.steerQueued > 0) &&

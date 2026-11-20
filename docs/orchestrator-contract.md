@@ -93,7 +93,9 @@ the full record; transcripts are included for `orch_status` and `full: true`.
   stopped: records survive restarts, work does not.
 - `completed` means the turn ended (`end_turn`). `stopReason` is preserved even
   when it is `max_tokens` or `refusal`. `failed` means an adapter/protocol
-  error or an unexpected exit; `timed_out` means the wall-clock budget expired;
+  error or an unexpected exit, or a turn whose whole reply is a short
+  quota/rate-limit banner (e.g. Antigravity's `⚠ Individual quota reached…`,
+  which arrives as text with `end_turn`; see `runtimeRefusal`); `timed_out` means the wall-clock budget expired;
   `error` says which.
 
 ## Guardrails

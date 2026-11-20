@@ -8,7 +8,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { createOrchestrator, MAX_DEPTH, MAX_LIVE, ORCHESTRATOR_TOOLS } from "./orchestrator.mjs";
+import { createOrchestrator, MAX_DEPTH, MAX_LIVE, ORCHESTRATOR_TOOLS, runtimeRefusal } from "./orchestrator.mjs";
 
 const OWNER = "1".repeat(64);
 const OTHER = "2".repeat(64);
@@ -109,7 +109,7 @@ rl.on("line", (line) => {
       send({
         jsonrpc: "2.0",
         method: "session/update",
-        params: { update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "turn" + promptCount + ":" + text } } },
+        params: { update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: text.includes("QUOTA_BANNER") ? "\\n\\u26a0 Individual quota reached. Please upgrade your subscription. Resets in 48m42s.\\n" : "turn" + promptCount + ":" + text } } },
       });
       if (text.includes("TRAILING_CHUNK")) {
         // Reply resolves BEFORE the last chunk arrives (real-world adapter behavior).
@@ -595,5 +595,34 @@ test("hardening: generic -32000 does not blacklist, steer cap + starting count, 
   } finally {
     await orch2.close();
     await env2.cleanup();
+  }
+});
+
+test("runtimeRefusal: short quota/limit banners are refusals, ordinary or long replies are not", () => {
+  assert.equal(
+    runtimeRefusal("\n\u26a0 Individual quota reached. Please upgrade your subscription. Resets in 48m42s.\n"),
+    "Individual quota reached. Please upgrade your subscription. Resets in 48m42s.",
+  );
+  assert.match(runtimeRefusal("Error: rate limit exceeded, retry in 30s"), /rate limit exceeded/);
+  assert.equal(runtimeRefusal("Messages hop node to node"), "");
+  assert.equal(runtimeRefusal(""), "");
+  assert.equal(runtimeRefusal("Quotas: a system can say quota exceeded when... " + "x".repeat(500)), "");
+});
+
+test("a turn that ends with only a quota banner is recorded as failed, not completed", async () => {
+  const env = await setupEnv();
+  const orch = createOrchestrator({ dataDir: env.dataDir, stateDir: env.stateDir, shimsDir: env.shimsDir, limits: { idleDrainMs: 30 } });
+  try {
+    const d = JSON.parse(await orch.call(AGENT, "orch_delegate", { runtime: "antigravity", prompt: "QUOTA_BANNER review", chat: CHAT, cwd: env.workDir }));
+    const w = JSON.parse(await orch.call(AGENT, "orch_wait", { taskId: d.taskId, timeoutMs: 5000 }));
+    assert.equal(w.task.status, "failed");
+    assert.match(w.task.error, /quota reached/i);
+    assert.match(w.task.result.text, /quota reached/i);
+    const ok = JSON.parse(await orch.call(AGENT, "orch_delegate", { runtime: "claude", prompt: "fine", chat: CHAT, cwd: env.workDir }));
+    const ow = JSON.parse(await orch.call(AGENT, "orch_wait", { taskId: ok.taskId, timeoutMs: 5000 }));
+    assert.equal(ow.task.status, "completed");
+  } finally {
+    await orch.close();
+    await env.cleanup();
   }
 });

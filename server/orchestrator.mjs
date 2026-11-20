@@ -223,6 +223,24 @@ function isAuthError(error) {
   return /auth(?:entication|orization)?\s+required|not\s+authenticated|login\s+required|unauthorized/i.test(msg);
 }
 
+// Some adapters report a refused turn (quota, rate limit) as ordinary reply
+// text with stopReason "end_turn" — e.g. Antigravity's
+// "⚠ Individual quota reached. …". Treat a short reply that is only such a
+// banner as a failure so the task isn't shown as Done. Long replies are left
+// alone: a worker may legitimately write about quotas.
+const LIMIT_RE =
+  /\b(?:quota\s+(?:reached|exceeded)|rate[- ]limit(?:ed|\s+(?:reached|exceeded))|usage\s+limit\s+(?:reached|exceeded)|credit\s+balance\s+is\s+too\s+low|insufficient\s+(?:credits|quota))\b/i;
+const MAX_BANNER_CHARS = 400;
+
+export function runtimeRefusal(output) {
+  const text = String(output ?? "").trim();
+  if (!text || text.length > MAX_BANNER_CHARS) return "";
+  if (/^[\u26a0\u203c]/.test(text) || LIMIT_RE.test(text)) {
+    return text.replace(/^[\u26a0\u203c]\ufe0f?\s*/, "").replace(/\s+/g, " ");
+  }
+  return "";
+}
+
 function buildWorkerEnv(baseEnv = process.env) {
   const env = {};
   for (const [k, v] of Object.entries(baseEnv)) {
@@ -1001,6 +1019,14 @@ export function createOrchestrator({
           await finishTask(pubkey, state, task, {
             status: "cancelled",
             stopReason: "cancelled",
+            output: currentOutput,
+            outputBytes: currentOutputBytes,
+          });
+        } else if (runtimeRefusal(currentOutput)) {
+          await finishTask(pubkey, state, task, {
+            status: "failed",
+            stopReason: task.stopReason || "end_turn",
+            error: runtimeRefusal(currentOutput),
             output: currentOutput,
             outputBytes: currentOutputBytes,
           });
