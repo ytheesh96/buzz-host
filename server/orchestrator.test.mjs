@@ -244,7 +244,11 @@ test("self-worker default lifecycle: capabilities, delegate, chat-settings + noO
     assert.equal(h.relay.created[0].ownerPubkey, OWNER);
     assert.equal(h.relay.posted.length, 1);
     assert.equal(h.relay.posted[0].mentionPubkey, undefined);
-    assert.equal(h.relay.posted[0].content, "Summarize Nostr NIP-29");
+    // Brief + backlink to the owner's message in the parent chat (no parent history).
+    assert.equal(
+      h.relay.posted[0].content,
+      `Summarize Nostr NIP-29\n\n↩ Delegated from: buzz://message?channel=${CHANNEL}&id=${ORIGIN}`,
+    );
     assert.ok(h.relay.posted[0].tags.some((t) => t[0] === "t" && t[1] === "buzz.orch.prompt"));
 
     // Operator wake file was written atomically to Conductor's wake dir with exact Patch 0004 fields.
@@ -321,6 +325,50 @@ test("cross-agent delegation by name, @name, or pubkey routes settings and wake 
     const res = await waitP;
     assert.equal(res.task.status, "completed");
     assert.equal(res.task.result.text, "Repo looks clean.");
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("worker brief: optional context section, parent backlink in visible message + wake prompt, size cap, context hidden from list", async () => {
+  const h = await setupHarness();
+  try {
+    const t = await h.call("orch_delegate", {
+      runtime: "claude",
+      agent: "Giraffe",
+      prompt: "Review the migration plan.",
+      context: "  Owner decided: keep Postgres 16; no downtime allowed.  ",
+      label: "review",
+      chat: CHAT,
+      cwd: h.workDir,
+    });
+    assert.equal(t.context, "Owner decided: keep Postgres 16; no downtime allowed.");
+    const backlink = `buzz://message?channel=${CHANNEL}&id=${ORIGIN}`;
+    const expected =
+      "Review the migration plan.\n\n**Context**\nOwner decided: keep Postgres 16; no downtime allowed." +
+      `\n\n↩ Delegated from: ${backlink}`;
+    assert.equal(h.relay.posted[0].content, expected);
+    const wakes = await listWakes(h.dataDir, GIRAFFE);
+    assert.equal(wakes.length, 1);
+    assert.ok(wakes[0].data.prompt.endsWith(expected));
+    assert.match(wakes[0].data.prompt, /brief below is self-contained/);
+    // The worker's link still points at its own Solo chat prompt, not the parent.
+    assert.equal(t.link, `buzz://message?channel=${t.workerChannelId}&id=${t.promptEventId}`);
+
+    const listed = await h.call("orch_list", {});
+    assert.equal(listed.tasks[0].context, undefined);
+
+    await assert.rejects(
+      () =>
+        h.call("orch_delegate", {
+          runtime: "claude",
+          prompt: "x".repeat(40 * 1024),
+          context: "y".repeat(30 * 1024),
+          chat: CHAT,
+          cwd: h.workDir,
+        }),
+      /prompt \+ context exceed 60 KiB limit/,
+    );
   } finally {
     await h.cleanup();
   }

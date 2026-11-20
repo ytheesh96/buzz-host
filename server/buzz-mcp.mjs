@@ -144,7 +144,7 @@ async function handle(request) {
           ...(computerModule ? [computerModule.instructions(pubkey)] : []),
           ...(withOrchestrate
             ? [
-                "Orchestration: you can delegate tasks to real Solo-chat workers on other runtimes (claude, codex, hermes, antigravity) with orch_capabilities, orch_delegate, orch_wait, orch_status, orch_list, orch_steer, and orch_cancel. Each delegated task opens a real Solo chat with a buzz://message link — include that link verbatim in your chat updates so the owner can open and inspect the worker chat directly.",
+                "Orchestration: you can delegate tasks to real Solo-chat workers on other runtimes (claude, codex, hermes, antigravity) with orch_capabilities, orch_delegate, orch_wait, orch_status, orch_list, orch_steer, and orch_cancel. Workers see no history from this chat, so write each orch_delegate prompt as a self-contained brief and put background (decisions, constraints, findings so far) in its optional context field. Each delegated task opens a real Solo chat that links back to the owner's message here, with a buzz://message link — include that link verbatim in your chat updates so the owner can open and inspect the worker chat directly.",
               ]
             : []),
         ].join("\n"),

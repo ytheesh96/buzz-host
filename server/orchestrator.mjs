@@ -86,10 +86,11 @@ export const ORCHESTRATOR_TOOLS = [
   ),
   tool(
     "orch_delegate",
-    "Delegate work to a real Solo-chat worker on another runtime (claude, codex, hermes, antigravity). Runs on yourself by default, or on any other Omarchy agent named by `agent`. Returns workerChannelId and a buzz://message link you can share in chat, then call orch_wait for the answer.",
+    "Delegate work to a real Solo-chat worker on another runtime (claude, codex, hermes, antigravity). Runs on yourself by default, or on any other Omarchy agent named by `agent`. The worker sees no parent chat history: `prompt` must be a self-contained brief, and `context` (optional) carries background such as decisions, constraints, or findings so far. The worker chat links back to the owner's message here. Returns workerChannelId and a buzz://message link you can share in chat, then call orch_wait for the answer.",
     {
       runtime: str,
       prompt: str,
+      context: str,
       agent: str,
       model: str,
       effort: str,
@@ -166,6 +167,20 @@ function buzzMessageLink(channelId, eventId) {
   return `buzz://message?channel=${channelId}&id=${eventId}`;
 }
 
+/**
+ * First message posted in a worker Solo chat: the brief, an optional
+ * context section, and a backlink to the owner's message in the parent chat.
+ * Workers get no parent history (like t3code's delegate_task); the backlink
+ * is navigation for the owner, not an instruction to read the parent chat.
+ */
+function composeWorkerBrief({ prompt, context, parentLink }) {
+  const parts = [String(prompt ?? "").trim()];
+  const ctx = String(context ?? "").trim();
+  if (ctx) parts.push(`**Context**\n${ctx}`);
+  if (parentLink) parts.push(`↩ Delegated from: ${parentLink}`);
+  return parts.join("\n\n");
+}
+
 function clipBytes(text, maxBytes) {
   const s = String(text ?? "");
   if (Buffer.byteLength(s, "utf8") <= maxBytes) return s;
@@ -232,7 +247,7 @@ function toFullView(task, { includeTranscript = false } = {}) {
 }
 
 function toSummaryView(task) {
-  const { prompt: _prompt, transcript: _transcript, ...rest } = task;
+  const { prompt: _prompt, context: _context, transcript: _transcript, ...rest } = task;
   let result = null;
   let resultTruncated;
   if (task.result) {
@@ -1114,6 +1129,7 @@ export function createOrchestrator({
         : `<delegated-worker-task channel="${channelId}" runtime="${task.runtime}">\n` +
           `You are running as a Solo-chat worker for "${task.label}" in channel #${channelId} (workspace: ${task.workspace}).\n` +
           `Complete the task below and post your final answer directly in channel ${channelId} (use \`buzz messages send --channel ${channelId} --content -\` or a plain final answer). Do not delegate further tasks.\n` +
+          `The brief below is self-contained. The "Delegated from" link is for the owner; do not read the parent chat unless the brief is missing something essential.\n` +
           `</delegated-worker-task>`;
       return `${header}\n\n${promptText}`;
     };
@@ -1463,7 +1479,12 @@ export function createOrchestrator({
       // 3. Post the visible task prompt in the Solo chat (no p-tag, so buzz-acp
       //    does not double-trigger) and record its eventId in seenMessageIds
       //    before watching — critical when worker === self.
-      await postVisiblePrompt(task.prompt);
+      const brief = composeWorkerBrief({
+        prompt: task.prompt,
+        context: task.context,
+        parentLink: buzzMessageLink(task.channelId, task.originEventId),
+      });
+      await postVisiblePrompt(brief);
 
       if (isAbortedBeforeStart()) {
         startingCancelled.delete(task.taskId);
@@ -1486,7 +1507,7 @@ export function createOrchestrator({
       }
 
       // 5. Trigger the worker turn via its operator wake directory ($BUZZ_ACP_WAKE_DIR).
-      await dropWake(task.prompt, false);
+      await dropWake(brief, false);
       if (!finished && !cancelling && !timedOut) resetTurnTimer();
     } catch (error) {
       soloByChannel.delete(channelId);
@@ -1655,8 +1676,9 @@ export function createOrchestrator({
     }
     const prompt = typeof args.prompt === "string" ? args.prompt : "";
     if (!prompt.trim()) throw new Error("prompt is required");
-    if (Buffer.byteLength(prompt, "utf8") > MAX_PROMPT_BYTES) {
-      throw new Error("prompt exceeds 60 KiB limit");
+    const context = typeof args.context === "string" ? args.context.trim() : "";
+    if (Buffer.byteLength(prompt, "utf8") + Buffer.byteLength(context, "utf8") > MAX_PROMPT_BYTES) {
+      throw new Error("prompt + context exceed 60 KiB limit");
     }
     const fail = await activeAuthFailure(runtime);
     if (fail) {
@@ -1710,6 +1732,7 @@ export function createOrchestrator({
       effort: typeof args.effort === "string" ? args.effort.trim() : "",
       label: labelRaw || defaultLabel(prompt),
       prompt,
+      context,
       workspace: ws,
       status: "queued",
       createdAt: now,
