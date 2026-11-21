@@ -175,29 +175,105 @@ export function toModels(probed, configured = "") {
  * (acp-proxy's split_pick). */
 export const RUNTIME_SEP = "::";
 
+/** Resolve a chat or thread's effective {runtime, model, effort} from
+ * chat-settings.json. A thread inherits its channel's settings unless it
+ * overrides them; when a thread switches to a different runtime than its
+ * channel, the channel's model and effort (which belonged to the old runtime)
+ * are not inherited. */
+export function resolveChatSettings(settings, channelId, threadRootId, defaultRuntime, knownRuntimes = null) {
+  const validRuntime = (rt) => {
+    const s = typeof rt === "string" ? rt.trim().toLowerCase() : "";
+    if (!s) return "";
+    return knownRuntimes ? (knownRuntimes.has(s) ? s : "") : s;
+  };
+  const validText = (v) => (typeof v === "string" ? v.trim() : "");
+  const all = settings && typeof settings === "object" ? settings : {};
+  const baseRaw = channelId && all[channelId] && typeof all[channelId] === "object" ? all[channelId] : {};
+  const threadKey = channelId && threadRootId ? `${channelId}_${threadRootId}` : "";
+  const ownRaw = threadKey && all[threadKey] && typeof all[threadKey] === "object" ? all[threadKey] : {};
+
+  const baseRt = validRuntime(baseRaw.runtime);
+  const ownRt = validRuntime(ownRaw.runtime);
+  const fallbackRt = validRuntime(defaultRuntime);
+  const runtime = ownRt || baseRt || fallbackRt;
+
+  const threadSwitchedRuntime = Boolean(ownRt && ownRt !== (baseRt || fallbackRt));
+  const model = validText(ownRaw.model) || (threadSwitchedRuntime ? "" : validText(baseRaw.model));
+  const effort = validText(ownRaw.effort) || (threadSwitchedRuntime ? "" : validText(baseRaw.effort));
+
+  return { runtime, model, effort };
+}
+
 /** The agent's own runtime's models (`own`: toModels plus {runtime, title})
  * and other runtimes' (`others`, the same), as one `Models` for Buzz's
  * composer: each runtime a submenu (Hermes: one per provider), other
- * runtimes' ids prefixed with theirs. Without others, `own` as it is. */
-export function withRuntimes(own, others = []) {
-  const plain = { current: own.current, models: own.models };
-  if (!others.length) return plain;
+ * runtimes' ids prefixed with theirs. Without others, `own` as it is.
+ * When `chat` ({runtime, model, effort}) is given, `current` (and its resting
+ * effort) reflect that conversation's active setting instead of the agent's
+ * default. */
+export function withRuntimes(own, others = [], chat = null) {
   const tag = (title, m) => ({
     ...m,
     label: `${title} · ${m.label}`,
     group: m.group ? `${title} · ${m.group}` : title,
   });
-  return {
-    current: own.current,
-    models: [
-      ...own.models.map((m) => tag(own.title, m)),
-      ...others.flatMap((o) =>
-        o.models
-          .map((m) => ({ ...tag(o.title, m), id: `${o.runtime}${RUNTIME_SEP}${m.id}` }))
-          .filter((m) => PICKABLE.test(m.id)),
-      ),
-    ],
-  };
+  const models = others.length
+    ? [
+        ...own.models.map((m) => tag(own.title, m)),
+        ...others.flatMap((o) =>
+          o.models
+            .map((m) => ({ ...tag(o.title, m), id: `${o.runtime}${RUNTIME_SEP}${m.id}` }))
+            .filter((m) => PICKABLE.test(m.id)),
+        ),
+      ]
+    : own.models.map((m) => ({ ...m }));
+  let current = own.current;
+
+  if (chat && (chat.runtime || chat.model || chat.effort)) {
+    const targetRuntime = chat.runtime || own.runtime;
+    if (targetRuntime === own.runtime) {
+      if (chat.model) {
+        if (models.some((m) => m.id === chat.model)) {
+          current = chat.model;
+        } else if (PICKABLE.test(chat.model)) {
+          const base = own.models.find((m) => m.id === own.current);
+          models.unshift({
+            id: chat.model,
+            label: others.length ? `${own.title} · ${chat.model}` : chat.model,
+            ...(others.length ? { group: own.title } : {}),
+            efforts: base?.efforts ?? [],
+          });
+          current = chat.model;
+        }
+      }
+    } else {
+      const other = others.find((o) => o.runtime === targetRuntime);
+      if (other) {
+        const rawModel = chat.model || other.current || "";
+        const prefixed = rawModel ? `${targetRuntime}${RUNTIME_SEP}${rawModel}` : "";
+        if (prefixed && models.some((m) => m.id === prefixed)) {
+          current = prefixed;
+        } else if (prefixed && PICKABLE.test(prefixed)) {
+          const base = other.models.find((m) => m.id === other.current);
+          models.push({
+            id: prefixed,
+            label: `${other.title} · ${rawModel}`,
+            group: other.title,
+            efforts: base?.efforts ?? [],
+          });
+          current = prefixed;
+        }
+      }
+    }
+    if (chat.effort) {
+      const idx = models.findIndex((m) => m.id === current);
+      if (idx >= 0 && models[idx].efforts?.some((e) => e.id === chat.effort)) {
+        models[idx] = { ...models[idx], effort: chat.effort };
+      }
+    }
+  }
+
+  return { current, models };
 }
 
 /** Probes cached per runtime and Hermes profile in `dir`: an answer comes

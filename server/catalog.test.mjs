@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { probe, toModels, catalogs, effortLabel, withRuntimes } from "./catalog.mjs";
+import { probe, toModels, catalogs, effortLabel, withRuntimes, resolveChatSettings } from "./catalog.mjs";
 
 // Temp dirs made by this file, removed when it finishes.
 const tmpDirs = [];
@@ -173,4 +173,120 @@ test("catalogs without waiting: nothing until a background probe answers; a fail
   await new Promise((r) => setTimeout(r, 50));
   assert.equal(await get("antigravity:", { fail: true }, { wait: false }), undefined, "asked again later");
   assert.equal(calls, 3);
+});
+
+test("resolveChatSettings: thread inherits channel unless it switches runtime", () => {
+  const known = new Set(["claude", "codex", "hermes", "antigravity"]);
+  const ch = "61ace2b8-1160-44c8-ad2b-6efd96b816af";
+  const th = "a".repeat(64);
+  const key = `${ch}_${th}`;
+
+  assert.deepEqual(resolveChatSettings({}, ch, th, "claude", known), {
+    runtime: "claude",
+    model: "",
+    effort: "",
+  });
+
+  // Channel switched to antigravity; thread inherits runtime, model, effort.
+  const chSettings = { [ch]: { runtime: "antigravity", model: "gemini-4-neon", effort: "high" } };
+  assert.deepEqual(resolveChatSettings(chSettings, ch, th, "claude", known), {
+    runtime: "antigravity",
+    model: "gemini-4-neon",
+    effort: "high",
+  });
+
+  // Thread overrides effort on same runtime: keeps channel's runtime and model.
+  assert.deepEqual(
+    resolveChatSettings({ ...chSettings, [key]: { effort: "low" } }, ch, th, "claude", known),
+    { runtime: "antigravity", model: "gemini-4-neon", effort: "low" },
+  );
+
+  // Thread switches back to claude: must NOT inherit channel's antigravity model/effort.
+  assert.deepEqual(
+    resolveChatSettings({ ...chSettings, [key]: { runtime: "claude" } }, ch, th, "claude", known),
+    { runtime: "claude", model: "", effort: "" },
+  );
+
+  // Channel uses agent default runtime with a model/effort; thread switches to codex.
+  assert.deepEqual(
+    resolveChatSettings(
+      { [ch]: { model: "opus", effort: "high" }, [key]: { runtime: "codex" } },
+      ch,
+      th,
+      "claude",
+      known,
+    ),
+    { runtime: "codex", model: "", effort: "" },
+  );
+
+  // Unknown runtime falls back to default.
+  assert.deepEqual(
+    resolveChatSettings({ [ch]: { runtime: "unknown-rt" } }, ch, null, "claude", known),
+    { runtime: "claude", model: "", effort: "" },
+  );
+});
+
+test("withRuntimes with per-chat settings selects active runtime, model and effort", () => {
+  const own = {
+    runtime: "claude",
+    title: "Claude Code",
+    current: "default",
+    models: [
+      { id: "default", label: "Default (Opus 5.5)", efforts: [{ id: "low", label: "Low" }, { id: "high", label: "High" }] },
+      { id: "sonnet", label: "Sonnet", efforts: [{ id: "low", label: "Low" }, { id: "high", label: "High" }] },
+    ],
+  };
+  const codex = {
+    runtime: "codex",
+    title: "Codex",
+    current: "gpt-5",
+    models: [
+      { id: "gpt-5", label: "GPT-5", efforts: [{ id: "low", label: "Low" }, { id: "xhigh", label: "Extra high" }] },
+      { id: "gpt-5-mini", label: "GPT-5 mini", efforts: [{ id: "low", label: "Low" }] },
+    ],
+  };
+  const antigravity = {
+    runtime: "antigravity",
+    title: "Antigravity",
+    current: "gemini-4-neon",
+    models: [
+      { id: "gemini-4-neon", label: "Gemini 4 Neon", efforts: [{ id: "low", label: "Low" }, { id: "high", label: "High" }] },
+    ],
+  };
+
+  // Cross-runtime with explicit model and effort.
+  const ag = withRuntimes(own, [codex, antigravity], {
+    runtime: "antigravity",
+    model: "gemini-4-neon",
+    effort: "low",
+  });
+  assert.equal(ag.current, "antigravity::gemini-4-neon");
+  assert.equal(ag.models.find((m) => m.id === "antigravity::gemini-4-neon").effort, "low");
+  assert.equal(antigravity.models[0].effort, undefined, "does not mutate cached runtime catalog");
+
+  // Cross-runtime without explicit model uses that runtime's default.
+  const cx = withRuntimes(own, [codex, antigravity], { runtime: "codex", model: "", effort: "" });
+  assert.equal(cx.current, "codex::gpt-5");
+
+  // Cross-runtime with unlisted custom model adds an entry and selects it.
+  const custom = withRuntimes(own, [codex], { runtime: "codex", model: "gpt-5-custom", effort: "xhigh" });
+  assert.equal(custom.current, "codex::gpt-5-custom");
+  const customEntry = custom.models.find((m) => m.id === "codex::gpt-5-custom");
+  assert.equal(customEntry.group, "Codex");
+  assert.equal(customEntry.effort, "xhigh");
+
+  // Own runtime with model + unsupported effort: selects model, ignores unsupported effort.
+  const ownOverride = withRuntimes(own, [codex], { runtime: "claude", model: "sonnet", effort: "bogus" });
+  assert.equal(ownOverride.current, "sonnet");
+  assert.equal(ownOverride.models.find((m) => m.id === "sonnet").effort, undefined);
+
+  // Single runtime (no others) still applies per-chat model and effort.
+  const solo = withRuntimes(own, [], { runtime: "claude", model: "sonnet", effort: "high" });
+  assert.equal(solo.current, "sonnet");
+  assert.equal(solo.models.find((m) => m.id === "sonnet").effort, "high");
+  assert.equal(own.models[1].effort, undefined, "does not mutate own catalog");
+
+  // Unavailable target runtime falls back to agent default.
+  const missing = withRuntimes(own, [codex], { runtime: "hermes", model: "go:flash", effort: "" });
+  assert.equal(missing.current, "default");
 });

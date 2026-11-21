@@ -568,9 +568,22 @@ def update_settings(key, mutator):
 
 
 def wanted_for(key, settings):
-    """A thread uses its channel's settings unless it has its own."""
-    base = dict(settings.get(key.split("_", 1)[0], {})) if "_" in key else {}
-    base.update(settings.get(key, {}))
+    """A thread uses its channel's settings unless it has its own.
+    If the thread sets a different runtime than its channel, it does not
+    inherit the channel's model or effort (those belonged to the old runtime)."""
+    if "_" not in key:
+        entry = settings.get(key)
+        return dict(entry) if isinstance(entry, dict) else {}
+    base_raw = settings.get(key.split("_", 1)[0])
+    own_raw = settings.get(key)
+    base = dict(base_raw) if isinstance(base_raw, dict) else {}
+    own = dict(own_raw) if isinstance(own_raw, dict) else {}
+    own_rt = str(own.get("runtime") or "").strip().lower()
+    base_rt = str(base.get("runtime") or "").strip().lower() or DEFAULT_RUNTIME
+    if own_rt in KNOWN_RUNTIMES and own_rt != base_rt:
+        base.pop("model", None)
+        base.pop("effort", None)
+    base.update(own)
     return base
 
 

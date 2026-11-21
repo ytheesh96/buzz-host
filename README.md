@@ -214,12 +214,14 @@ Buzz's own panel.
 With Buzz patch `0006-models-for-hosted.patch`, a hosted type may offer `models` and
 `sessionControls`, so the composer's gauge button works for Omarchy agents as for local ones:
 
-- **Catalog:** the plugin's `models(agent)` calls buzz-host `catalog`. buzz-host
-  (`server/catalog.mjs`) opens one unprompted ACP session per runtime / Hermes profile, sets each
-  model in turn and reads its effort levels (Hermes: one set for all models, so no walk). A model
-  the runtime refuses ("Usage credits are required") is left out. Cached 6 h in
-  `~/.local/share/buzz-host/catalog/`, refreshed in the background; the plugin caches 5 min.
-  Hermes models carry `group` = provider; Buzz lists each provider as a submenu.
+- **Catalog:** the plugin's `models(agent, place)` calls buzz-host `catalog` (with `channelId` and
+  `threadRootId` when Buzz passes `place`). buzz-host (`server/catalog.mjs`) opens one unprompted
+  ACP session per runtime / Hermes profile, sets each model in turn and reads its effort levels
+  (Hermes: one set for all models, so no walk). A model the runtime refuses ("Usage credits are
+  required") is left out. Cached 6 h in `~/.local/share/buzz-host/catalog/`, refreshed in the
+  background; the plugin caches per conversation and invalidates when `session.state` reports that
+  the chat's runtime, model, or effort changed in `chat-settings.json`. Hermes models carry `group`
+  = provider; Buzz lists each provider as a submenu.
 - **Picks:** Buzz puts `["model"|"effort", <agent>, value]` tags on the owner's message.
   `acp-proxy` applies the latest owner message's picks to that turn only (ahead of `/model`,
   `/effort`); the next turn without one goes back to the chat setting, else to what the session ran

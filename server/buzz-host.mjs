@@ -22,7 +22,7 @@ import { createAttention } from "./attention.mjs";
 import { createMemory } from "./memory.mjs";
 import { createOrchestrator } from "./orchestrator.mjs";
 import { createRelayWatcher } from "./attention-relay.mjs";
-import { catalogs, toModels, withRuntimes } from "./catalog.mjs";
+import { catalogs, resolveChatSettings, toModels, withRuntimes } from "./catalog.mjs";
 import { proxyControl as routeControl } from "./control.mjs";
 import * as desktop from "./desktop/desktop.mjs";
 import { acquire as leaseAcquire, release as leaseRelease, publicView } from "./desktop/lease.mjs";
@@ -362,25 +362,34 @@ async function runtimeCatalog(runtime, profile = "", configured = "", { wait = t
 }
 
 const installed = (command) => fs.access(command, fs.constants.X_OK).then(() => true, () => false);
+const RUNTIME_IDS = new Set(Object.keys(RUNTIMES));
+
+async function chatSettingsFor(pubkey, channelId, threadRootId, defaultRuntime) {
+  const settings = await readJson(path.join(dir(pubkey), "chat-settings.json"), {});
+  return resolveChatSettings(settings, channelId, threadRootId, defaultRuntime, RUNTIME_IDS);
+}
 
 /** The agent's own runtime's models, and every other installed runtime's
  * that has answered a probe (one not signed in never does; it's left out).
- * Only the agent's own is waited for: the others are probed in the
- * background and join a later answer (`runtimesPending` until then). */
-async function chatCatalog(runtime, profile, configured) {
+ * Only the agent's own (and the chat's active runtime, if switched) are
+ * waited for: the others are probed in the background and join a later
+ * answer (`runtimesPending` until then). */
+async function chatCatalog(runtime, profile, configured, chat = null) {
   const own = await runtimeCatalog(runtime, profile, configured);
   let pending = false;
+  const activeRuntime = chat?.runtime && chat.runtime !== runtime ? chat.runtime : "";
   const others = await Promise.all(
     Object.entries(RUNTIMES)
       .filter(([id]) => id !== runtime)
       .map(async ([id, r]) => {
         if (!(await installed(r.command))) return null;
-        const models = await runtimeCatalog(id, "", "", { wait: false }).catch(() => null);
+        const wait = id === activeRuntime;
+        const models = await runtimeCatalog(id, "", "", { wait }).catch(() => null);
         if (models === undefined) pending = true;
         return models?.models?.length ? { runtime: id, title: r.title, ...models } : null;
       }),
   );
-  const all = withRuntimes({ runtime, title: RUNTIMES[runtime].title, ...own }, others.filter(Boolean));
+  const all = withRuntimes({ runtime, title: RUNTIMES[runtime].title, ...own }, others.filter(Boolean), chat);
   return pending ? { ...all, runtimesPending: true } : all;
 }
 
@@ -723,27 +732,35 @@ const methods = {
 
   // The models and effort levels Buzz's composer offers for this agent's next
   // turn (Buzz's `Models`): its own runtime's, then other runtimes'
-  // ("codex::<id>"). acp-proxy applies a pick from the message tags; one on
+  // ("codex::<id>"). When channelId (and optional threadRootId) is given,
+  // `current` reflects that conversation's active runtime/model/effort from
+  // chat-settings.json. acp-proxy applies a pick from the message tags; one on
   // another runtime moves the chat there.
-  async catalog(config, { pubkey }) {
+  async catalog(config, { pubkey, channelId, threadRootId }) {
     checkPubkey(pubkey);
+    if (channelId != null) checkPlace(channelId, threadRootId);
     const m = await meta(pubkey);
     const { runtime, profile } = settingsFrom(m);
-    return chatCatalog(runtime, profile, m.model || "");
+    const chat = channelId ? await chatSettingsFor(pubkey, channelId, threadRootId, runtime) : null;
+    return chatCatalog(runtime, profile, m.model || "", chat);
   },
 
   // Buzz's session controls for one conversation (channel + thread root).
   async "session.state"(config, { pubkey, channelId, threadRootId }) {
     checkPubkey(pubkey);
     checkPlace(channelId, threadRootId);
-    await meta(pubkey);
-    const reply = await proxyControl(
-      pubkey,
-      { op: "state", channel: channelId, root: threadRootId || undefined },
-      5_000,
-      { state: "unavailable" },
-    ).catch(() => ({ state: "unavailable" }));
-    return { state: reply.state ?? "unavailable" };
+    const m = await meta(pubkey);
+    const { runtime } = settingsFrom(m);
+    const [reply, chat] = await Promise.all([
+      proxyControl(
+        pubkey,
+        { op: "state", channel: channelId, root: threadRootId || undefined },
+        5_000,
+        { state: "unavailable" },
+      ).catch(() => ({ state: "unavailable" })),
+      chatSettingsFor(pubkey, channelId, threadRootId, runtime),
+    ]);
+    return { state: reply.state ?? "unavailable", chat };
   },
   async "session.control"(config, { pubkey, channelId, threadRootId, action }) {
     checkPubkey(pubkey);
