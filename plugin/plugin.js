@@ -3391,8 +3391,14 @@ export function apply(ctx) {
       .call("catalog", { pubkey: agent.pubkey }, { timeoutMs: 180000 })
       .then((answer) => {
         const { models: value, ttlMs } = composerModels(answer);
-        if (catalogCache.get(key)?.pending === pending)
+        if (catalogCache.get(key)?.pending === pending) {
           catalogCache.set(key, { at: Date.now(), value, ttlMs });
+          // Other runtimes still being probed: have Buzz read again then.
+          if (ttlMs < CATALOG_TTL)
+            setTimeout(() => {
+              for (const listener of [...catalogNotify]) listener();
+            }, ttlMs + 100);
+        }
         return value;
       })
       .catch((error) => {

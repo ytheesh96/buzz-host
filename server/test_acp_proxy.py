@@ -792,6 +792,20 @@ class RuntimeSwitch(Base):
         self.p.handle_adapter_line(line({"jsonrpc": "2.0", "id": "n1",
                                          "result": {"sessionId": "s1", "configOptions": options()}}))
 
+        self.sent = []
+        self.p.send_adapter_raw = lambda data, runtime_id=None: self.sent.append(
+            (runtime_id or self.p.DEFAULT_RUNTIME, json.loads(data)))
+
+    def dispatch(self, raw):
+        """(runtime, message) a prompt goes to the adapter as, whether at once
+        or from its second pass off the input thread (spawn runs inline here)."""
+        before = len(self.sent)
+        rt, out = self.p.dispatch_client_line(raw)
+        if out is not None:
+            return rt, json.loads(out)
+        self.assertEqual(len(self.sent), before + 1, "handled again and sent")
+        return self.sent[-1]
+
     def chat(self):
         return self.p.load_settings().get(CHANNEL, {})
 
@@ -849,9 +863,9 @@ class RuntimeSwitch(Base):
         self.p.handle_adapter_line(line({"jsonrpc": "2.0", "id": "n2",
                                          "result": {"sessionId": "c9", "configOptions": codex_options()}}),
                                    adapter_runtime="codex")
-        rt, out = self.p.dispatch_client_line(prompt_meta("p2", "rt:codex:c9", [ev("go on", eid="f" * 64)]))
+        rt, out = self.dispatch(prompt_meta("p2", "rt:codex:c9", [ev("go on", eid="f" * 64)]))
         self.assertEqual(rt, "codex")
-        blocks = json.loads(out)["params"]["prompt"]
+        blocks = out["params"]["prompt"]
         self.assertTrue(blocks[0]["text"].startswith("<conversation-history>"))
         self.assertIn("moved from Claude Code to Codex", blocks[0]["text"])
         self.assertIn("owner: please fix the bug", blocks[0]["text"])
@@ -859,8 +873,8 @@ class RuntimeSwitch(Base):
         self.assertNotIn(": +", blocks[0]["text"], "reactions aren't history")
         self.assertEqual(blocks[1]["text"], "hello")
         self.assertNotIn("handoff", self.chat(), "handed over once")
-        _rt, out = self.p.dispatch_client_line(prompt_meta("p3", "rt:codex:c9", [ev("more", eid="9" * 64)]))
-        self.assertNotIn("conversation-history", out.decode())
+        _rt, out = self.dispatch(prompt_meta("p3", "rt:codex:c9", [ev("more", eid="9" * 64)]))
+        self.assertNotIn("conversation-history", json.dumps(out))
 
     def test_history_is_bounded_and_skips_this_turn(self):
         rows = [{"id": f"{i:064x}", "kind": 9, "created_at": 1795219000 + i, "pubkey": OTHER,
@@ -876,10 +890,10 @@ class RuntimeSwitch(Base):
         self.assertTrue(lines)
 
     def test_a_pick_on_another_runtime_moves_this_very_turn(self):
-        rt, out = self.p.dispatch_client_line(prompt_meta("p1", "s1", [ev(tags=[
+        rt, out = self.dispatch(prompt_meta("p1", "s1", [ev(tags=[
             ("model", AGENT, "codex::gpt-5-mini"), ("effort", AGENT, "high")])]))
         self.assertEqual(rt, "codex")
-        sent = json.loads(out)["params"]
+        sent = out["params"]
         self.assertEqual(sent["sessionId"], "c1")
         self.assertIn("<conversation-history>", sent["prompt"][0]["text"])
         new = [r for r in self.requests if r[1] == "session/new"]
@@ -912,7 +926,7 @@ class RuntimeSwitch(Base):
         self.assertEqual(self.p.conversation_state(CHANNEL, None), "idle")
 
         # A plain id is the agent's own runtime's: back to Claude.
-        rt, out = self.p.dispatch_client_line(prompt_meta("p2", "s1", [ev(eid="f" * 64, tags=[("model", AGENT, "opus")])]))
+        rt, out = self.dispatch(prompt_meta("p2", "s1", [ev(eid="f" * 64, tags=[("model", AGENT, "opus")])]))
         self.assertEqual(rt, "claude")
         self.assertNotIn("runtime", self.chat())
 
@@ -929,12 +943,30 @@ class RuntimeSwitch(Base):
         self.assertEqual(self.chat().get("runtime"), "codex")
         self.assertNotIn("model", self.chat())
 
-    def test_a_failed_switch_keeps_the_turn_on_the_old_runtime(self):
-        self.p.save_settings({CHANNEL: {"runtime": "codex"}})
+    def test_a_failed_switch_goes_back_and_keeps_the_turn_on_the_old_runtime(self):
         self.p.proxy_request = lambda *a, **k: {"error": {"code": -32000, "message": "Not logged in"}}
-        rt, _out = self.p.dispatch_client_line(prompt_meta("p1", "s1", [ev()]))
-        self.assertEqual(rt, "claude")
-        self.assertIn("Couldn't start a Codex session (Not logged in)", self.replies[-1])
+        rt, out = self.dispatch(prompt_meta("p1", "s1", [ev(tags=[("model", AGENT, "codex::gpt-5")])]))
+        self.assertEqual((rt, out["params"]["sessionId"]), ("claude", "s1"))
+        self.assertIn("Couldn't start a Codex session (Not logged in), so this chat stays on Claude Code",
+                      self.replies[-1])
+        self.assertEqual(self.chat(), {}, "runtime, model and handoff rolled back")
+        self.assertFalse(self.fresh_requested())
+        self.assertEqual(len(self.replies), 1, "no model fallback note")
+
+    def test_buzz_acps_new_session_failing_after_runtime_goes_back(self):
+        self.command("/runtime codex")
+        self.p.dispatch_client_line(session_new("n2", self.own))
+        self.p.handle_adapter_line(line({"jsonrpc": "2.0", "id": "n2", "error": {
+            "code": -32000, "message": "Authentication required"}}), adapter_runtime="codex")
+        self.assertIn("Couldn't start a Codex session (Authentication required)", self.replies[-1])
+        self.assertEqual(self.p.chat_runtime(CHANNEL), "claude")
+
+    def test_runtime_default_in_a_thread_clears_its_own(self):
+        key = f"{CHANNEL}_{ROOT}"
+        self.p.save_settings({CHANNEL: {"runtime": "codex"}, key: {"runtime": "hermes"}})
+        self.assertIn("Codex", self.p.set_runtime(["default"], "s1", key, "this thread"))
+        self.assertNotIn("runtime", self.p.load_settings()[key], "its own runtime is gone")
+        self.assertEqual(self.p.chat_runtime(key), "codex")
 
 
 if __name__ == "__main__":

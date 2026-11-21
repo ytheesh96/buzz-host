@@ -198,6 +198,7 @@ turn_notify = {}     # client request id -> {"channel", "root", "runtime"} for h
 # A chat that changes runtime mid-turn: buzz-acp's session -> the session this
 # proxy opened on the new runtime for that turn (and back). buzz-acp starts a
 # session of its own on the new runtime from the next message (fresh marker).
+redispatch = {}      # client request id -> {"switched"}: a turn handled again off the input thread
 aliases = {}         # buzz-acp sid -> proxy-opened ext sid
 alias_of = {}        # proxy-opened ext sid -> buzz-acp sid
 next_id = [0]
@@ -1134,6 +1135,65 @@ def take_runtime_pick(key, picks):
     return picks
 
 
+def own_picks(picks, runtime_id):
+    """This turn's picks for a session on `runtime_id`: a model picked on
+    another runtime isn't one."""
+    picks = dict(picks or {})
+    if picks.get("model"):
+        rt, model = split_pick(picks["model"])
+        if rt == runtime_id or PICK_RUNTIME_SEP not in picks["model"]:
+            picks["model"] = model
+        else:
+            picks.pop("model")
+    return picks
+
+
+def rollback_switch(key, runtime_id, from_rt, root, error):
+    """The chat's new runtime couldn't start a session (installed, but not
+    signed in): it goes back to `from_rt`, and the chat is told."""
+    if from_rt not in KNOWN_RUNTIMES:
+        from_rt = DEFAULT_RUNTIME
+    inherited = chat_runtime(key.split("_", 1)[0]) if "_" in key else DEFAULT_RUNTIME
+
+    def _mutate(entry):
+        if entry.get("runtime", inherited) != runtime_id:
+            return  # moved on meanwhile
+        entry.pop("handoff", None)
+        entry.pop("model", None)  # the new runtime's, if it came with the move
+        if from_rt == inherited:
+            entry.pop("runtime", None)
+        else:
+            entry["runtime"] = from_rt
+    if key and settings_file and chat_runtime(key) == runtime_id:
+        update_settings(key, _mutate)
+        if fresh_dir:
+            with contextlib.suppress(OSError):
+                os.remove(os.path.join(fresh_dir, key))
+    stays = runtime_title(chat_runtime(key)) if key else runtime_title(from_rt)
+    log(f"{key}: {runtime_id} couldn't start a session ({error}); back on {stays}")
+    spawn(reply, key.split("_", 1)[0], root or None,
+          f"Couldn't start a {runtime_title(runtime_id)} session ({error}), so this chat stays on {stays}.")
+
+
+def redo_turn(line, rid):
+    """Handle a session/prompt again off the input thread (see redispatch)."""
+    out, target_rt = None, DEFAULT_RUNTIME
+    try:
+        target_rt, out = dispatch_client_line(line)
+    except Exception as e:
+        log(f"handling a moved turn failed: {e}")
+        send_client({"jsonrpc": "2.0", "id": rid, "error": {"code": -32603, "message": str(e)}})
+    finally:
+        with lock:
+            redispatch.pop(rid, None)
+    if out is None:
+        return
+    try:
+        send_adapter_raw(out, runtime_id=target_rt)
+    except Exception as e:
+        _fail_secondary_dispatch(out, target_rt, str(e))
+
+
 def note_fallback(key, root, runtime_id, missed):
     """After a move to another runtime: a model or effort it doesn't offer
     goes (from the chat's settings too), and the chat is told."""
@@ -1407,7 +1467,9 @@ def set_runtime(args, sid, key, where):
         return (f"This is a worker chat the orchestrator runs on {runtime_title(current)}; "
                 "its runtime stays as it is.")
     name = args[0].lower()
-    new_rt = DEFAULT_RUNTIME if name == "default" else name
+    # `default` clears the chat's own runtime: a thread's goes back to its channel's.
+    inherited = chat_runtime(key.split("_", 1)[0]) if "_" in key else DEFAULT_RUNTIME
+    new_rt = inherited if name == "default" else name
     if new_rt not in KNOWN_RUNTIMES:
         return f"`{args[0]}` isn't a runtime. Options: {runtime_options()}."
     if not runtime_available(new_rt):
@@ -1884,6 +1946,7 @@ def dispatch_client_line(line):
         client_sid = params.get("sessionId")
         with lock:
             sid = aliases.get(client_sid, client_sid)
+            redo = redispatch.get(msg["id"])  # this turn's second pass (redo_turn)
         target_rt, real_sid = split_sid(sid)
         with lock:
             s = sessions.setdefault(sid, {})
@@ -1914,7 +1977,7 @@ def dispatch_client_line(line):
             s["last_used"] = time.monotonic()
         if turn and sid and key and sid == client_sid:
             save_session_chat(sid, key, target_rt)
-        command = command_of(last) if key else None
+        command = command_of(last) if key and not redo else None
         if command:
             event_id = last[0]
             # A top-level mention in a channel starts its own thread; settings
@@ -1942,25 +2005,43 @@ def dispatch_client_line(line):
         # A turn runs on its chat's runtime: after a /runtime batched with
         # this message, or a composer pick of a model on another runtime,
         # this proxy opens a session there for it (buzz-acp starts its own
-        # from the next message).
+        # from the next message). Opening one, and reading the history a
+        # session new to the runtime gets, can take a while: that turn is
+        # handled again on a thread of its own (redo), so the other chats'
+        # traffic keeps flowing.
         picks = picks_of(events)
-        switched = hydrated = False
+        hydrated = False
+        switched = bool(redo and redo.get("switched"))
         if key:
-            before_rt = chat_runtime(key)
-            try:
-                picks = take_runtime_pick(key, picks)
-            except Exception as e:
-                log(f"{key}: taking a runtime pick failed: {e}")
+            if redo:
+                picks = own_picks(picks, target_rt)  # take_runtime_pick ran
+            else:
+                before_rt = chat_runtime(key)
+                try:
+                    picks = take_runtime_pick(key, picks)
+                except Exception as e:
+                    log(f"{key}: taking a runtime pick failed: {e}")
+                switched = chat_runtime(key) != before_rt
             want_rt = chat_runtime(key)
-            switched = want_rt != before_rt
-            if want_rt != target_rt and runtime_available(want_rt):
+            needs_switch = want_rt != target_rt and runtime_available(want_rt)
+            with lock:
+                first_turn = not s.get("history_checked")
+                needs_history = bool(s.get("hydrate_from"))
+            needs_history = needs_history or (first_turn and want_rt == target_rt
+                                              and bool(wanted_for(key, load_settings()).get("handoff")))
+            if not redo and (needs_switch or needs_history):
+                with lock:
+                    redispatch[msg["id"]] = {"switched": switched}
+                spawn(redo_turn, line, msg["id"])
+                return None, None
+            if needs_switch:
                 try:
                     new_sid = open_runtime_session(client_sid, sid, key, want_rt)
                 except Exception as e:
                     log(f"{key}: opening a {want_rt} session failed: {e}")
-                    spawn(reply, key.split("_", 1)[0], root or None,
-                          f"Couldn't start a {runtime_title(want_rt)} session ({e}); "
-                          f"this message runs on {runtime_title(target_rt)}.")
+                    rollback_switch(key, want_rt, target_rt, root, e)
+                    switched = False
+                    picks = own_picks(picks, target_rt)
                 else:
                     sid = new_sid
                     target_rt, real_sid = split_sid(sid)
@@ -2124,6 +2205,13 @@ def handle_adapter_line(line, adapter_runtime=None):
                     err_msg = (err.get("data") or {}).get("details") if isinstance(err, dict) else None
                     if not err_msg and isinstance(err, dict):
                         err_msg = err.get("message")
+                    handoff = wanted_for(ws["key"], load_settings()).get("handoff") if settings_file else None
+                    if isinstance(handoff, dict) and new_rt != handoff.get("from"):
+                        # The chat just moved to a runtime that can't start
+                        # a session (not signed in): back where it was.
+                        spawn(rollback_switch, ws["key"], new_rt, handoff.get("from"),
+                              ws["key"].split("_", 1)[1] if "_" in ws["key"] else None,
+                              err_msg or "session/new failed")
                     spawn(notify_host, "_acp_turn_done", {
                         "channel": ws["key"].split("_", 1)[0],
                         "root": ws["key"].split("_", 1)[1] if "_" in ws["key"] else "",
