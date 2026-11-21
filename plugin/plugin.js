@@ -8,6 +8,37 @@
 
 export const inject = ["react", "agents", "settingsCards", "conversation"];
 
+// How long the composer keeps buzz-host's model list; while buzz-host is
+// still probing other runtimes, briefly, so their models show up soon.
+// Per-conversation entries are revalidated in the background after a short
+// interval so mid-chat /runtime, /model, /effort and composer switches reflect
+// quickly without showing a loading spinner.
+const CATALOG_TTL = 5 * 60_000;
+const CATALOG_RETRY_MS = 15_000;
+const CHAT_CATALOG_REFRESH_MS = 2_000;
+const CATALOG_CACHE_CAP = 200;
+
+/** Cache key for an agent's composer catalog, scoped to a conversation when Buzz supplies `place`. */
+export function catalogKey(pubkey, place) {
+  return place?.channelId ? `${pubkey}|${place.channelId}|${place.root ?? ""}` : pubkey;
+}
+
+/** RPC params for buzz-host's `catalog` method. */
+export function catalogParams(pubkey, place) {
+  return place?.channelId
+    ? { pubkey, channelId: place.channelId, threadRootId: place.root ?? null }
+    : { pubkey };
+}
+
+/** buzz-host's catalog answer as Buzz's `Models`, and how long to keep it.
+ * Models are the agent's own runtime's, then (grouped by runtime, ids
+ * "<runtime>::<model>") other signed-in runtimes'; a pick of one moves the
+ * chat to that runtime. With an older buzz-host, the answer as it is. */
+export function composerModels(answer) {
+  const { runtimesPending, ...models } = answer ?? {};
+  return { models, ttlMs: runtimesPending ? CATALOG_RETRY_MS : CATALOG_TTL };
+}
+
 const URL_KEY = "local.buzz-host.url";
 const DEFAULT_URL = "wss://omarchy.tail65c5a9.ts.net:8447";
 const RUNTIMES = [
@@ -3345,19 +3376,37 @@ export function apply(ctx) {
   // and `sessionControls`; stock Buzz refuses `models` on a hosted type, so
   // the type registers again without them there (see the register below).
 
-  // Buzz asks again whenever the agents a draft mentions change; buzz-host
-  // probes the runtime only when its own cache is empty or old.
+  // Buzz asks again whenever the agents a draft mentions (or its conversation
+  // place) change; buzz-host probes the runtime only when its own cache is
+  // empty or old.
   const catalogCache = new Map();
   const catalogNotify = new Set();
-  const CATALOG_TTL = 5 * 60_000;
-  function invalidateCatalog(pubkey) {
-    catalogCache.delete(pubkey);
+  function notifyCatalog() {
     for (const listener of [...catalogNotify]) listener();
+  }
+  function invalidateCatalog(pubkey, place) {
+    if (place?.channelId) {
+      catalogCache.delete(catalogKey(pubkey, place));
+    } else {
+      const prefix = `${pubkey}|`;
+      for (const k of [...catalogCache.keys()]) {
+        if (k === pubkey || k.startsWith(prefix)) catalogCache.delete(k);
+      }
+    }
+    notifyCatalog();
+  }
+  function setCatalogEntry(key, entry) {
+    catalogCache.delete(key);
+    catalogCache.set(key, entry);
+    if (catalogCache.size > CATALOG_CACHE_CAP) {
+      const oldest = catalogCache.keys().next().value;
+      if (oldest !== undefined) catalogCache.delete(oldest);
+    }
   }
   if (typeof ctx.agents.registerTab === "function") {
     // Hidden tab whose subscribe() bumps Buzz's agents snapshot so open
-    // composers re-read hostedModels() immediately after settings.set changes
-    // an agent's runtime, profile, or model on buzz-host.
+    // composers re-read hostedModels() immediately after settings.set or a
+    // per-chat runtime/model/effort switch on buzz-host.
     ctx.agents.registerTab({
       id: "catalog-sync",
       title: "Catalog sync",
@@ -3369,27 +3418,44 @@ export function apply(ctx) {
       },
     });
   }
-  function hostedModels(agent) {
-    const key = agent.pubkey;
+  function hostedModels(agent, place) {
+    const key = catalogKey(agent.pubkey, place);
     const hit = catalogCache.get(key);
-    if (hit?.value && Date.now() - hit.at < CATALOG_TTL) return hit.value;
+    const now = Date.now();
+    const fresh = Boolean(hit?.value && now - hit.at < hit.ttlMs);
+    const shouldRefresh =
+      fresh &&
+      Boolean(place?.channelId) &&
+      !hit.pending &&
+      now - (hit.checkedAt ?? hit.at) >= CHAT_CATALOG_REFRESH_MS;
+    if (fresh && !shouldRefresh) return hit.value;
     if (hit?.pending) return hit.value ?? hit.pending;
+    const prevValue = hit?.value;
     const pending = client
-      .call("catalog", { pubkey: agent.pubkey }, { timeoutMs: 180000 })
-      .then((value) => {
-        if (catalogCache.get(key)?.pending === pending)
-          catalogCache.set(key, { at: Date.now(), value });
+      .call("catalog", catalogParams(agent.pubkey, place), { timeoutMs: 180000 })
+      .then((answer) => {
+        const { models: value, ttlMs } = composerModels(answer);
+        if (catalogCache.get(key)?.pending === pending) {
+          const ts = Date.now();
+          setCatalogEntry(key, { at: ts, checkedAt: ts, value, ttlMs });
+          if (prevValue && JSON.stringify(prevValue) !== JSON.stringify(value)) {
+            notifyCatalog();
+          }
+          // Other runtimes still being probed: have Buzz read again then.
+          if (ttlMs < CATALOG_TTL) setTimeout(notifyCatalog, ttlMs + 100);
+        }
         return value;
       })
       .catch((error) => {
         if (catalogCache.get(key)?.pending === pending) {
-          if (hit?.value) catalogCache.set(key, hit);
+          if (prevValue)
+            setCatalogEntry(key, { at: hit.at, checkedAt: Date.now(), value: prevValue, ttlMs: hit.ttlMs });
           else catalogCache.delete(key);
         }
-        throw error;
+        if (!prevValue) throw error;
       });
-    catalogCache.set(key, { ...(hit ?? {}), pending });
-    return hit?.value ?? pending;
+    setCatalogEntry(key, { ...(hit ?? {}), pending });
+    return prevValue ?? pending;
   }
 
   // Buzz reads a conversation's session state synchronously and often: answer
@@ -3397,6 +3463,7 @@ export function apply(ctx) {
   // for the conversations Buzz is still reading (each notify makes it read).
   const hostedSessions = (() => {
     const known = new Map();
+    const knownChat = new Map();
     const asked = new Map();
     const listeners = new Set();
     let timer;
@@ -3412,6 +3479,20 @@ export function apply(ctx) {
           { pubkey: a.pubkey, channelId: a.channelId, threadRootId: a.root ?? null },
           { timeoutMs: 10000 },
         );
+        if (r?.chat && typeof r.chat === "object") {
+          const k = keyOf(a.pubkey, a);
+          const sig = JSON.stringify(r.chat);
+          const prev = knownChat.get(k);
+          knownChat.delete(k);
+          knownChat.set(k, sig);
+          if (knownChat.size > CATALOG_CACHE_CAP) {
+            const oldest = knownChat.keys().next().value;
+            if (oldest !== undefined) knownChat.delete(oldest);
+          }
+          if (prev !== undefined && prev !== sig) {
+            invalidateCatalog(a.pubkey, { channelId: a.channelId, root: a.root });
+          }
+        }
         return r?.state ?? "unavailable";
       } catch {
         return "unavailable";
@@ -3613,7 +3694,7 @@ export function apply(ctx) {
         h(
           Note,
           null,
-          "Agents of type Omarchy run on your server with buzz-host. Create them in Agents → New agent → Harness → Remote → Omarchy. In a chat, tag the agent with /model, /effort, /new, /stop, /status or /help to control that chat (or thread).",
+          "Agents of type Omarchy run on your server with buzz-host. Create them in Agents → New agent → Harness → Remote → Omarchy. In a chat, tag the agent with /model, /effort, /runtime, /new, /stop, /status or /help to control that chat (or thread). The composer's model picker also lists other runtimes' models; picking one moves the chat to that runtime.",
         ),
         h(
           Row,

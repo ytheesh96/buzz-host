@@ -3,7 +3,7 @@
 Loads the real acp-proxy script (as a module: its __main__ block doesn't run)
 with a temporary HOME, agent dir and adapter name, and drives its message
 handlers the way buzz-acp and the adapter would."""
-import importlib.machinery, importlib.util, json, os, shutil, sys, tempfile, unittest
+import importlib.machinery, importlib.util, json, os, shutil, sys, tempfile, time, unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CHANNEL = "123e4567-e89b-42d3-a456-426614174000"
@@ -743,6 +743,248 @@ class ParallelAndMultiRuntime(Base):
         # _is_orch_prompt ignores orchestrator-posted visible prompts when checking agent_posted.
         self.assertTrue(self.p._is_orch_prompt({"tags": [["h", CHANNEL], ["t", "buzz.orch.prompt"]]}))
         self.assertFalse(self.p._is_orch_prompt({"tags": [["h", CHANNEL]]}))
+
+
+def codex_options(model="gpt-5", effort="medium"):
+    return [
+        {"id": "model", "category": "model", "currentValue": model,
+         "options": [{"value": v, "name": v} for v in ("gpt-5", "gpt-5-mini")]},
+        {"id": "reasoning_effort", "category": "thought_level", "currentValue": effort,
+         "options": [{"value": v, "name": v} for v in ("low", "medium", "high")]},
+    ]
+
+
+class RuntimeSwitch(Base):
+    """/runtime and composer picks on another runtime: the chat moves there mid-chat."""
+
+    def setUp(self):
+        super().setUp()
+        self.p.agent_pubkey = AGENT
+        self.replies = []
+        self.p.reply = lambda channel, root, text: self.replies.append(text)
+        self.p.send_client = lambda obj: None
+        self.p.spawn = lambda fn, *args: fn(*args)
+        self.p.runtime_available = lambda rt: rt != "antigravity"
+        self.history = [
+            {"id": "1" * 64, "kind": 9, "created_at": 1795219000, "pubkey": OWNER, "content": "please fix the bug"},
+            {"id": "2" * 64, "kind": 9, "created_at": 1795219060, "pubkey": AGENT, "content": "fixed in abc123"},
+            {"id": "3" * 64, "kind": 7, "created_at": 1795219070, "pubkey": OWNER, "content": "+"},
+        ]
+        self.fetched = []
+        self.p.fetch_history = lambda key: (self.fetched.append(key), list(self.history))[1]
+        self.requests = []
+
+        def fake(method, params, timeout=20, runtime_id=None):
+            self.requests.append((runtime_id, method, params))
+            if method == "session/new":
+                return {"result": {"sessionId": "c1", "configOptions": codex_options()}}
+            sid = "rt:codex:" + params["sessionId"] if runtime_id == "codex" else params["sessionId"]
+            opts = self.p.sessions[sid]["options"]
+            for o in opts:
+                if o["id"] == params["configId"]:
+                    o["currentValue"] = params["value"]
+            return {"result": {"configOptions": opts}}
+        self.p.proxy_request = fake
+        req = line({"jsonrpc": "2.0", "id": "n1", "method": "session/new", "params": {
+            "cwd": self.own, "mcpServers": [{"name": "buzz", "command": "/bin/buzz-mcp", "env": []}],
+            "_meta": {"buzzHost": {"channelId": CHANNEL, "rootEventId": None}}}})
+        self.p.handle_client_line(req)
+        self.p.handle_adapter_line(line({"jsonrpc": "2.0", "id": "n1",
+                                         "result": {"sessionId": "s1", "configOptions": options()}}))
+
+        self.sent = []
+        self.p.send_adapter_raw = lambda data, runtime_id=None: self.sent.append(
+            (runtime_id or self.p.DEFAULT_RUNTIME, json.loads(data)))
+
+    def dispatch(self, raw):
+        """(runtime, message) a prompt goes to the adapter as, whether at once
+        or from its second pass off the input thread (spawn runs inline here)."""
+        before = len(self.sent)
+        rt, out = self.p.dispatch_client_line(raw)
+        if out is not None:
+            return rt, json.loads(out)
+        self.assertEqual(len(self.sent), before + 1, "handled again and sent")
+        return self.sent[-1]
+
+    def chat(self):
+        return self.p.load_settings().get(CHANNEL, {})
+
+    def fresh_requested(self):
+        return os.path.exists(os.path.join(self.home, "agent", "fresh", CHANNEL))
+
+    def command(self, text, rid="p1", eid="e" * 64):
+        before = len(self.replies)
+        self.assertIsNone(self.p.handle_client_line(prompt_meta(rid, "s1", [ev(text, eid=eid)])))
+        for _ in range(200):  # a lone command is answered on its own thread
+            if len(self.replies) > before:
+                break
+            time.sleep(0.01)
+        return self.replies[-1]
+
+    def test_runtime_command_lists_sets_and_clears(self):
+        self.p.save_settings({CHANNEL: {"model": "opus", "effort": "high"}})
+        listing = self.command("@haiku /runtime")
+        self.assertIn("Claude Code (`claude`, the agent's default)", listing)
+        self.assertIn("`antigravity` (not installed)", listing)
+        self.assertIn("isn't a runtime", self.command("/runtime nope", rid="p2"))
+        self.assertIn("isn't installed", self.command("/runtime antigravity", rid="p3"))
+        self.assertIn("already runs on Claude Code", self.command("/runtime claude", rid="p4"))
+        self.assertEqual(self.chat(), {"model": "opus", "effort": "high"}, "nothing changed so far")
+
+        text = self.command("/runtime codex", rid="p5")
+        self.assertIn("Runtime for this chat: Codex.", text)
+        self.assertIn("`opus`, `high` stayed with Claude Code", text)
+        chat = self.chat()
+        self.assertEqual(chat["runtime"], "codex")
+        self.assertEqual(chat["handoff"]["from"], "claude")
+        self.assertNotIn("model", chat)
+        self.assertTrue(self.fresh_requested())
+        self.assertEqual(self.p.chat_runtime(CHANNEL), "codex")
+
+        status = self.command("/status", rid="p6")
+        self.assertIn("Runtime: Codex (running: Claude Code)", status)
+
+        self.command("/runtime default", rid="p7")
+        self.assertNotIn("runtime", self.chat())
+        self.assertEqual(self.p.chat_runtime(CHANNEL), "claude")
+
+    def test_runtime_with_a_model_and_worker_chats(self):
+        text = self.command("/runtime codex gpt-5-mini")
+        self.assertIn("Model: `gpt-5-mini`", text)
+        self.assertEqual(self.chat()["model"], "gpt-5-mini")
+        self.p.save_settings({CHANNEL: {"runtime": "hermes", "noOrchestrate": True}})
+        self.assertIn("worker chat", self.command("/runtime codex", rid="p2"))
+        self.assertEqual(self.p.chat_runtime(CHANNEL), "hermes")
+
+    def test_next_session_on_the_new_runtime_gets_the_history_once(self):
+        self.command("/runtime codex")
+        rt, out = self.p.dispatch_client_line(session_new("n2", self.own))
+        self.assertEqual(rt, "codex")
+        self.p.handle_adapter_line(line({"jsonrpc": "2.0", "id": "n2",
+                                         "result": {"sessionId": "c9", "configOptions": codex_options()}}),
+                                   adapter_runtime="codex")
+        rt, out = self.dispatch(prompt_meta("p2", "rt:codex:c9", [ev("go on", eid="f" * 64)]))
+        self.assertEqual(rt, "codex")
+        blocks = out["params"]["prompt"]
+        self.assertTrue(blocks[0]["text"].startswith("<conversation-history>"))
+        self.assertIn("moved from Claude Code to Codex", blocks[0]["text"])
+        self.assertIn("owner: please fix the bug", blocks[0]["text"])
+        self.assertIn("you: fixed in abc123", blocks[0]["text"])
+        self.assertNotIn(": +", blocks[0]["text"], "reactions aren't history")
+        self.assertEqual(blocks[1]["text"], "hello")
+        self.assertNotIn("handoff", self.chat(), "handed over once")
+        _rt, out = self.dispatch(prompt_meta("p3", "rt:codex:c9", [ev("more", eid="9" * 64)]))
+        self.assertNotIn("conversation-history", json.dumps(out))
+
+    def test_history_is_bounded_and_skips_this_turn(self):
+        rows = [{"id": f"{i:064x}", "kind": 9, "created_at": 1795219000 + i, "pubkey": OTHER,
+                 "content": f"message {i}"} for i in range(40)]
+        lines = self.p.history_lines(rows, exclude={f"{39:064x}"})
+        self.assertEqual(len(lines), self.p.HISTORY_MESSAGES)
+        self.assertTrue(lines[-1].endswith("message 38"))
+        self.assertIn(f"{OTHER[:8]}…: message 9", lines[0])
+        big = [{"id": str(i), "kind": 9, "created_at": i, "pubkey": OWNER, "content": "x" * 5000} for i in range(30)]
+        lines = self.p.history_lines(big)
+        self.assertLessEqual(len("\n".join(lines).encode()), self.p.HISTORY_BYTES)
+        self.assertTrue(all(len(l) < self.p.HISTORY_ITEM_CHARS + 60 for l in lines))
+        self.assertTrue(lines)
+
+    def test_a_pick_on_another_runtime_moves_this_very_turn(self):
+        rt, out = self.dispatch(prompt_meta("p1", "s1", [ev(tags=[
+            ("model", AGENT, "codex::gpt-5-mini"), ("effort", AGENT, "high")])]))
+        self.assertEqual(rt, "codex")
+        sent = out["params"]
+        self.assertEqual(sent["sessionId"], "c1")
+        self.assertIn("<conversation-history>", sent["prompt"][0]["text"])
+        new = [r for r in self.requests if r[1] == "session/new"]
+        self.assertEqual(new[0][0], "codex")
+        self.assertEqual(new[0][2]["cwd"], self.own)
+        self.assertEqual(new[0][2]["mcpServers"][0]["env"], [{"name": "BUZZHOST_CHAT", "value": CHANNEL}])
+        self.assertEqual({o["id"]: o["currentValue"] for o in self.p.sessions["rt:codex:c1"]["options"]},
+                         {"model": "gpt-5-mini", "reasoning_effort": "high"})
+        chat = self.chat()
+        self.assertEqual((chat["runtime"], chat["model"]), ("codex", "gpt-5-mini"))
+        self.assertNotIn("effort", chat, "an effort pick runs one turn")
+        self.assertTrue(self.fresh_requested())
+        self.assertEqual(self.replies, [])
+
+        # Its updates and requests reach buzz-acp as its own session's.
+        upd = json.loads(self.p.handle_adapter_line(line({"jsonrpc": "2.0", "method": "session/update", "params": {
+            "sessionId": "c1", "update": {"sessionUpdate": "agent_message_chunk",
+                                          "content": {"type": "text", "text": "hi"}}}}), adapter_runtime="codex"))
+        self.assertEqual(upd["params"]["sessionId"], "s1")
+        req = json.loads(self.p.handle_adapter_line(line({"jsonrpc": "2.0", "id": 4, "method": "session/request_permission",
+                                                          "params": {"sessionId": "c1"}}), adapter_runtime="codex"))
+        self.assertEqual(req["params"]["sessionId"], "s1")
+        # buzz-acp's Stop for its session reaches the moved turn.
+        rt, out = self.p.dispatch_client_line(line({"jsonrpc": "2.0", "method": "session/cancel",
+                                                    "params": {"sessionId": "s1"}}))
+        self.assertEqual((rt, json.loads(out)["params"]["sessionId"]), ("codex", "c1"))
+        self.assertEqual(self.p.conversation_state(CHANNEL, None), "active")
+        self.p.handle_adapter_line(line({"jsonrpc": "2.0", "id": "p1", "result": {"stopReason": "end_turn"}}),
+                                   adapter_runtime="codex")
+        self.assertEqual(self.p.conversation_state(CHANNEL, None), "idle")
+
+        # A plain id is the agent's own runtime's: back to Claude.
+        rt, out = self.dispatch(prompt_meta("p2", "s1", [ev(eid="f" * 64, tags=[("model", AGENT, "opus")])]))
+        self.assertEqual(rt, "claude")
+        self.assertNotIn("runtime", self.chat())
+
+    def test_a_model_the_new_runtime_lacks_falls_back_and_says_so(self):
+        self.p.save_settings({CHANNEL: {"model": "opus"}})
+        self.p.handle_client_line(prompt_meta("p1", "s1", [ev("and go", eid="f" * 64), ev("/runtime codex")]))
+        self.assertEqual(self.chat()["runtime"], "codex")
+        self.assertIn("stayed with Claude Code", self.replies[0])
+        self.assertIn("rt:codex:c1", self.p.sessions, "the batched turn ran on Codex")
+
+    def test_a_picked_model_the_new_runtime_lacks_is_said_and_dropped(self):
+        self.p.handle_client_line(prompt_meta("p1", "s1", [ev(tags=[("model", AGENT, "codex::gpt-9")])]))
+        self.assertIn("model `gpt-9` isn't offered on Codex, so this chat uses Codex's default", self.replies[-1])
+        self.assertEqual(self.chat().get("runtime"), "codex")
+        self.assertNotIn("model", self.chat())
+
+    def test_a_failed_switch_goes_back_and_keeps_the_turn_on_the_old_runtime(self):
+        self.p.proxy_request = lambda *a, **k: {"error": {"code": -32000, "message": "Not logged in"}}
+        rt, out = self.dispatch(prompt_meta("p1", "s1", [ev(tags=[("model", AGENT, "codex::gpt-5")])]))
+        self.assertEqual((rt, out["params"]["sessionId"]), ("claude", "s1"))
+        self.assertIn("Couldn't start a Codex session (Not logged in), so this chat stays on Claude Code",
+                      self.replies[-1])
+        self.assertEqual(self.chat(), {}, "runtime, model and handoff rolled back")
+        self.assertFalse(self.fresh_requested())
+        self.assertEqual(len(self.replies), 1, "no model fallback note")
+
+    def test_buzz_acps_new_session_failing_after_runtime_goes_back(self):
+        self.command("/runtime codex")
+        self.p.dispatch_client_line(session_new("n2", self.own))
+        self.p.handle_adapter_line(line({"jsonrpc": "2.0", "id": "n2", "error": {
+            "code": -32000, "message": "Authentication required"}}), adapter_runtime="codex")
+        self.assertIn("Couldn't start a Codex session (Authentication required)", self.replies[-1])
+        self.assertEqual(self.p.chat_runtime(CHANNEL), "claude")
+
+    def test_runtime_default_in_a_thread_clears_its_own(self):
+        key = f"{CHANNEL}_{ROOT}"
+        self.p.save_settings({CHANNEL: {"runtime": "codex"}, key: {"runtime": "hermes"}})
+        self.assertIn("Codex", self.p.set_runtime(["default"], "s1", key, "this thread"))
+        self.assertNotIn("runtime", self.p.load_settings()[key], "its own runtime is gone")
+        self.assertEqual(self.p.chat_runtime(key), "codex")
+
+    def test_thread_switching_runtime_does_not_inherit_channel_model_or_effort(self):
+        key = f"{CHANNEL}_{ROOT}"
+        settings = {
+            CHANNEL: {"runtime": "antigravity", "model": "gemini-4-neon", "effort": "high", "workspace": ["/tmp"]},
+            key: {"runtime": "claude"},
+        }
+        got = self.p.wanted_for(key, settings)
+        self.assertEqual(got.get("runtime"), "claude")
+        self.assertNotIn("model", got)
+        self.assertNotIn("effort", got)
+        self.assertEqual(got.get("workspace"), ["/tmp"], "runtime-independent settings still inherit")
+        # Same runtime on channel and thread still inherits channel's model when only effort changes.
+        same_rt = {
+            CHANNEL: {"model": "opus", "effort": "high"},
+            key: {"effort": "low"},
+        }
+        self.assertEqual(self.p.wanted_for(key, same_rt), {"model": "opus", "effort": "low"})
 
 
 if __name__ == "__main__":
