@@ -8,6 +8,20 @@
 
 export const inject = ["react", "agents", "settingsCards", "conversation"];
 
+// How long the composer keeps buzz-host's model list; while buzz-host is
+// still probing other runtimes, briefly, so their models show up soon.
+const CATALOG_TTL = 5 * 60_000;
+const CATALOG_RETRY_MS = 15_000;
+
+/** buzz-host's catalog answer as Buzz's `Models`, and how long to keep it.
+ * Models are the agent's own runtime's, then (grouped by runtime, ids
+ * "<runtime>::<model>") other signed-in runtimes'; a pick of one moves the
+ * chat to that runtime. With an older buzz-host, the answer as it is. */
+export function composerModels(answer) {
+  const { runtimesPending, ...models } = answer ?? {};
+  return { models, ttlMs: runtimesPending ? CATALOG_RETRY_MS : CATALOG_TTL };
+}
+
 const URL_KEY = "local.buzz-host.url";
 const DEFAULT_URL = "wss://omarchy.tail65c5a9.ts.net:8447";
 const RUNTIMES = [
@@ -3349,7 +3363,6 @@ export function apply(ctx) {
   // probes the runtime only when its own cache is empty or old.
   const catalogCache = new Map();
   const catalogNotify = new Set();
-  const CATALOG_TTL = 5 * 60_000;
   function invalidateCatalog(pubkey) {
     catalogCache.delete(pubkey);
     for (const listener of [...catalogNotify]) listener();
@@ -3372,13 +3385,14 @@ export function apply(ctx) {
   function hostedModels(agent) {
     const key = agent.pubkey;
     const hit = catalogCache.get(key);
-    if (hit?.value && Date.now() - hit.at < CATALOG_TTL) return hit.value;
+    if (hit?.value && Date.now() - hit.at < hit.ttlMs) return hit.value;
     if (hit?.pending) return hit.value ?? hit.pending;
     const pending = client
       .call("catalog", { pubkey: agent.pubkey }, { timeoutMs: 180000 })
-      .then((value) => {
+      .then((answer) => {
+        const { models: value, ttlMs } = composerModels(answer);
         if (catalogCache.get(key)?.pending === pending)
-          catalogCache.set(key, { at: Date.now(), value });
+          catalogCache.set(key, { at: Date.now(), value, ttlMs });
         return value;
       })
       .catch((error) => {
@@ -3613,7 +3627,7 @@ export function apply(ctx) {
         h(
           Note,
           null,
-          "Agents of type Omarchy run on your server with buzz-host. Create them in Agents → New agent → Harness → Remote → Omarchy. In a chat, tag the agent with /model, /effort, /new, /stop, /status or /help to control that chat (or thread).",
+          "Agents of type Omarchy run on your server with buzz-host. Create them in Agents → New agent → Harness → Remote → Omarchy. In a chat, tag the agent with /model, /effort, /runtime, /new, /stop, /status or /help to control that chat (or thread). The composer's model picker also lists other runtimes' models; picking one moves the chat to that runtime.",
         ),
         h(
           Row,

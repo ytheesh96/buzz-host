@@ -22,7 +22,7 @@ import { createAttention } from "./attention.mjs";
 import { createMemory } from "./memory.mjs";
 import { createOrchestrator } from "./orchestrator.mjs";
 import { createRelayWatcher } from "./attention-relay.mjs";
-import { catalogs, toModels } from "./catalog.mjs";
+import { catalogs, toModels, withRuntimes } from "./catalog.mjs";
 import { proxyControl as routeControl } from "./control.mjs";
 import * as desktop from "./desktop/desktop.mjs";
 import { acquire as leaseAcquire, release as leaseRelease, publicView } from "./desktop/lease.mjs";
@@ -343,18 +343,45 @@ function checkName(name) {
 const PROBE_DIR = path.join(LIB, "probe");
 const catalog = catalogs({ dir: path.join(HOME, ".local/share/buzz-host/catalog") });
 
-async function runtimeCatalog(runtime, profile = "", configured = "") {
+async function runtimeCatalog(runtime, profile = "", configured = "", { wait = true } = {}) {
   if (!Object.hasOwn(RUNTIMES, runtime)) throw new Error("Unknown runtime");
   const home = runtime === "hermes" && profile ? hermesHome(profile) : "";
   await fs.mkdir(PROBE_DIR, { recursive: true });
-  const probed = await catalog(`${runtime}:${profile}`, {
-    command: RUNTIMES[runtime].command,
-    env: { ...process.env, ...(home ? { HERMES_HOME: home } : {}) },
-    cwd: PROBE_DIR,
-    // hermes-acp lists one set of levels (reasoning_effort) for every model.
-    perModel: runtime !== "hermes",
-  });
-  return toModels(probed, configured);
+  const probed = await catalog(
+    `${runtime}:${profile}`,
+    {
+      command: RUNTIMES[runtime].command,
+      env: { ...process.env, ...(home ? { HERMES_HOME: home } : {}) },
+      cwd: PROBE_DIR,
+      // hermes-acp lists one set of levels (reasoning_effort) for every model.
+      perModel: runtime !== "hermes",
+    },
+    { wait },
+  );
+  return probed && toModels(probed, configured);
+}
+
+const installed = (command) => fs.access(command, fs.constants.X_OK).then(() => true, () => false);
+
+/** The agent's own runtime's models, and every other installed runtime's
+ * that has answered a probe (one not signed in never does; it's left out).
+ * Only the agent's own is waited for: the others are probed in the
+ * background and join a later answer (`runtimesPending` until then). */
+async function chatCatalog(runtime, profile, configured) {
+  const own = await runtimeCatalog(runtime, profile, configured);
+  let pending = false;
+  const others = await Promise.all(
+    Object.entries(RUNTIMES)
+      .filter(([id]) => id !== runtime)
+      .map(async ([id, r]) => {
+        if (!(await installed(r.command))) return null;
+        const models = await runtimeCatalog(id, "", "", { wait: false }).catch(() => null);
+        if (models === undefined) pending = true;
+        return models?.models?.length ? { runtime: id, title: r.title, ...models } : null;
+      }),
+  );
+  const all = withRuntimes({ runtime, title: RUNTIMES[runtime].title, ...own }, others.filter(Boolean));
+  return pending ? { ...all, runtimesPending: true } : all;
 }
 
 function checkPlace(channelId, threadRootId) {
@@ -410,9 +437,7 @@ const methods = {
       Object.entries(RUNTIMES).map(async ([id, r]) => ({
         id,
         title: r.title,
-        available: await fs
-          .access(r.command, fs.constants.X_OK)
-          .then(() => true, () => false),
+        available: await installed(r.command),
       })),
     );
     return { version: VERSION, host: os.hostname(), runtimes };
@@ -697,12 +722,14 @@ const methods = {
   },
 
   // The models and effort levels Buzz's composer offers for this agent's next
-  // turn (Buzz's `Models`). acp-proxy applies a pick from the message tags.
+  // turn (Buzz's `Models`): its own runtime's, then other runtimes'
+  // ("codex::<id>"). acp-proxy applies a pick from the message tags; one on
+  // another runtime moves the chat there.
   async catalog(config, { pubkey }) {
     checkPubkey(pubkey);
     const m = await meta(pubkey);
     const { runtime, profile } = settingsFrom(m);
-    return runtimeCatalog(runtime, profile, m.model || "");
+    return chatCatalog(runtime, profile, m.model || "");
   },
 
   // Buzz's session controls for one conversation (channel + thread root).

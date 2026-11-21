@@ -6,6 +6,7 @@
 2. Chat commands from the agent's owner, answered without waking the model:
 
      @agent /model [<id>|default]    @agent /effort [<level>|default]
+     @agent /runtime [<name> [<model>]|default]
      @agent /new    @agent /stop     @agent /status    @agent /help
 
    The patched buzz-acp names each turn's chat (channel, and thread root for
@@ -20,10 +21,22 @@
    (BUZZ_ACP_FRESH_SESSION_DIR). The agent posts a short confirmation with the
    buzz CLI.
 
+   /runtime saves the chat's runtime (claude, codex, hermes, antigravity) in
+   chat-settings.json; the chat's model and effort, the old runtime's, go.
+   The next message starts a fresh session there (the fresh marker), and
+   that session's first turn gets the chat's recent Buzz messages
+   (<conversation-history>, bounded by count and bytes). A turn that must
+   run on the chat's new runtime while buzz-acp still holds the old session
+   (a /runtime batched with other messages, or a composer pick on another
+   runtime) runs in a session this proxy opens there (aliases). Worker chats
+   keep the runtime the orchestrator gave them.
+
    Buzz's composer picks: the owner's message can carry
    ["model", <this agent>, id] and ["effort", <this agent>, level] tags (the
    owner's patched Buzz offers model and effort for hosted agents). A pick
-   runs that turn only, ahead of the chat's /model and /effort; a turn
+   runs that turn only, ahead of the chat's /model and /effort, except a
+   model on another runtime ("codex::gpt-5"), which moves the chat there
+   with that model, as /runtime does; a turn
    without one goes back to those, else to what the session ran before this
    proxy changed it (model-restore.json keeps that across restarts).
 
@@ -71,7 +84,7 @@
 
 Everything else passes through byte for byte.
 """
-import atexit, contextlib, errno, json, os, re, shlex, signal, socket, subprocess, sys, threading, time
+import atexit, contextlib, copy, errno, json, os, re, shlex, signal, socket, subprocess, sys, threading, time
 
 CHANNEL_RE = re.compile(r"^Channel: .*\(#([0-9a-f-]{36})\)\s*$", re.M)
 THREAD_RE = re.compile(r"^Thread root: ([0-9a-f]{64})\s*$", re.M)
@@ -80,7 +93,7 @@ EVENT_RE = re.compile(
     r"Event ID: ([0-9a-f]{64})\n.*?^From: .*?hex: ([0-9a-f]{64})\).*?^Content: (.*?)\nTags: ",
     re.M | re.S)
 MENTION_RE = re.compile(r"^(?:\s*(?:@\S+|nostr:n(?:pub|profile)1[0-9a-z]+))+\s*")
-COMMANDS = {"model", "effort", "new", "stop", "status", "help", "workspace"}
+COMMANDS = {"model", "effort", "runtime", "new", "stop", "status", "help", "workspace"}
 MODEL_KEYS = {"model"}
 EFFORT_KEYS = {"thought_level", "effort", "reasoning_effort", "reasoning", "thinking"}
 
@@ -105,6 +118,19 @@ ADAPTER_TO_RUNTIME = {
 }
 DEFAULT_RUNTIME = ADAPTER_TO_RUNTIME.get(ADAPTER, ADAPTER)
 KNOWN_RUNTIMES = ("claude", "codex", "hermes", "antigravity")
+RUNTIME_TITLES = {"claude": "Claude Code", "codex": "Codex", "hermes": "Hermes", "antigravity": "Antigravity"}
+# A composer pick of a model on another runtime: "<runtime>::<model id>"
+# (catalog.mjs names other runtimes' models so).
+PICK_RUNTIME_SEP = "::"
+# Buzz history handed to a session that starts on a new runtime mid-chat.
+HISTORY_FETCH = 60        # messages asked of the relay
+HISTORY_MESSAGES = 30     # at most this many, newest kept
+HISTORY_BYTES = 24000     # and at most this many bytes of them
+HISTORY_ITEM_CHARS = 2000 # each message cut to this
+
+
+def runtime_title(rt):
+    return RUNTIME_TITLES.get(rt, rt)
 
 
 def runtime_starts_in_folder(rt_or_adapter):
@@ -169,6 +195,11 @@ pending_cfg = {}     # client request id -> (sid, method, params): buzz-acp's ow
 canvas_cache = {}    # channel -> (time, workspace.mjs result)
 turns = {}           # client request id -> a turn that may need its reply posted (reply fallback)
 turn_notify = {}     # client request id -> {"channel", "root", "runtime"} for host turn-done notifications
+# A chat that changes runtime mid-turn: buzz-acp's session -> the session this
+# proxy opened on the new runtime for that turn (and back). buzz-acp starts a
+# session of its own on the new runtime from the next message (fresh marker).
+aliases = {}         # buzz-acp sid -> proxy-opened ext sid
+alias_of = {}        # proxy-opened ext sid -> buzz-acp sid
 next_id = [0]
 REPLY_LIMIT = 30000  # characters of a fallback reply
 init_params_saved = None  # latest initialize params from buzz-acp, replayed to lazy secondary adapters
@@ -226,6 +257,17 @@ def resolve_adapter_spec(runtime_id):
             agy = os.path.expanduser("~/.local/share/mise/shims/agy")
         return [agy, "acp", "--dangerously-skip-permissions"], {}
     raise RuntimeError(f"Unknown runtime: {runtime_id}")
+
+
+def runtime_available(runtime_id):
+    """Whether this proxy can start `runtime_id` (its own runtime always)."""
+    if runtime_id == DEFAULT_RUNTIME:
+        return True
+    try:
+        argv, _env = resolve_adapter_spec(runtime_id)
+    except RuntimeError:
+        return False
+    return bool(argv) and os.path.isfile(argv[0]) and os.access(argv[0], os.X_OK)
 
 
 def send_adapter_raw(data, runtime_id=None):
@@ -539,6 +581,73 @@ def chat_runtime(key):
     return rt if rt in KNOWN_RUNTIMES else DEFAULT_RUNTIME
 
 
+def split_pick(value):
+    """(runtime, model) for a composer model pick: "codex::gpt-5" names its
+    runtime; a plain id is this agent's own runtime's."""
+    if isinstance(value, str) and PICK_RUNTIME_SEP in value:
+        rt, model = value.split(PICK_RUNTIME_SEP, 1)
+        if rt in KNOWN_RUNTIMES and model:
+            return rt, model
+    return DEFAULT_RUNTIME, value
+
+
+def request_fresh(*keys):
+    """Ask the patched buzz-acp to start these chats in a fresh session."""
+    if not fresh_dir:
+        return False
+    os.makedirs(fresh_dir, exist_ok=True)
+    for k in dict.fromkeys(k for k in keys if k):
+        open(os.path.join(fresh_dir, k), "w").close()
+    return True
+
+
+def switch_chat_runtime(key, runtime_id, model=None, from_rt=None):
+    """Make `runtime_id` the chat's runtime. The chat's model and effort were
+    the old runtime's, so they go (unless `model` names the new one's). The
+    next message starts a fresh session there, given the chat's recent
+    history (`handoff`). Returns the settings dropped, {kind: value}."""
+    dropped = {}
+    # A thread without a runtime of its own uses its channel's.
+    inherited = chat_runtime(key.split("_", 1)[0]) if "_" in key else DEFAULT_RUNTIME
+
+    def _mutate(entry):
+        for kind in ("model", "effort"):
+            if entry.get(kind):
+                dropped[kind] = entry.pop(kind)
+        if runtime_id == inherited:
+            entry.pop("runtime", None)
+        else:
+            entry["runtime"] = runtime_id
+        if model and model.lower() != "default":
+            entry["model"] = model
+            if dropped.get("model") == model:
+                dropped.pop("model")
+        if fresh_dir:
+            entry["handoff"] = {"from": from_rt or DEFAULT_RUNTIME, "at": int(time.time())}
+    update_settings(key, _mutate)
+    request_fresh(key)
+    log(f"{key}: runtime {from_rt} -> {runtime_id}" + (f" ({model})" if model else ""))
+    return dropped
+
+
+def take_handoff(key):
+    """The runtime a chat moved from, once: for the first turn of the session
+    it starts on its new runtime."""
+    found = {}
+
+    def _mutate(entry):
+        h = entry.pop("handoff", None)
+        if isinstance(h, dict) and not found:
+            found.update(h)
+    if not key or not settings_file:
+        return None
+    settings = load_settings()
+    for k in dict.fromkeys([key, key.split("_", 1)[0]]):
+        if isinstance(settings.get(k), dict) and "handoff" in settings[k]:
+            update_settings(k, _mutate)
+    return found.get("from") or None
+
+
 def load_restore():
     try:
         with open(restore_file) as f:
@@ -686,11 +795,13 @@ def apply_settings(sid, key, picks=None):
     """Put the session on this turn's model and effort: the owner's pick on
     the message, else the chat's /model and /effort, else what it ran before
     this proxy changed it (the agent's own). The model goes first: the
-    effort levels offered can change with it."""
+    effort levels offered can change with it. Returns what the session
+    doesn't offer, [(kind, value, source)]."""
     want = wanted_for(key, load_settings()) if key and settings_file else {}
     picks = picks or {}
     restore = restore_point(sid)
     rt, real_sid = split_sid(sid)
+    missed = []
     for kind, keyset in (("model", MODEL_KEYS), ("effort", EFFORT_KEYS)):
         with lock:
             options = list(sessions.get(sid, {}).get("options") or [])
@@ -711,6 +822,7 @@ def apply_settings(sid, key, picks=None):
             continue
         if value not in {v for v, _ in choices(opt)}:
             log(f"{key}: {kind} {value!r} ({source}) not offered; keeping {current!r}")
+            missed.append((kind, value, source))
             if source == "restore":
                 restore.pop(kind)
                 save_restore_point(sid, restore)
@@ -736,6 +848,7 @@ def apply_settings(sid, key, picks=None):
             log(f"{key}: {kind} -> {value} ({source})")
         else:
             log(f"{key}: setting {kind} failed: {resp and resp.get('error')}")
+    return missed
 
 
 # ---------- workspaces ----------
@@ -901,6 +1014,141 @@ def start_in_workspace(msg_id, params):
     with lock:
         pending_ws[msg_id] = {"key": key, "start": start, "home": home, "runtime": target_runtime}
     return target_runtime
+
+
+# ---------- runtime switching ----------
+
+def fetch_history(key):
+    """The chat's recent Buzz messages, oldest first (thread scope: its thread)."""
+    channel, _, root = key.partition("_")
+    args = ["buzz", "--format", "json", "messages"]
+    args += (["thread", "--channel", channel, "--event", root] if root
+             else ["get", "--channel", channel, "--limit", str(HISTORY_FETCH)])
+    r = subprocess.run(args, capture_output=True, text=True, timeout=30)
+    if r.returncode != 0:
+        raise RuntimeError((r.stderr or r.stdout).strip()[:300] or f"exit {r.returncode}")
+    items = json.loads(r.stdout or "[]")
+    if isinstance(items, dict):
+        items = items.get("messages") or items.get("events") or []
+    return sorted((e for e in items if isinstance(e, dict)), key=lambda e: e.get("created_at") or 0)
+
+
+def history_lines(rows, exclude=()):
+    """Bounded transcript lines: the newest HISTORY_MESSAGES, within HISTORY_BYTES."""
+    lines = []
+    for e in rows:
+        text = str(e.get("content") or "").strip()
+        if not text or e.get("id") in exclude or e.get("kind") not in (1, 9):  # messages, not reactions
+            continue
+        if len(text) > HISTORY_ITEM_CHARS:
+            text = text[:HISTORY_ITEM_CHARS].rstrip() + "…"
+        author = str(e.get("pubkey") or "").lower()
+        who = ("owner" if owner and author == owner
+               else "you" if agent_pubkey and author == agent_pubkey.lower()
+               else (author[:8] + "…") if author else "someone")
+        at = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(e.get("created_at") or 0))
+        lines.append(f"[{at}] {who}: {text}")
+    lines = lines[-HISTORY_MESSAGES:]
+    while lines and len("\n".join(lines).encode()) > HISTORY_BYTES:
+        lines.pop(0)
+    return lines
+
+
+def history_note(key, from_rt, to_rt, exclude=()):
+    """The chat's recent messages for a session that starts on a new runtime."""
+    try:
+        lines = history_lines(fetch_history(key), exclude)
+    except Exception as e:  # never block a turn on history
+        log(f"{key}: history for the runtime handoff failed: {e}")
+        return ""
+    if not lines:
+        return ""
+    return ("<conversation-history>\n"
+            f"This chat moved from {runtime_title(from_rt)} to {runtime_title(to_rt)}, so this session is new. "
+            "These are the chat's recent Buzz messages before this turn, oldest first (messages only, no tool "
+            "activity); carry on from them.\n\n" + "\n".join(lines) + "\n</conversation-history>")
+
+
+def open_runtime_session(client_sid, sid, key, runtime_id):
+    """Open a session on `runtime_id` for the chat buzz-acp's `client_sid`
+    serves (now running in `sid`), as buzz-acp's own session/new would (same
+    cwd and MCP servers, the chat's workspace), and route `client_sid`'s
+    turns there. Returns the new session id."""
+    with lock:
+        base = copy.deepcopy(sessions.get(sid, {}).get("base") or {})
+        from_rt = sessions.get(sid, {}).get("runtime") or split_sid(sid)[0]
+    channel, _, root = key.partition("_")
+    params = {"cwd": base.get("cwd") or os.getcwd(),  # agent-run starts us in the agent's folder
+              "mcpServers": base.get("mcpServers") or [],
+              "_meta": {"buzzHost": {"channelId": channel, "rootEventId": root or None}}}
+    with lock:
+        next_id[0] += 1
+        ws_id = f"buzz-host-ws-{next_id[0]}"
+    start_in_workspace(ws_id, params)
+    with lock:
+        ws = pending_ws.pop(ws_id, None)
+    resp = proxy_request("session/new", params, timeout=120, runtime_id=runtime_id)
+    result = (resp or {}).get("result") if isinstance(resp, dict) else None
+    if not isinstance(result, dict) or not result.get("sessionId"):
+        err = (resp or {}).get("error") if isinstance(resp, dict) else None
+        detail = ((err.get("data") or {}).get("details") or err.get("message")) if isinstance(err, dict) else None
+        raise RuntimeError(detail or "no answer from the runtime")
+    ext = join_sid(runtime_id, result["sessionId"])
+    with lock:
+        ns = sessions.setdefault(ext, {})
+        if ws:
+            ns.update(ws)
+        ns.update({"runtime": runtime_id, "options": result.get("configOptions") or [], "key": key,
+                   "base": base, "hydrate_from": from_rt})
+        old = aliases.pop(client_sid, None)
+        if old:
+            alias_of.pop(old, None)
+        if ext != client_sid:
+            aliases[client_sid] = ext
+            alias_of[ext] = client_sid
+    log(f"{key}: opened a {runtime_id} session for this turn ({ext})")
+    return ext
+
+
+def take_runtime_pick(key, picks):
+    """A composer pick of a model on another runtime ("codex::gpt-5") makes
+    that runtime and model the chat's own. Returns this turn's picks, with
+    the model id as its runtime knows it."""
+    value = (picks or {}).get("model")
+    if not value or not key:
+        return picks
+    rt, model = split_pick(value)
+    picks = dict(picks, model=model)
+    current = chat_runtime(key)
+    if rt == current:
+        return picks  # a pick on the chat's own runtime runs just this turn
+    if wanted_for(key, load_settings()).get("noOrchestrate"):
+        log(f"{key}: ignoring a pick on {rt}: a worker chat keeps its runtime")
+        picks.pop("model")
+        return picks
+    if not runtime_available(rt):
+        log(f"{key}: ignoring a pick on {rt}: not installed here")
+        picks.pop("model")
+        return picks
+    switch_chat_runtime(key, rt, model, current)
+    return picks
+
+
+def note_fallback(key, root, runtime_id, missed):
+    """After a move to another runtime: a model or effort it doesn't offer
+    goes (from the chat's settings too), and the chat is told."""
+    gone = [(kind, value) for kind, value, source in missed if source != "restore"]
+    if not gone:
+        return
+    def _drop(entry):  # a picked model on another runtime was saved too
+        for kind, value in gone:
+            if entry.get(kind) == value:
+                entry.pop(kind)
+    update_settings(key, _drop)
+    title = runtime_title(runtime_id)
+    spawn(reply, key.split("_", 1)[0], root or None,
+          " and ".join(f"{kind} `{value}`" for kind, value in gone)
+          + f" isn't offered on {title}, so this chat uses {title}'s default.")
 
 
 # ---------- chat commands ----------
@@ -1078,7 +1326,11 @@ def describe(sid, key):
     with lock:
         options = list(sessions.get(sid, {}).get("options") or [])
     want = wanted_for(key, load_settings())
-    lines = []
+    chosen_rt = chat_runtime(key)
+    with lock:
+        running_rt = sessions.get(sid, {}).get("runtime") or split_sid(sid)[0]
+    lines = [f"Runtime: {runtime_title(chosen_rt)}" + ("" if want.get("runtime") else " (agent default)")
+             + (f" (running: {runtime_title(running_rt)})" if running_rt != chosen_rt else "")]
     for kind, keyset in (("Model", MODEL_KEYS), ("Effort", EFFORT_KEYS)):
         opt = option_by(options, keyset)
         chosen = want.get(kind.lower())
@@ -1139,6 +1391,46 @@ def set_workspace(args, key, where):
     return text + " Applies from the next message."
 
 
+def runtime_options():
+    return ", ".join(f"`{r}`" + ("" if runtime_available(r) else " (not installed)") for r in KNOWN_RUNTIMES)
+
+
+def set_runtime(args, sid, key, where):
+    """/runtime [<name> [<model>]|default]: the runtime this chat runs on."""
+    want = wanted_for(key, load_settings())
+    current = chat_runtime(key)
+    if not args:
+        whose = "set for this chat" if want.get("runtime") else "the agent's default"
+        return (f"Runtime for {where}: {runtime_title(current)} (`{current}`, {whose}). "
+                f"Options: {runtime_options()}. Set with `/runtime <name> [<model>]` or `/runtime default`.")
+    if want.get("noOrchestrate"):
+        return (f"This is a worker chat the orchestrator runs on {runtime_title(current)}; "
+                "its runtime stays as it is.")
+    name = args[0].lower()
+    new_rt = DEFAULT_RUNTIME if name == "default" else name
+    if new_rt not in KNOWN_RUNTIMES:
+        return f"`{args[0]}` isn't a runtime. Options: {runtime_options()}."
+    if not runtime_available(new_rt):
+        return f"{runtime_title(new_rt)} isn't installed on {socket.gethostname()}. Nothing changed."
+    model = args[1] if len(args) > 1 else None
+    if new_rt == current:
+        if not model:
+            return f"{where[0].upper() + where[1:]} already runs on {runtime_title(current)}."
+        return run_command("model", [model], sid, key, None)
+    dropped = switch_chat_runtime(key, new_rt, model, current)
+    title = runtime_title(new_rt)
+    text = f"Runtime for {where}: {title}."
+    if model and model.lower() != "default":
+        text += f" Model: `{model}`."
+    elif dropped:
+        text += (f" Model and effort: {title}'s default ("
+                 + ", ".join(f"`{v}`" for v in dropped.values())
+                 + f" stayed with {runtime_title(current)}).")
+    if fresh_dir:
+        return text + f" The next message starts a fresh {title} session, given this chat's recent messages."
+    return text + " Applies from the next message."
+
+
 def provider_of(value):
     """'nous' for 'nous:anthropic/x'; 'custom:local' for 'custom:local:x' (Hermes ids)."""
     parts = value.split(":")
@@ -1167,11 +1459,15 @@ def run_command(cmd, args, sid, key, root):
     channel = key.split("_", 1)[0]
     where = "this thread" if "_" in key else "this chat"
     with lock:
+        sid = aliases.get(sid, sid)  # the session this chat's turns run in
         options = list(sessions.get(sid, {}).get("options") or [])
     if cmd in ("model", "effort"):
         keyset = MODEL_KEYS if cmd == "model" else EFFORT_KEYS
         opt = option_by(options, keyset)
-        offered = choices(opt)
+        with lock:
+            session_rt = sessions.get(sid, {}).get("runtime") or split_sid(sid)[0]
+        # Moved to another runtime, not yet started there: its list is unknown.
+        offered = choices(opt) if session_rt == chat_runtime(key) else []
         current = wanted_for(key, load_settings()).get(cmd) or "default"
         groups = by_provider(offered) if cmd == "model" else None
         if not args:
@@ -1204,6 +1500,8 @@ def run_command(cmd, args, sid, key, root):
                 final_val[0] = value
         update_settings(key, _apply)
         return f"{cmd.title()} for {where}: {final_val[0]}. Applies from the next message."
+    if cmd == "runtime":
+        return set_runtime(args, sid, key, where)
     if cmd == "workspace":
         if args:
             return set_workspace(args, key, where)
@@ -1240,7 +1538,9 @@ def run_command(cmd, args, sid, key, root):
         return f"Status for {where}: " + " · ".join(lines)
     return ("Commands (from the owner, applying to this chat or thread): "
             "`/model [<id>|default]`, `/effort [<level>|default]` (a model or effort picked in Buzz's "
-            "composer runs just that message), `/new` (fresh session next message), "
+            "composer runs just that message; one on another runtime moves the chat there), "
+            "`/runtime [<name> [<model>]|default]` (claude, codex, hermes, antigravity; the chat carries on "
+            "in a fresh session there, given its recent messages), `/new` (fresh session next message), "
             "`/stop` (stop the running turn), `/status`, "
             "`/workspace [<path>...|off|default]` (folders this chat works in; default: its Canvas's "
             "Buzz workspace folders; a change starts a fresh session).")
@@ -1532,11 +1832,14 @@ def dispatch_client_line(line):
         return DEFAULT_RUNTIME, (json.dumps(msg, separators=(",", ":")) + "\n").encode()
     if method in ("session/new", "session/load", "session/resume") and "id" in msg:
         sid = params.get("sessionId")
+        # What buzz-acp starts its sessions with, for one this proxy opens on
+        # another runtime when the chat moves there (open_runtime_session).
+        base = {"cwd": params.get("cwd"), "mcpServers": copy.deepcopy(params.get("mcpServers") or [])}
         if method == "session/new":
             has_meta = "buzzHost" in (params.get("_meta") or {})
             target_rt = start_in_workspace(msg["id"], params) if has_meta else DEFAULT_RUNTIME
             with lock:
-                pending_new[msg["id"]] = {"sid": sid, "runtime": target_rt}
+                pending_new[msg["id"]] = {"sid": sid, "runtime": target_rt, "base": base}
             if not has_meta:
                 return target_rt, line
             msg["params"] = params
@@ -1546,7 +1849,7 @@ def dispatch_client_line(line):
         if target_rt == DEFAULT_RUNTIME and sid:
             target_rt = session_runtime_for(sid)
         with lock:
-            pending_new[msg["id"]] = {"sid": sid, "runtime": target_rt}
+            pending_new[msg["id"]] = {"sid": sid, "runtime": target_rt, "base": base}
         changed = False
         if sid and real_sid != sid:
             params["sessionId"] = real_sid
@@ -1578,7 +1881,9 @@ def dispatch_client_line(line):
             return target_rt, (json.dumps(msg, separators=(",", ":")) + "\n").encode()
         return target_rt, line
     elif method == "session/prompt" and "id" in msg:
-        sid = params.get("sessionId")
+        client_sid = params.get("sessionId")
+        with lock:
+            sid = aliases.get(client_sid, client_sid)
         target_rt, real_sid = split_sid(sid)
         with lock:
             s = sessions.setdefault(sid, {})
@@ -1607,7 +1912,7 @@ def dispatch_client_line(line):
                 s["key"] = key
             key = s.get("key")
             s["last_used"] = time.monotonic()
-        if turn and sid and key:
+        if turn and sid and key and sid == client_sid:
             save_session_chat(sid, key, target_rt)
         command = command_of(last) if key else None
         if command:
@@ -1634,6 +1939,50 @@ def dispatch_client_line(line):
                 if HEX64_RE.match(author) and (not me or author != me):
                     record_turn_author(key, author, item.get("id", ""))
                     break
+        # A turn runs on its chat's runtime: after a /runtime batched with
+        # this message, or a composer pick of a model on another runtime,
+        # this proxy opens a session there for it (buzz-acp starts its own
+        # from the next message).
+        picks = picks_of(events)
+        switched = hydrated = False
+        if key:
+            before_rt = chat_runtime(key)
+            try:
+                picks = take_runtime_pick(key, picks)
+            except Exception as e:
+                log(f"{key}: taking a runtime pick failed: {e}")
+            want_rt = chat_runtime(key)
+            switched = want_rt != before_rt
+            if want_rt != target_rt and runtime_available(want_rt):
+                try:
+                    new_sid = open_runtime_session(client_sid, sid, key, want_rt)
+                except Exception as e:
+                    log(f"{key}: opening a {want_rt} session failed: {e}")
+                    spawn(reply, key.split("_", 1)[0], root or None,
+                          f"Couldn't start a {runtime_title(want_rt)} session ({e}); "
+                          f"this message runs on {runtime_title(target_rt)}.")
+                else:
+                    sid = new_sid
+                    target_rt, real_sid = split_sid(sid)
+                    with lock:
+                        s = sessions.setdefault(sid, {})
+                        s["last_used"] = time.monotonic()
+            # The first turn of a session on the chat's new runtime gets the
+            # chat's recent history.
+            with lock:
+                first_turn = not s.get("history_checked")
+                s["history_checked"] = True
+                hydrate_from = s.pop("hydrate_from", None)
+            if (not hydrate_from and first_turn and chat_runtime(key) == target_rt
+                    and wanted_for(key, load_settings()).get("handoff")):
+                hydrate_from = take_handoff(key)
+            if hydrate_from:
+                switched = True
+                note = history_note(key, hydrate_from, target_rt,
+                                    {str(e.get("id", "")) for e in events})
+                if note and isinstance(params.get("prompt"), list):
+                    params["prompt"] = [{"type": "text", "text": note}] + params["prompt"]
+                    hydrated = True
         is_worker_chat = bool(key and settings_file and wanted_for(key, load_settings()).get("noOrchestrate"))
         with lock:
             s["running"] = s.get("running", 0) + 1
@@ -1652,9 +2001,12 @@ def dispatch_client_line(line):
                     "runtime": target_rt,
                 }
         try:
-            apply_settings(sid, key, picks_of(events))
+            missed = apply_settings(sid, key, picks) or []
         except Exception as e:  # never block a turn on settings
             log(f"applying settings failed: {e}")
+            missed = []
+        if switched and key:
+            note_fallback(key, root, target_rt, missed)
         if key:
             cur_model, cur_effort = current_model_effort(sid)
             spawn(notify_host, "_acp_turn_start", {
@@ -1688,10 +2040,10 @@ def dispatch_client_line(line):
             extra.append(note)
         if extra and isinstance(params.get("prompt"), list):
             params["prompt"] += [{"type": "text", "text": t} for t in extra]
-        sid_changed = bool(sid and real_sid != sid)
+        sid_changed = bool(client_sid and real_sid != client_sid)
         if sid_changed:
             params["sessionId"] = real_sid
-        if extra or stripped or sid_changed:
+        if extra or stripped or sid_changed or hydrated:
             msg["params"] = params
             return target_rt, (json.dumps(msg, separators=(",", ":")) + "\n").encode()
         return target_rt, line
@@ -1707,7 +2059,8 @@ def dispatch_client_line(line):
         return target_rt, line
     elif isinstance(params, dict) and params.get("sessionId"):
         sid = params.get("sessionId")
-        target_rt, real_sid = split_sid(sid)
+        with lock:
+            target_rt, real_sid = split_sid(aliases.get(sid, sid))  # session/cancel follows a moved turn
         if sid and real_sid != sid:
             params["sessionId"] = real_sid
             msg["params"] = params
@@ -1757,9 +2110,11 @@ def handle_adapter_line(line, adapter_runtime=None):
                             o["currentValue"] = params.get("modelId")
             elif rid in pending_new:
                 info = pending_new.pop(rid)
+                base = None
                 if isinstance(info, dict):
                     orig_sid = info.get("sid")
                     new_rt = info.get("runtime") or rt
+                    base = info.get("base")
                 else:
                     orig_sid = info
                     new_rt = rt
@@ -1789,6 +2144,8 @@ def handle_adapter_line(line, adapter_runtime=None):
                     s = sessions.setdefault(ext_sid, {})
                     s["runtime"] = new_rt
                     s["options"] = (msg.get("result") or {}).get("configOptions") or s.get("options") or []
+                    if base and not err:
+                        s["base"] = base
                     if ws:
                         s.update(ws)
                         if ws.get("key"):
@@ -1840,6 +2197,11 @@ def handle_adapter_line(line, adapter_runtime=None):
         if raw_sid and ext_sid != raw_sid:
             p["sessionId"] = ext_sid
             rewritten = True
+        with lock:
+            client_sid = alias_of.get(ext_sid)
+        if client_sid:  # a turn this proxy moved to another runtime
+            p["sessionId"] = client_sid
+            rewritten = True
         upd = p.get("update") or {}
         with lock:
             s = sessions.setdefault(ext_sid, {})
@@ -1868,6 +2230,10 @@ def handle_adapter_line(line, adapter_runtime=None):
             rewritten = True
         with lock:
             compacting = bool(ext_sid and sessions.get(ext_sid, {}).get("compacting"))
+            client_sid = alias_of.get(ext_sid)
+        if client_sid and isinstance(p, dict):
+            p["sessionId"] = client_sid
+            rewritten = True
         if compacting:  # nothing in buzz-acp is waiting to answer it
             if rt == DEFAULT_RUNTIME:
                 send_adapter({"jsonrpc": "2.0", "id": rid,

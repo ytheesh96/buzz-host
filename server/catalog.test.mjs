@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { probe, toModels, catalogs, effortLabel } from "./catalog.mjs";
+import { probe, toModels, catalogs, effortLabel, withRuntimes } from "./catalog.mjs";
 
 // Temp dirs made by this file, removed when it finishes.
 const tmpDirs = [];
@@ -121,4 +121,56 @@ test("catalogs: cached on disk, refreshed in the background when old", async () 
   assert.deepEqual(await get("claude:", {}), { n: 2 }, "then refreshed");
   const failing = catalogs({ dir: path.join(dir, "x"), probeWith: async () => { throw new Error("login"); } });
   await assert.rejects(failing("codex:", {}), /login/);
+});
+
+test("withRuntimes: one submenu per runtime, other runtimes' ids prefixed", () => {
+  const own = { runtime: "claude", title: "Claude Code", current: "opus", models: [
+    { id: "opus", label: "Opus 5.5", efforts: [{ id: "high", label: "High" }] },
+  ] };
+  assert.deepEqual(withRuntimes(own, []), { current: "opus", models: own.models }, "alone: as it was");
+  const codex = { runtime: "codex", title: "Codex", current: "gpt-5", models: [
+    { id: "gpt-5", label: "GPT-5", efforts: [{ id: "low", label: "Low" }, { id: "xhigh", label: "Extra high" }] },
+    { id: "x".repeat(60), label: "too long once prefixed", efforts: [] },
+  ] };
+  const hermes = { runtime: "hermes", title: "Hermes", current: "go:flash", models: [
+    { id: "go:flash", label: "OpenCode Go · flash", group: "OpenCode Go", efforts: [] },
+  ] };
+  const { current, models } = withRuntimes(own, [codex, hermes]);
+  assert.equal(current, "opus", "the agent's own model, unprefixed");
+  assert.deepEqual(models.map((m) => [m.id, m.group, m.label]), [
+    ["opus", "Claude Code", "Claude Code · Opus 5.5"],
+    ["codex::gpt-5", "Codex", "Codex · GPT-5"],
+    ["hermes::go:flash", "Hermes · OpenCode Go", "Hermes · OpenCode Go · flash"],
+  ]);
+  assert.deepEqual(models[1].efforts.map((e) => e.id), ["low", "xhigh"], "efforts follow each model");
+});
+
+test("catalogs without waiting: nothing until a background probe answers; a failure backs off", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "catalogs-"));
+  tmpDirs.push(dir);
+  let release;
+  let calls = 0;
+  const get = catalogs({
+    dir,
+    retryMs: 40,
+    probeWith: (options) => {
+      calls++;
+      if (options.fail) return Promise.reject(new Error("not signed in"));
+      return new Promise((r) => (release = () => r({ ok: true })));
+    },
+  });
+  assert.equal(await get("codex:", {}, { wait: false }), undefined, "probing in the background");
+  assert.equal(await get("codex:", {}, { wait: false }), undefined);
+  assert.equal(calls, 1, "one probe at a time");
+  release();
+  await new Promise((r) => setTimeout(r, 5));
+  assert.deepEqual(await get("codex:", {}, { wait: false }), { ok: true });
+
+  assert.equal(await get("antigravity:", { fail: true }, { wait: false }), undefined);
+  await new Promise((r) => setTimeout(r, 5));
+  assert.equal(await get("antigravity:", { fail: true }, { wait: false }), null, "failed: left out");
+  assert.equal(calls, 2, "not asked again yet");
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(await get("antigravity:", { fail: true }, { wait: false }), undefined, "asked again later");
+  assert.equal(calls, 3);
 });

@@ -171,10 +171,41 @@ export function toModels(probed, configured = "") {
   return { current: PICKABLE.test(current) ? current : "", models };
 }
 
+/** A pick of another runtime's model names its runtime: "codex::gpt-5"
+ * (acp-proxy's split_pick). */
+export const RUNTIME_SEP = "::";
+
+/** The agent's own runtime's models (`own`: toModels plus {runtime, title})
+ * and other runtimes' (`others`, the same), as one `Models` for Buzz's
+ * composer: each runtime a submenu (Hermes: one per provider), other
+ * runtimes' ids prefixed with theirs. Without others, `own` as it is. */
+export function withRuntimes(own, others = []) {
+  const plain = { current: own.current, models: own.models };
+  if (!others.length) return plain;
+  const tag = (title, m) => ({
+    ...m,
+    label: `${title} · ${m.label}`,
+    group: m.group ? `${title} · ${m.group}` : title,
+  });
+  return {
+    current: own.current,
+    models: [
+      ...own.models.map((m) => tag(own.title, m)),
+      ...others.flatMap((o) =>
+        o.models
+          .map((m) => ({ ...tag(o.title, m), id: `${o.runtime}${RUNTIME_SEP}${m.id}` }))
+          .filter((m) => PICKABLE.test(m.id)),
+      ),
+    ],
+  };
+}
+
 /** Probes cached per runtime and Hermes profile in `dir`: an answer comes
  * from the cache when there is one, refreshed in the background once older
- * than `maxAgeMs`; the first probe is awaited. */
-export function catalogs({ dir, maxAgeMs = 6 * 3600_000, probeWith = probe }) {
+ * than `maxAgeMs`; the first probe is awaited, unless `{wait: false}`: then
+ * the answer is undefined while a background probe runs, and null for
+ * `retryMs` after one failed (a runtime not signed in). */
+export function catalogs({ dir, maxAgeMs = 6 * 3600_000, retryMs = 10 * 60_000, probeWith = probe }) {
   const live = new Map();
   const file = (key) => path.join(dir, `${key.replace(/[^A-Za-z0-9_.-]/g, "_")}.json`);
   const refresh = (key, options) => {
@@ -188,18 +219,26 @@ export function catalogs({ dir, maxAgeMs = 6 * 3600_000, probeWith = probe }) {
         return value;
       })
       .catch((error) => {
-        const kept = live.get(key);
-        if (kept) delete kept.pending;
+        const kept = live.get(key) ?? {};
+        delete kept.pending;
+        kept.failedAt = Date.now();
+        live.set(key, kept);
         throw error;
       });
     live.set(key, { ...(live.get(key) ?? {}), pending });
     return pending;
   };
-  return async function get(key, options) {
+  return async function get(key, options, { wait = true } = {}) {
     let record = live.get(key);
     if (!record?.value) {
       const saved = await fs.readFile(file(key), "utf8").then(JSON.parse, () => undefined);
       if (saved?.value) live.set(key, (record = { ...saved, ...(record?.pending ? { pending: record.pending } : {}) }));
+    }
+    if (!record?.value && !wait) {
+      if (record?.pending) return undefined;
+      if (Date.now() - (record?.failedAt ?? 0) < retryMs) return null;
+      refresh(key, options).catch(() => {});
+      return undefined;
     }
     if (!record?.value) return refresh(key, options);
     if (Date.now() - record.at > maxAgeMs) refresh(key, options).catch(() => {});
