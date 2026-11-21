@@ -18,16 +18,19 @@ const CATALOG_RETRY_MS = 15_000;
 const CHAT_CATALOG_REFRESH_MS = 2_000;
 const CATALOG_CACHE_CAP = 200;
 
-/** Cache key for an agent's composer catalog, scoped to a conversation when Buzz supplies `place`. */
-export function catalogKey(pubkey, place) {
-  return place?.channelId ? `${pubkey}|${place.channelId}|${place.root ?? ""}` : pubkey;
+/** Cache key for an agent's composer catalog, scoped to conversation and optional runtime preview. */
+export function catalogKey(pubkey, place, runtime) {
+  const base = place?.channelId ? `${pubkey}|${place.channelId}|${place.root ?? ""}` : pubkey;
+  return runtime ? `${base}|rt:${runtime}` : base;
 }
 
 /** RPC params for buzz-host's `catalog` method. */
-export function catalogParams(pubkey, place) {
-  return place?.channelId
-    ? { pubkey, channelId: place.channelId, threadRootId: place.root ?? null }
-    : { pubkey };
+export function catalogParams(pubkey, place, runtime) {
+  return {
+    pubkey,
+    ...(place?.channelId ? { channelId: place.channelId, threadRootId: place.root ?? null } : {}),
+    ...(runtime ? { runtime } : {}),
+  };
 }
 
 /** buzz-host's catalog answer as Buzz's `Models`, and how long to keep it.
@@ -3386,7 +3389,11 @@ export function apply(ctx) {
   }
   function invalidateCatalog(pubkey, place) {
     if (place?.channelId) {
-      catalogCache.delete(catalogKey(pubkey, place));
+      const base = catalogKey(pubkey, place);
+      const rtPrefix = `${base}|rt:`;
+      for (const k of [...catalogCache.keys()]) {
+        if (k === base || k.startsWith(rtPrefix)) catalogCache.delete(k);
+      }
     } else {
       const prefix = `${pubkey}|`;
       for (const k of [...catalogCache.keys()]) {
@@ -3418,8 +3425,8 @@ export function apply(ctx) {
       },
     });
   }
-  function hostedModels(agent, place) {
-    const key = catalogKey(agent.pubkey, place);
+  function hostedModels(agent, place, runtime) {
+    const key = catalogKey(agent.pubkey, place, runtime);
     const hit = catalogCache.get(key);
     const now = Date.now();
     const fresh = Boolean(hit?.value && now - hit.at < hit.ttlMs);
@@ -3432,7 +3439,7 @@ export function apply(ctx) {
     if (hit?.pending) return hit.value ?? hit.pending;
     const prevValue = hit?.value;
     const pending = client
-      .call("catalog", catalogParams(agent.pubkey, place), { timeoutMs: 180000 })
+      .call("catalog", catalogParams(agent.pubkey, place, runtime), { timeoutMs: 180000 })
       .then((answer) => {
         const { models: value, ttlMs } = composerModels(answer);
         if (catalogCache.get(key)?.pending === pending) {

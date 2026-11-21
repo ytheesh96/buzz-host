@@ -93,9 +93,11 @@ EVENT_RE = re.compile(
     r"Event ID: ([0-9a-f]{64})\n.*?^From: .*?hex: ([0-9a-f]{64})\).*?^Content: (.*?)\nTags: ",
     re.M | re.S)
 MENTION_RE = re.compile(r"^(?:\s*(?:@\S+|nostr:n(?:pub|profile)1[0-9a-z]+))+\s*")
-COMMANDS = {"model", "effort", "runtime", "new", "stop", "status", "help", "workspace"}
+COMMANDS = {"model", "effort", "runtime", "profile", "new", "stop", "status", "help", "workspace"}
 MODEL_KEYS = {"model"}
 EFFORT_KEYS = {"thought_level", "effort", "reasoning_effort", "reasoning", "thinking"}
+PROFILE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+HERMES_ROOT = os.path.expanduser("~/.hermes")
 
 agent_dir = os.environ.get("BUZZ_HOST_AGENT_DIR", "")
 settings_file = os.path.join(agent_dir, "chat-settings.json") if agent_dir else ""
@@ -129,22 +131,94 @@ HISTORY_BYTES = 24000     # and at most this many bytes of them
 HISTORY_ITEM_CHARS = 2000 # each message cut to this
 
 
+def hermes_home(profile=""):
+    return os.path.join(HERMES_ROOT, "profiles", profile) if profile else HERMES_ROOT
+
+
+def format_target(rt, profile=""):
+    rt = str(rt or "").strip().lower()
+    prof = str(profile or "").strip()
+    if rt == "hermes" and prof and prof.lower() != "default":
+        return f"hermes:{prof}"
+    return rt
+
+
+def parse_target(spec):
+    """Parse 'claude', 'hermes', 'hermes:default', or 'hermes:<profile>' into
+    (runtime, profile, canonical_target), or None when invalid."""
+    if not isinstance(spec, str):
+        return None
+    trimmed = spec.strip()
+    if not trimmed:
+        return None
+    if ":" in trimmed:
+        raw_rt, raw_prof = trimmed.split(":", 1)
+    else:
+        raw_rt, raw_prof = trimmed, ""
+    rt = raw_rt.strip().lower()
+    prof = raw_prof.strip()
+    if rt not in KNOWN_RUNTIMES:
+        return None
+    if rt != "hermes":
+        if prof:
+            return None
+        return rt, "", rt
+    if not prof or prof.lower() == "default":
+        return "hermes", "", "hermes"
+    if not PROFILE_RE.match(prof):
+        return None
+    return "hermes", prof, f"hermes:{prof}"
+
+
+def base_runtime(target_or_adapter):
+    parsed = parse_target(target_or_adapter) if isinstance(target_or_adapter, str) else None
+    return parsed[0] if parsed else target_or_adapter
+
+
+def _detect_default_profile():
+    if DEFAULT_RUNTIME != "hermes":
+        return ""
+    explicit = os.environ.get("BUZZ_HOST_HERMES_PROFILE", "").strip()
+    if explicit:
+        return "" if (explicit.lower() == "default" or not PROFILE_RE.match(explicit)) else explicit
+    hh = os.environ.get("HERMES_HOME", "").strip()
+    if hh:
+        norm = os.path.normpath(os.path.expanduser(hh))
+        prefix = os.path.normpath(os.path.join(HERMES_ROOT, "profiles")) + os.sep
+        if norm.startswith(prefix):
+            rest = norm[len(prefix):]
+            if os.sep not in rest and rest.lower() != "default" and PROFILE_RE.match(rest):
+                return rest
+    return ""
+
+
+DEFAULT_PROFILE = _detect_default_profile()
+DEFAULT_TARGET = format_target(DEFAULT_RUNTIME, DEFAULT_PROFILE) if DEFAULT_RUNTIME in KNOWN_RUNTIMES else DEFAULT_RUNTIME
+
+
 def runtime_title(rt):
+    parsed = parse_target(rt) if isinstance(rt, str) else None
+    if parsed:
+        base, prof, _ = parsed
+        if base == "hermes" and prof:
+            return f"Hermes ({prof})"
+        return RUNTIME_TITLES.get(base, base)
     return RUNTIME_TITLES.get(rt, rt)
 
 
 def runtime_starts_in_folder(rt_or_adapter):
-    return rt_or_adapter in ("claude", "codex", "antigravity", "claude-agent-acp", "codex-acp", "agy")
+    return base_runtime(rt_or_adapter) in ("claude", "codex", "antigravity", "claude-agent-acp", "codex-acp", "agy")
 
 
 def runtime_extra_dirs(rt_or_adapter):
-    return rt_or_adapter in ("claude", "antigravity", "claude-agent-acp", "agy")
+    return base_runtime(rt_or_adapter) in ("claude", "antigravity", "claude-agent-acp", "agy")
 
 
 def runtime_default_compact(rt_or_adapter):
-    if rt_or_adapter in ("hermes", "hermes-acp"):
+    b = base_runtime(rt_or_adapter)
+    if b in ("hermes", "hermes-acp"):
         return "compress"
-    if rt_or_adapter in ("claude", "codex", "antigravity", "claude-agent-acp", "codex-acp", "agy"):
+    if b in ("claude", "codex", "antigravity", "claude-agent-acp", "codex-acp", "agy"):
         return "compact"
     return None
 
@@ -216,43 +290,112 @@ def log(msg):
 
 
 def split_sid(ext_sid):
-    """Split a proxy session id into (runtime_id, adapter_session_id)."""
+    """Split a proxy session id into (target_id, adapter_session_id)."""
     if isinstance(ext_sid, str) and ext_sid.startswith("rt:"):
         parts = ext_sid.split(":", 2)
-        if len(parts) == 3 and parts[1] in KNOWN_RUNTIMES and parts[2]:
-            return parts[1], parts[2]
-    return DEFAULT_RUNTIME, ext_sid
+        if len(parts) == 3 and parts[2]:
+            tag = parts[1]
+            if tag in KNOWN_RUNTIMES:
+                return tag, parts[2]
+            if tag.startswith("hermes@"):
+                prof = tag[len("hermes@"):]
+                if prof and prof.lower() != "default" and PROFILE_RE.match(prof):
+                    return f"hermes:{prof}", parts[2]
+    return DEFAULT_TARGET, ext_sid
 
 
 def join_sid(runtime_id, real_sid):
     """Map an adapter session id to the external id buzz-acp sees."""
-    if not real_sid or not runtime_id or runtime_id == DEFAULT_RUNTIME:
+    if not real_sid or not runtime_id or runtime_id == DEFAULT_TARGET:
         return real_sid
-    return f"rt:{runtime_id}:{real_sid}"
+    parsed = parse_target(runtime_id)
+    if parsed and parsed[0] == "hermes" and parsed[1]:
+        tag = f"hermes@{parsed[1]}"
+    else:
+        tag = parsed[0] if parsed else runtime_id
+    return f"rt:{tag}:{real_sid}"
+
+
+def _adapter_overrides():
+    override = os.environ.get("BUZZ_HOST_ADAPTERS_JSON", "")
+    if not override:
+        return {}
+    try:
+        mapping = json.loads(override)
+        return mapping if isinstance(mapping, dict) else {}
+    except ValueError:
+        return {}
+
+
+def hermes_profiles():
+    """Named Hermes profiles available on this host (excluding 'default')."""
+    found = set()
+    profiles_dir = os.path.join(HERMES_ROOT, "profiles")
+    try:
+        for name in os.listdir(profiles_dir):
+            if name.startswith(".") or name.lower() == "default" or not PROFILE_RE.match(name):
+                continue
+            d = os.path.join(profiles_dir, name)
+            if os.path.isdir(d) and (
+                os.path.isfile(os.path.join(d, "profile.yaml"))
+                or os.path.isfile(os.path.join(d, "config.yaml"))
+            ):
+                found.add(name)
+    except OSError:
+        pass
+    for key in _adapter_overrides():
+        parsed = parse_target(key)
+        if parsed and parsed[0] == "hermes" and parsed[1]:
+            found.add(parsed[1])
+    if DEFAULT_RUNTIME == "hermes" and DEFAULT_PROFILE:
+        found.add(DEFAULT_PROFILE)
+    return sorted(found)
+
+
+def hermes_profile_exists(profile):
+    if not profile:
+        return True
+    if not PROFILE_RE.match(profile) or profile.lower() == "default":
+        return False
+    if f"hermes:{profile}" in _adapter_overrides():
+        return True
+    if DEFAULT_RUNTIME == "hermes" and profile == DEFAULT_PROFILE:
+        return True
+    d = hermes_home(profile)
+    return os.path.isdir(d) and (
+        os.path.isfile(os.path.join(d, "profile.yaml"))
+        or os.path.isfile(os.path.join(d, "config.yaml"))
+    )
 
 
 def resolve_adapter_spec(runtime_id):
-    """Return (argv, extra_env) for spawning `runtime_id` directly (without nesting acp-proxy)."""
-    override = os.environ.get("BUZZ_HOST_ADAPTERS_JSON", "")
-    if override:
-        try:
-            mapping = json.loads(override)
-            entry = mapping.get(runtime_id)
-            if isinstance(entry, list) and entry:
-                return [str(x) for x in entry], {}
-            if isinstance(entry, dict) and entry.get("cmd"):
-                return [str(x) for x in entry["cmd"]], dict(entry.get("env") or {})
-        except ValueError:
-            pass
-    if runtime_id == "claude":
+    """Return (argv, extra_env) for spawning `runtime_id` directly (without nesting acp-proxy).
+    A None value in extra_env removes that key from the child environment."""
+    parsed = parse_target(runtime_id)
+    if not parsed:
+        raise RuntimeError(f"Unknown runtime: {runtime_id}")
+    rt, profile, canonical = parsed
+    mapping = _adapter_overrides()
+    entry = mapping.get(canonical) if canonical in mapping else mapping.get(rt)
+    if entry is not None:
+        base_env = {}
+        if rt == "hermes":
+            base_env["HERMES_HOME"] = hermes_home(profile) if profile else None
+        if isinstance(entry, list) and entry:
+            return [str(x) for x in entry], base_env
+        if isinstance(entry, dict) and entry.get("cmd"):
+            base_env.update(dict(entry.get("env") or {}))
+            return [str(x) for x in entry["cmd"]], base_env
+    if rt == "claude":
         return [os.path.join(host_lib, "npm", "node_modules", ".bin", "claude-agent-acp")], {}
-    if runtime_id == "codex":
+    if rt == "codex":
         return [os.path.join(host_lib, "npm", "node_modules", ".bin", "codex-acp")], {}
-    if runtime_id == "hermes":
+    if rt == "hermes":
         return [os.path.expanduser("~/.local/bin/hermes-acp")], {
             "HERMES_ACP_SKIP_CONFIGURED_MCP": os.environ.get("HERMES_ACP_SKIP_CONFIGURED_MCP", "1"),
+            "HERMES_HOME": hermes_home(profile) if profile else None,
         }
-    if runtime_id == "antigravity":
+    if rt == "antigravity":
         agy = os.path.expanduser("~/.local/share/mise/installs/antigravity-cli/latest/agy")
         if not (os.path.isfile(agy) and os.access(agy, os.X_OK)):
             agy = os.path.expanduser("~/.local/share/mise/shims/agy")
@@ -261,19 +404,56 @@ def resolve_adapter_spec(runtime_id):
 
 
 def runtime_available(runtime_id):
-    """Whether this proxy can start `runtime_id` (its own runtime always)."""
-    if runtime_id == DEFAULT_RUNTIME:
+    """Whether this proxy can start `runtime_id` (its own target always)."""
+    parsed = parse_target(runtime_id)
+    if not parsed:
+        return False
+    rt, profile, canonical = parsed
+    if canonical == DEFAULT_TARGET:
         return True
+    if rt == "hermes" and profile and not hermes_profile_exists(profile):
+        return False
     try:
-        argv, _env = resolve_adapter_spec(runtime_id)
+        argv, _env = resolve_adapter_spec(canonical)
     except RuntimeError:
         return False
     return bool(argv) and os.path.isfile(argv[0]) and os.access(argv[0], os.X_OK)
 
 
+def ensure_hermes_profile(profile):
+    """Ask buzz-host to install/enable buzz-host-session-env in this Hermes profile
+    before spawning hermes-acp on demand."""
+    if not host_sock or not os.path.exists(host_sock):
+        return
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as c:
+            c.settimeout(60)
+            c.connect(host_sock)
+            c.sendall((json.dumps({
+                "pubkey": agent_pubkey or "",
+                "name": "_ensure_hermes_profile",
+                "args": {"profile": profile or ""},
+            }) + "\n").encode())
+            buf = b""
+            while b"\n" not in buf:
+                chunk = c.recv(4096)
+                if not chunk:
+                    break
+                buf += chunk
+        reply_obj = json.loads(buf.split(b"\n", 1)[0] or b"{}")
+        if reply_obj.get("error"):
+            err = str(reply_obj["error"])
+            if err.startswith("No tool "):
+                log(f"ensure_hermes_profile({profile or 'default'}): host lacks handler ({err})")
+                return
+            raise RuntimeError(err)
+    except OSError as e:
+        log(f"ensure_hermes_profile({profile or 'default'}) skipped: {e}")
+
+
 def send_adapter_raw(data, runtime_id=None):
-    rt = runtime_id or DEFAULT_RUNTIME
-    if rt == DEFAULT_RUNTIME:
+    rt = runtime_id or DEFAULT_TARGET
+    if rt == DEFAULT_TARGET:
         with to_adapter_lock:
             child.stdin.write(data)
             child.stdin.flush()
@@ -296,7 +476,7 @@ def send_client(obj):
 
 
 def proxy_request(method, params, timeout=20, runtime_id=None):
-    rt = runtime_id or DEFAULT_RUNTIME
+    rt = runtime_id or DEFAULT_TARGET
     with lock:
         next_id[0] += 1
         rid = f"buzz-host-{next_id[0]}"
@@ -330,31 +510,39 @@ def _reap_proc(proc):
 
 
 def ensure_adapter(runtime_id):
-    """Lazily spawn and ACP-v1 initialize a secondary runtime adapter."""
-    if runtime_id == DEFAULT_RUNTIME:
+    """Lazily spawn and ACP-v1 initialize a secondary runtime (or Hermes profile) adapter."""
+    parsed = parse_target(runtime_id)
+    canonical = parsed[2] if parsed else runtime_id
+    if canonical == DEFAULT_TARGET:
         return None
     with adapter_spawn_lock:
-        existing = adapters.get(runtime_id)
+        existing = adapters.get(canonical)
         if existing and existing["proc"].poll() is None and existing["ready"]:
             return existing
-        rt_lock = adapter_init_locks.setdefault(runtime_id, threading.Lock())
+        rt_lock = adapter_init_locks.setdefault(canonical, threading.Lock())
     with rt_lock:
-        existing = adapters.get(runtime_id)
+        existing = adapters.get(canonical)
         if existing and existing["proc"].poll() is None and existing["ready"]:
             return existing
-        argv, extra_env = resolve_adapter_spec(runtime_id)
+        if parsed and parsed[0] == "hermes":
+            ensure_hermes_profile(parsed[1])
+        argv, extra_env = resolve_adapter_spec(canonical)
         env = dict(os.environ)
-        env.update(extra_env)
+        for k, v in extra_env.items():
+            if v is None:
+                env.pop(k, None)
+            else:
+                env[k] = v
         proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0, env=env)
         ad = {
-            "runtime": runtime_id,
+            "runtime": canonical,
             "proc": proc,
             "lock": threading.Lock(),
             "ready": False,
         }
         with adapter_spawn_lock:
-            adapters[runtime_id] = ad
-        threading.Thread(target=pump_adapter_proc, args=(proc, runtime_id), daemon=True).start()
+            adapters[canonical] = ad
+        threading.Thread(target=pump_adapter_proc, args=(proc, canonical), daemon=True).start()
         params = dict(init_params_saved or {"protocolVersion": 1, "clientCapabilities": {}})
         params["protocolVersion"] = 1
         params.pop("info", None)
@@ -362,7 +550,7 @@ def ensure_adapter(runtime_id):
             next_id[0] += 1
             rid = f"buzz-host-{next_id[0]}"
             ev = threading.Event()
-            waiters[rid] = [ev, None, runtime_id]
+            waiters[rid] = [ev, None, canonical]
         try:
             with ad["lock"]:
                 proc.stdin.write((json.dumps({"jsonrpc": "2.0", "id": rid, "method": "initialize", "params": params},
@@ -372,23 +560,23 @@ def ensure_adapter(runtime_id):
             with lock:
                 waiters.pop(rid, None)
             with adapter_spawn_lock:
-                if adapters.get(runtime_id) is ad:
-                    adapters.pop(runtime_id, None)
+                if adapters.get(canonical) is ad:
+                    adapters.pop(canonical, None)
             _reap_proc(proc)
-            raise RuntimeError(f"{runtime_id} adapter failed during initialize: {e}") from e
+            raise RuntimeError(f"{canonical} adapter failed during initialize: {e}") from e
         ev.wait(60)
         with lock:
             entry = waiters.pop(rid, None)
             resp = entry[1] if entry else None
         if not resp or "error" in resp:
             with adapter_spawn_lock:
-                if adapters.get(runtime_id) is ad:
-                    adapters.pop(runtime_id, None)
+                if adapters.get(canonical) is ad:
+                    adapters.pop(canonical, None)
             _reap_proc(proc)
             err = (resp or {}).get("error") or {}
-            raise RuntimeError(err.get("message") or f"{runtime_id} adapter failed to initialize")
+            raise RuntimeError(err.get("message") or f"{canonical} adapter failed to initialize")
         ad["ready"] = True
-        log(f"started secondary adapter for runtime {runtime_id}")
+        log(f"started secondary adapter for runtime {canonical}")
         return ad
 
 
@@ -567,10 +755,41 @@ def update_settings(key, mutator):
     return update_json_locked(settings_file, _mutate)
 
 
+def _norm_profile(v):
+    s = str(v or "").strip()
+    if not s or s.lower() == "default" or not PROFILE_RE.match(s):
+        return ""
+    return s
+
+
+def _entry_target(raw, inherited):
+    if not isinstance(raw, dict):
+        return inherited
+    has_rt = isinstance(raw.get("runtime"), str) and raw["runtime"].strip() != ""
+    has_prof = "profile" in raw and isinstance(raw.get("profile"), str)
+    if not has_rt and not has_prof:
+        return inherited
+    if has_rt:
+        parsed = parse_target(raw["runtime"])
+        if not parsed:
+            return inherited
+        rt, prof, _ = parsed
+        if rt != "hermes":
+            return rt
+        if not prof and has_prof:
+            prof = _norm_profile(raw["profile"])
+        return format_target("hermes", prof)
+    inh = parse_target(inherited)
+    if not inh or inh[0] != "hermes":
+        return inherited
+    return format_target("hermes", _norm_profile(raw["profile"]))
+
+
 def wanted_for(key, settings):
     """A thread uses its channel's settings unless it has its own.
-    If the thread sets a different runtime than its channel, it does not
-    inherit the channel's model or effort (those belonged to the old runtime)."""
+    If the thread sets a different runtime or Hermes profile than its channel,
+    it does not inherit the channel's model or effort (those belonged to the
+    old runtime/profile)."""
     if "_" not in key:
         entry = settings.get(key)
         return dict(entry) if isinstance(entry, dict) else {}
@@ -578,31 +797,37 @@ def wanted_for(key, settings):
     own_raw = settings.get(key)
     base = dict(base_raw) if isinstance(base_raw, dict) else {}
     own = dict(own_raw) if isinstance(own_raw, dict) else {}
-    own_rt = str(own.get("runtime") or "").strip().lower()
-    base_rt = str(base.get("runtime") or "").strip().lower() or DEFAULT_RUNTIME
-    if own_rt in KNOWN_RUNTIMES and own_rt != base_rt:
+    base_target = _entry_target(base, DEFAULT_TARGET)
+    own_target = _entry_target(own, base_target)
+    if own_target != base_target:
         base.pop("model", None)
         base.pop("effort", None)
+        base.pop("profile", None)
     base.update(own)
     return base
 
 
 def chat_runtime(key):
-    """Configured runtime for `key` if valid, else DEFAULT_RUNTIME."""
+    """Configured canonical runtime target for `key` if valid, else DEFAULT_TARGET."""
     if not key or not settings_file:
-        return DEFAULT_RUNTIME
-    rt = str(wanted_for(key, load_settings()).get("runtime") or "").strip().lower()
-    return rt if rt in KNOWN_RUNTIMES else DEFAULT_RUNTIME
+        return DEFAULT_TARGET
+    settings = load_settings()
+    if "_" not in key:
+        return _entry_target(settings.get(key), DEFAULT_TARGET)
+    base_target = _entry_target(settings.get(key.split("_", 1)[0]), DEFAULT_TARGET)
+    return _entry_target(settings.get(key), base_target)
 
 
 def split_pick(value):
-    """(runtime, model) for a composer model pick: "codex::gpt-5" names its
-    runtime; a plain id is this agent's own runtime's."""
+    """(target_id, model) for a composer model pick: 'codex::gpt-5' or
+    'hermes:career-lead::go:flash' names its runtime/profile; a plain id is
+    this agent's own runtime/profile."""
     if isinstance(value, str) and PICK_RUNTIME_SEP in value:
-        rt, model = value.split(PICK_RUNTIME_SEP, 1)
-        if rt in KNOWN_RUNTIMES and model:
-            return rt, model
-    return DEFAULT_RUNTIME, value
+        rt_spec, model = value.split(PICK_RUNTIME_SEP, 1)
+        parsed = parse_target(rt_spec)
+        if parsed and model:
+            return parsed[2], model
+    return DEFAULT_TARGET, value
 
 
 def request_fresh(*keys):
@@ -616,31 +841,47 @@ def request_fresh(*keys):
 
 
 def switch_chat_runtime(key, runtime_id, model=None, from_rt=None):
-    """Make `runtime_id` the chat's runtime. The chat's model and effort were
-    the old runtime's, so they go (unless `model` names the new one's). The
-    next message starts a fresh session there, given the chat's recent
+    """Make `runtime_id` (canonical target, e.g. 'codex', 'hermes', or
+    'hermes:career-lead') the chat's runtime. The chat's model and effort were
+    the old runtime/profile's, so they go (unless `model` names the new one's).
+    The next message starts a fresh session there, given the chat's recent
     history (`handoff`). Returns the settings dropped, {kind: value}."""
+    parsed = parse_target(runtime_id)
+    if not parsed:
+        raise ValueError(f"Unknown runtime: {runtime_id}")
+    rt, profile, canonical = parsed
     dropped = {}
     # A thread without a runtime of its own uses its channel's.
-    inherited = chat_runtime(key.split("_", 1)[0]) if "_" in key else DEFAULT_RUNTIME
+    inherited = chat_runtime(key.split("_", 1)[0]) if "_" in key else DEFAULT_TARGET
+    inh_parsed = parse_target(inherited)
 
     def _mutate(entry):
         for kind in ("model", "effort"):
             if entry.get(kind):
                 dropped[kind] = entry.pop(kind)
-        if runtime_id == inherited:
+        if canonical == inherited:
             entry.pop("runtime", None)
+            entry.pop("profile", None)
         else:
-            entry["runtime"] = runtime_id
+            entry["runtime"] = rt
+            if rt == "hermes":
+                if profile:
+                    entry["profile"] = profile
+                elif inh_parsed and inh_parsed[0] == "hermes" and inh_parsed[1]:
+                    entry["profile"] = ""
+                else:
+                    entry.pop("profile", None)
+            else:
+                entry.pop("profile", None)
         if model and model.lower() != "default":
             entry["model"] = model
             if dropped.get("model") == model:
                 dropped.pop("model")
         if fresh_dir:
-            entry["handoff"] = {"from": from_rt or DEFAULT_RUNTIME, "at": int(time.time())}
+            entry["handoff"] = {"from": from_rt or DEFAULT_TARGET, "at": int(time.time())}
     update_settings(key, _mutate)
     request_fresh(key)
-    log(f"{key}: runtime {from_rt} -> {runtime_id}" + (f" ({model})" if model else ""))
+    log(f"{key}: runtime {from_rt} -> {canonical}" + (f" ({model})" if model else ""))
     return dropped
 
 
@@ -746,7 +987,7 @@ def save_session_chat(sid, key, runtime_id=None):
     try:
         def _mutate(data):
             prev = data.get(sid)
-            if isinstance(prev, dict) and prev.get("key") == key and prev.get("runtime", DEFAULT_RUNTIME) == rt:
+            if isinstance(prev, dict) and prev.get("key") == key and prev.get("runtime", DEFAULT_TARGET) == rt:
                 return None
             data[sid] = {"key": key, "runtime": rt, "at": int(time.time())}
             if len(data) > SESSION_CHATS_CAP:
@@ -773,23 +1014,27 @@ def session_chat_for(sid):
 
 def session_runtime_for(sid):
     rt, _ = split_sid(sid)
-    if rt != DEFAULT_RUNTIME:
+    if rt != DEFAULT_TARGET:
         return rt
     with lock:
         saved = sessions.get(sid, {}).get("runtime")
-    if saved in KNOWN_RUNTIMES:
-        return saved
+    parsed = parse_target(saved) if isinstance(saved, str) else None
+    if parsed:
+        return parsed[2]
     entry = load_session_chats().get(sid)
-    if isinstance(entry, dict) and entry.get("runtime") in KNOWN_RUNTIMES:
-        return entry["runtime"]
-    return DEFAULT_RUNTIME
+    if isinstance(entry, dict):
+        parsed_entry = parse_target(entry.get("runtime"))
+        if parsed_entry:
+            return parsed_entry[2]
+    return DEFAULT_TARGET
 
 
 def picks_of(events):
-    """{"model", "effort"} the owner picked for this agent in Buzz's composer:
-    tags ["model"|"effort", <this agent>, value] on the latest of the owner's
-    messages this turn answers. Their other messages, and anyone else's, are
-    not asked: only the owner is honoured, as Buzz does for local agents."""
+    """{"runtime", "model", "effort"} the owner picked for this agent in Buzz's
+    composer: tags ["runtime"|"model"|"effort", <this agent>, value] on the
+    latest of the owner's messages this turn answers. Their other messages, and
+    anyone else's, are not asked: only the owner is honoured, as Buzz does for
+    local agents."""
     me = agent_pubkey.lower()
     if not owner or not HEX64_RE.match(me):
         return {}
@@ -798,7 +1043,7 @@ def picks_of(events):
             continue
         found = {}
         for tag in ev.get("tags") or []:
-            if (isinstance(tag, list) and len(tag) >= 3 and tag[0] in ("model", "effort")
+            if (isinstance(tag, list) and len(tag) >= 3 and tag[0] in ("runtime", "model", "effort")
                     and str(tag[1]).lower() == me and isinstance(tag[2], str) and tag[2]):
                 found.setdefault(tag[0], tag[2])
         return found
@@ -843,7 +1088,7 @@ def apply_settings(sid, key, picks=None):
             continue
         req_params = {"sessionId": real_sid, "configId": option_id(opt), "value": value}
         resp = (proxy_request("session/set_config_option", req_params)
-                if rt == DEFAULT_RUNTIME
+                if rt == DEFAULT_TARGET
                 else proxy_request("session/set_config_option", req_params, runtime_id=rt))
         if resp and "result" in resp:
             new = (resp["result"] or {}).get("configOptions")
@@ -1000,10 +1245,10 @@ def start_in_workspace(msg_id, params):
     if isinstance(meta, dict) and not meta:
         params.pop("_meta")
     if not isinstance(conv, dict):
-        return DEFAULT_RUNTIME
+        return DEFAULT_TARGET
     channel, root = conv.get("channelId") or "", conv.get("rootEventId")
     if not UUID_RE.match(channel) or (root and not re.fullmatch(r"[0-9a-f]{64}", root)):
-        return DEFAULT_RUNTIME
+        return DEFAULT_TARGET
     key = f"{channel}_{root}" if root else channel
     target_runtime = chat_runtime(key)
     label_mcp(params, key)
@@ -1125,33 +1370,57 @@ def open_runtime_session(client_sid, sid, key, runtime_id):
 
 
 def take_runtime_pick(key, picks):
-    """A composer pick of a model on another runtime ("codex::gpt-5") makes
-    that runtime and model the chat's own. Returns this turn's picks, with
-    the model id as its runtime knows it."""
-    value = (picks or {}).get("model")
-    if not value or not key:
+    """Apply a composer runtime/profile pick: either an explicit `runtime` tag
+    ('claude', 'hermes', 'hermes:career-lead') with optional clean `model`, or a
+    legacy prefixed model pick ('codex::gpt-5'). Moves the chat when the target
+    differs from the chat's current runtime/profile. Returns this turn's picks
+    (with `runtime` removed and any `::` prefix stripped from `model`)."""
+    picks = dict(picks or {})
+    raw_rt = picks.pop("runtime", None)
+    raw_model = picks.get("model")
+    if not key or (not raw_rt and not raw_model):
         return picks
-    rt, model = split_pick(value)
-    picks = dict(picks, model=model)
+    if raw_rt is not None:
+        parsed = parse_target(raw_rt)
+        if not parsed:
+            log(f"{key}: ignoring unknown runtime pick {raw_rt!r}")
+            picks.pop("model", None)
+            return picks
+        rt = parsed[2]
+        model = raw_model
+        if isinstance(model, str) and PICK_RUNTIME_SEP in model:
+            m_rt, m_id = split_pick(model)
+            if m_rt == rt:
+                model = m_id
+                picks["model"] = model
+    else:
+        rt, model = split_pick(raw_model)
+        picks["model"] = model
     current = chat_runtime(key)
     if rt == current:
-        return picks  # a pick on the chat's own runtime runs just this turn
+        return picks  # a pick on the chat's own runtime/profile runs just this turn
     if wanted_for(key, load_settings()).get("noOrchestrate"):
         log(f"{key}: ignoring a pick on {rt}: a worker chat keeps its runtime")
-        picks.pop("model")
+        picks.pop("model", None)
         return picks
     if not runtime_available(rt):
-        log(f"{key}: ignoring a pick on {rt}: not installed here")
-        picks.pop("model")
+        log(f"{key}: ignoring a pick on {rt}: not installed or profile missing here")
+        picks.pop("model", None)
         return picks
     switch_chat_runtime(key, rt, model, current)
     return picks
 
 
 def own_picks(picks, runtime_id):
-    """This turn's picks for a session on `runtime_id`: a model picked on
-    another runtime isn't one."""
+    """This turn's picks for a session on `runtime_id`: a runtime or model
+    picked for another runtime/profile isn't one."""
     picks = dict(picks or {})
+    raw_rt = picks.pop("runtime", None)
+    if raw_rt is not None:
+        parsed = parse_target(raw_rt)
+        if not parsed or parsed[2] != runtime_id:
+            picks.pop("model", None)
+            return picks
     if picks.get("model"):
         rt, model = split_pick(picks["model"])
         if rt == runtime_id or PICK_RUNTIME_SEP not in picks["model"]:
@@ -1164,25 +1433,37 @@ def own_picks(picks, runtime_id):
 def rollback_switch(key, runtime_id, from_rt, root, error):
     """The chat's new runtime couldn't start a session (installed, but not
     signed in): it goes back to `from_rt`, and the chat is told."""
-    if from_rt not in KNOWN_RUNTIMES:
-        from_rt = DEFAULT_RUNTIME
-    inherited = chat_runtime(key.split("_", 1)[0]) if "_" in key else DEFAULT_RUNTIME
+    from_parsed = parse_target(from_rt) if isinstance(from_rt, str) else None
+    from_target = from_parsed[2] if from_parsed else DEFAULT_TARGET
+    from_base, from_prof, _ = parse_target(from_target) or (DEFAULT_RUNTIME, DEFAULT_PROFILE, DEFAULT_TARGET)
+    inherited = chat_runtime(key.split("_", 1)[0]) if "_" in key else DEFAULT_TARGET
+    inh_parsed = parse_target(inherited)
 
     def _mutate(entry):
-        if entry.get("runtime", inherited) != runtime_id:
+        if _entry_target(entry, inherited) != runtime_id:
             return  # moved on meanwhile
         entry.pop("handoff", None)
         entry.pop("model", None)  # the new runtime's, if it came with the move
-        if from_rt == inherited:
+        if from_target == inherited:
             entry.pop("runtime", None)
+            entry.pop("profile", None)
         else:
-            entry["runtime"] = from_rt
+            entry["runtime"] = from_base
+            if from_base == "hermes":
+                if from_prof:
+                    entry["profile"] = from_prof
+                elif inh_parsed and inh_parsed[0] == "hermes" and inh_parsed[1]:
+                    entry["profile"] = ""
+                else:
+                    entry.pop("profile", None)
+            else:
+                entry.pop("profile", None)
     if key and settings_file and chat_runtime(key) == runtime_id:
         update_settings(key, _mutate)
         if fresh_dir:
             with contextlib.suppress(OSError):
                 os.remove(os.path.join(fresh_dir, key))
-    stays = runtime_title(chat_runtime(key)) if key else runtime_title(from_rt)
+    stays = runtime_title(chat_runtime(key)) if key else runtime_title(from_target)
     log(f"{key}: {runtime_id} couldn't start a session ({error}); back on {stays}")
     spawn(reply, key.split("_", 1)[0], root or None,
           f"Couldn't start a {runtime_title(runtime_id)} session ({error}), so this chat stays on {stays}.")
@@ -1190,7 +1471,7 @@ def rollback_switch(key, runtime_id, from_rt, root, error):
 
 def redo_turn(line, rid):
     """Handle a session/prompt again off the input thread (see redispatch)."""
-    out, target_rt = None, DEFAULT_RUNTIME
+    out, target_rt = None, DEFAULT_TARGET
     try:
         target_rt, out = dispatch_client_line(line)
     except Exception as e:
@@ -1402,7 +1683,8 @@ def describe(sid, key):
     chosen_rt = chat_runtime(key)
     with lock:
         running_rt = sessions.get(sid, {}).get("runtime") or split_sid(sid)[0]
-    lines = [f"Runtime: {runtime_title(chosen_rt)}" + ("" if want.get("runtime") else " (agent default)")
+    has_custom_rt = bool(want.get("runtime") or "profile" in want)
+    lines = [f"Runtime: {runtime_title(chosen_rt)}" + ("" if has_custom_rt else " (agent default)")
              + (f" (running: {runtime_title(running_rt)})" if running_rt != chosen_rt else "")]
     for kind, keyset in (("Model", MODEL_KEYS), ("Effort", EFFORT_KEYS)):
         opt = option_by(options, keyset)
@@ -1465,27 +1747,45 @@ def set_workspace(args, key, where):
 
 
 def runtime_options():
-    return ", ".join(f"`{r}`" + ("" if runtime_available(r) else " (not installed)") for r in KNOWN_RUNTIMES)
+    items = []
+    for r in KNOWN_RUNTIMES:
+        if r == "hermes":
+            avail = runtime_available("hermes")
+            items.append("`hermes`" + ("" if avail else " (not installed)"))
+            if avail:
+                for p in hermes_profiles():
+                    items.append(f"`hermes:{p}`")
+        else:
+            items.append(f"`{r}`" + ("" if runtime_available(r) else " (not installed)"))
+    return ", ".join(items)
 
 
 def set_runtime(args, sid, key, where):
-    """/runtime [<name> [<model>]|default]: the runtime this chat runs on."""
+    """/runtime [<name> [<model>]|default]: the runtime (or Hermes profile) this chat runs on."""
     want = wanted_for(key, load_settings())
     current = chat_runtime(key)
     if not args:
-        whose = "set for this chat" if want.get("runtime") else "the agent's default"
+        whose = "set for this chat" if (want.get("runtime") or "profile" in want) else "the agent's default"
         return (f"Runtime for {where}: {runtime_title(current)} (`{current}`, {whose}). "
                 f"Options: {runtime_options()}. Set with `/runtime <name> [<model>]` or `/runtime default`.")
     if want.get("noOrchestrate"):
         return (f"This is a worker chat the orchestrator runs on {runtime_title(current)}; "
                 "its runtime stays as it is.")
-    name = args[0].lower()
+    raw = args[0].strip()
     # `default` clears the chat's own runtime: a thread's goes back to its channel's.
-    inherited = chat_runtime(key.split("_", 1)[0]) if "_" in key else DEFAULT_RUNTIME
-    new_rt = inherited if name == "default" else name
-    if new_rt not in KNOWN_RUNTIMES:
-        return f"`{args[0]}` isn't a runtime. Options: {runtime_options()}."
+    inherited = chat_runtime(key.split("_", 1)[0]) if "_" in key else DEFAULT_TARGET
+    if raw.lower() == "default":
+        new_rt = inherited
+    else:
+        parsed = parse_target(raw)
+        if not parsed:
+            return f"`{args[0]}` isn't a runtime. Options: {runtime_options()}."
+        new_rt = parsed[2]
     if not runtime_available(new_rt):
+        p = parse_target(new_rt)
+        if p and p[0] == "hermes" and p[1] and not hermes_profile_exists(p[1]):
+            profs = ", ".join(["`default`"] + [f"`{x}`" for x in hermes_profiles()])
+            return f"Hermes profile `{p[1]}` doesn't exist on {socket.gethostname()}. Profiles: {profs}. Nothing changed."
         return f"{runtime_title(new_rt)} isn't installed on {socket.gethostname()}. Nothing changed."
     model = args[1] if len(args) > 1 else None
     if new_rt == current:
@@ -1504,6 +1804,24 @@ def set_runtime(args, sid, key, where):
     if fresh_dir:
         return text + f" The next message starts a fresh {title} session, given this chat's recent messages."
     return text + " Applies from the next message."
+
+
+def set_profile(args, sid, key, where):
+    """/profile [<name>|default]: switch this chat to a Hermes profile."""
+    profs = ["default"] + hermes_profiles()
+    if not args:
+        current = chat_runtime(key)
+        parsed = parse_target(current)
+        listing = ", ".join(f"`{p}`" for p in profs)
+        if parsed and parsed[0] == "hermes":
+            active_prof = parsed[1] or "default"
+            return (f"Hermes profile for {where}: `{active_prof}`. "
+                    f"Profiles: {listing}. Switch with `/profile <name>` or `/profile default`.")
+        return (f"{where[0].upper() + where[1:]} currently runs on {runtime_title(current)}. "
+                f"Hermes profiles: {listing}. Switch to one with `/profile <name>`.")
+    name = args[0].strip()
+    target = "hermes" if name.lower() == "default" else f"hermes:{name}"
+    return set_runtime([target] + args[1:], sid, key, where)
 
 
 def provider_of(value):
@@ -1577,6 +1895,8 @@ def run_command(cmd, args, sid, key, root):
         return f"{cmd.title()} for {where}: {final_val[0]}. Applies from the next message."
     if cmd == "runtime":
         return set_runtime(args, sid, key, where)
+    if cmd == "profile":
+        return set_profile(args, sid, key, where)
     if cmd == "workspace":
         if args:
             return set_workspace(args, key, where)
@@ -1594,7 +1914,7 @@ def run_command(cmd, args, sid, key, root):
             running = [s for s, st in sessions.items() if in_scope(st.get("key"), key) and st.get("running", 0) > 0]
         for s in running:
             rt, real_sid = split_sid(s)
-            if rt == DEFAULT_RUNTIME:
+            if rt == DEFAULT_TARGET:
                 send_adapter({"jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": real_sid}})
             else:
                 send_adapter({"jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": real_sid}}, runtime_id=rt)
@@ -1613,9 +1933,10 @@ def run_command(cmd, args, sid, key, root):
         return f"Status for {where}: " + " · ".join(lines)
     return ("Commands (from the owner, applying to this chat or thread): "
             "`/model [<id>|default]`, `/effort [<level>|default]` (a model or effort picked in Buzz's "
-            "composer runs just that message; one on another runtime moves the chat there), "
-            "`/runtime [<name> [<model>]|default]` (claude, codex, hermes, antigravity; the chat carries on "
-            "in a fresh session there, given its recent messages), `/new` (fresh session next message), "
+            "composer runs just that message; switching runtime/profile moves the chat there), "
+            "`/runtime [<name> [<model>]|default]` (claude, codex, hermes, hermes:<profile>, antigravity; "
+            "the chat carries on in a fresh session there, given its recent messages), "
+            "`/profile [<name>|default]` (switch to a Hermes profile), `/new` (fresh session next message), "
             "`/stop` (stop the running turn), `/status`, "
             "`/workspace [<path>...|off|default]` (folders this chat works in; default: its Canvas's "
             "Buzz workspace folders; a change starts a fresh session).")
@@ -1649,7 +1970,7 @@ def cancel_conversation(channel, root, match_all=False):
             targets = (running(f"{channel}_{root}") if root else []) or running(channel)
     for sid in targets:
         rt, real_sid = split_sid(sid)
-        if rt == DEFAULT_RUNTIME:
+        if rt == DEFAULT_TARGET:
             send_adapter({"jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": real_sid}})
         else:
             send_adapter({"jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": real_sid}}, runtime_id=rt)
@@ -1717,7 +2038,7 @@ def end_compaction(sid):
         try:
             rt, out = dispatch_client_line(raw)
             if out is not None:
-                if rt == DEFAULT_RUNTIME:
+                if rt == DEFAULT_TARGET:
                     send_adapter_raw(out)
                 else:
                     send_adapter_raw(out, runtime_id=rt)
@@ -1749,7 +2070,7 @@ def compact_conversation(channel, root):
     try:
         req = {"sessionId": real_sid, "prompt": [{"type": "text", "text": f"/{name}"}]}
         resp = (proxy_request("session/prompt", req, timeout=COMPACT_TIMEOUT)
-                if rt == DEFAULT_RUNTIME
+                if rt == DEFAULT_TARGET
                 else proxy_request("session/prompt", req, timeout=COMPACT_TIMEOUT, runtime_id=rt))
     finally:
         end_compaction(sid)
@@ -1887,7 +2208,7 @@ def dispatch_client_line(line):
     try:
         msg = json.loads(line)
     except ValueError:
-        return DEFAULT_RUNTIME, line
+        return DEFAULT_TARGET, line
     method = msg.get("method")
     # Client response to a secondary adapter's JSON-RPC request (e.g. session/request_permission).
     if not method and "id" in msg:
@@ -1897,14 +2218,14 @@ def dispatch_client_line(line):
             target_rt, orig_rid = mapped
             msg["id"] = orig_rid
             return target_rt, (json.dumps(msg, separators=(",", ":")) + "\n").encode()
-        return DEFAULT_RUNTIME, line
+        return DEFAULT_TARGET, line
     params = msg.get("params") or {}
     if method == "initialize":
         params["protocolVersion"] = 1
         params.pop("info", None)
         init_params_saved = dict(params)
         msg["params"] = params
-        return DEFAULT_RUNTIME, (json.dumps(msg, separators=(",", ":")) + "\n").encode()
+        return DEFAULT_TARGET, (json.dumps(msg, separators=(",", ":")) + "\n").encode()
     if method in ("session/new", "session/load", "session/resume") and "id" in msg:
         sid = params.get("sessionId")
         # What buzz-acp starts its sessions with, for one this proxy opens on
@@ -1912,7 +2233,7 @@ def dispatch_client_line(line):
         base = {"cwd": params.get("cwd"), "mcpServers": copy.deepcopy(params.get("mcpServers") or [])}
         if method == "session/new":
             has_meta = "buzzHost" in (params.get("_meta") or {})
-            target_rt = start_in_workspace(msg["id"], params) if has_meta else DEFAULT_RUNTIME
+            target_rt = start_in_workspace(msg["id"], params) if has_meta else DEFAULT_TARGET
             with lock:
                 pending_new[msg["id"]] = {"sid": sid, "runtime": target_rt, "base": base}
             if not has_meta:
@@ -1921,7 +2242,7 @@ def dispatch_client_line(line):
             return target_rt, (json.dumps(msg, separators=(",", ":")) + "\n").encode()
         # session/load or session/resume
         target_rt, real_sid = split_sid(sid)
-        if target_rt == DEFAULT_RUNTIME and sid:
+        if target_rt == DEFAULT_TARGET and sid:
             target_rt = session_runtime_for(sid)
         with lock:
             pending_new[msg["id"]] = {"sid": sid, "runtime": target_rt, "base": base}
@@ -1963,10 +2284,10 @@ def dispatch_client_line(line):
         target_rt, real_sid = split_sid(sid)
         with lock:
             s = sessions.setdefault(sid, {})
-            if target_rt != DEFAULT_RUNTIME:
+            if target_rt != DEFAULT_TARGET:
                 s["runtime"] = target_rt
-            elif s.get("runtime") in KNOWN_RUNTIMES:
-                target_rt = s["runtime"]
+            elif parse_target(s.get("runtime")):
+                target_rt = parse_target(s["runtime"])[2]
             # Compacting: it runs once the compaction ends (end_compaction).
             if s.get("compacting"):
                 s.setdefault("held", []).append(line)
@@ -2160,7 +2481,7 @@ def dispatch_client_line(line):
             msg["params"] = params
             return target_rt, (json.dumps(msg, separators=(",", ":")) + "\n").encode()
         return target_rt, line
-    return DEFAULT_RUNTIME, line
+    return DEFAULT_TARGET, line
 
 
 def handle_client_line(line):
@@ -2170,7 +2491,7 @@ def handle_client_line(line):
 
 def handle_adapter_line(line, adapter_runtime=None):
     """adapter -> buzz-acp. Returns None to swallow."""
-    rt = adapter_runtime or DEFAULT_RUNTIME
+    rt = adapter_runtime or DEFAULT_TARGET
     try:
         msg = json.loads(line)
     except ValueError:
@@ -2336,14 +2657,14 @@ def handle_adapter_line(line, adapter_runtime=None):
             p["sessionId"] = client_sid
             rewritten = True
         if compacting:  # nothing in buzz-acp is waiting to answer it
-            if rt == DEFAULT_RUNTIME:
+            if rt == DEFAULT_TARGET:
                 send_adapter({"jsonrpc": "2.0", "id": rid,
                               "error": {"code": -32603, "message": "The session is compacting"}})
             else:
                 send_adapter({"jsonrpc": "2.0", "id": rid,
                               "error": {"code": -32603, "message": "The session is compacting"}}, runtime_id=rt)
             return None
-        if rt != DEFAULT_RUNTIME:
+        if rt != DEFAULT_TARGET:
             with lock:
                 next_id[0] += 1
                 ext_rid = f"buzz-req-{next_id[0]}"
@@ -2361,16 +2682,16 @@ def pump_client():
         if out is None:
             continue
         try:
-            if target_rt == DEFAULT_RUNTIME:
+            if target_rt == DEFAULT_TARGET:
                 send_adapter_raw(out)
             else:
                 send_adapter_raw(out, runtime_id=target_rt)
         except BrokenPipeError:
-            if target_rt == DEFAULT_RUNTIME:
+            if target_rt == DEFAULT_TARGET:
                 break
             _fail_secondary_dispatch(line, target_rt, "Secondary runtime adapter closed stdin")
         except Exception as e:
-            if target_rt == DEFAULT_RUNTIME:
+            if target_rt == DEFAULT_TARGET:
                 break
             _fail_secondary_dispatch(line, target_rt, str(e))
     try:
@@ -2443,7 +2764,7 @@ def _fail_adapter_exit(adapter_runtime, exit_code):
                 pending_adapter_req.pop(ext_rid, None)
         # Fail pending session/new, session/load, session/resume for this runtime.
         for rid, info in list(pending_new.items()):
-            rt_item = info.get("runtime") if isinstance(info, dict) else DEFAULT_RUNTIME
+            rt_item = info.get("runtime") if isinstance(info, dict) else DEFAULT_TARGET
             if rt_item == adapter_runtime:
                 pending_new.pop(rid, None)
                 ws = pending_ws.pop(rid, None)
@@ -2505,7 +2826,7 @@ def pump_adapter_proc(proc, adapter_runtime):
             with to_client_lock:
                 sys.stdout.buffer.write(out)
                 sys.stdout.buffer.flush()
-    if adapter_runtime != DEFAULT_RUNTIME:
+    if adapter_runtime != DEFAULT_TARGET:
         try:
             exit_code = proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
@@ -2521,7 +2842,7 @@ def pump_adapter_proc(proc, adapter_runtime):
 
 
 def pump_adapter():
-    pump_adapter_proc(child, DEFAULT_RUNTIME)
+    pump_adapter_proc(child, DEFAULT_TARGET)
 
 
 if __name__ == "__main__":

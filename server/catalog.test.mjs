@@ -4,7 +4,17 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { probe, toModels, catalogs, effortLabel, withRuntimes, resolveChatSettings } from "./catalog.mjs";
+import {
+  probe,
+  toModels,
+  catalogs,
+  effortLabel,
+  withRuntimes,
+  resolveChatSettings,
+  forComposer,
+  formatTarget,
+  parseTarget,
+} from "./catalog.mjs";
 
 // Temp dirs made by this file, removed when it finishes.
 const tmpDirs = [];
@@ -130,7 +140,7 @@ test("withRuntimes: one submenu per runtime, other runtimes' ids prefixed", () =
   assert.deepEqual(withRuntimes(own, []), { current: "opus", models: own.models }, "alone: as it was");
   const codex = { runtime: "codex", title: "Codex", current: "gpt-5", models: [
     { id: "gpt-5", label: "GPT-5", efforts: [{ id: "low", label: "Low" }, { id: "xhigh", label: "Extra high" }] },
-    { id: "x".repeat(60), label: "too long once prefixed", efforts: [] },
+    { id: "x".repeat(125), label: "too long once prefixed", efforts: [] },
   ] };
   const hermes = { runtime: "hermes", title: "Hermes", current: "go:flash", models: [
     { id: "go:flash", label: "OpenCode Go · flash", group: "OpenCode Go", efforts: [] },
@@ -175,7 +185,7 @@ test("catalogs without waiting: nothing until a background probe answers; a fail
   assert.equal(calls, 3);
 });
 
-test("resolveChatSettings: thread inherits channel unless it switches runtime", () => {
+test("resolveChatSettings: thread inherits channel unless it switches runtime or Hermes profile", () => {
   const known = new Set(["claude", "codex", "hermes", "antigravity"]);
   const ch = "61ace2b8-1160-44c8-ad2b-6efd96b816af";
   const th = "a".repeat(64);
@@ -183,6 +193,8 @@ test("resolveChatSettings: thread inherits channel unless it switches runtime", 
 
   assert.deepEqual(resolveChatSettings({}, ch, th, "claude", known), {
     runtime: "claude",
+    profile: "",
+    target: "claude",
     model: "",
     effort: "",
   });
@@ -191,6 +203,8 @@ test("resolveChatSettings: thread inherits channel unless it switches runtime", 
   const chSettings = { [ch]: { runtime: "antigravity", model: "gemini-4-neon", effort: "high" } };
   assert.deepEqual(resolveChatSettings(chSettings, ch, th, "claude", known), {
     runtime: "antigravity",
+    profile: "",
+    target: "antigravity",
     model: "gemini-4-neon",
     effort: "high",
   });
@@ -198,13 +212,13 @@ test("resolveChatSettings: thread inherits channel unless it switches runtime", 
   // Thread overrides effort on same runtime: keeps channel's runtime and model.
   assert.deepEqual(
     resolveChatSettings({ ...chSettings, [key]: { effort: "low" } }, ch, th, "claude", known),
-    { runtime: "antigravity", model: "gemini-4-neon", effort: "low" },
+    { runtime: "antigravity", profile: "", target: "antigravity", model: "gemini-4-neon", effort: "low" },
   );
 
   // Thread switches back to claude: must NOT inherit channel's antigravity model/effort.
   assert.deepEqual(
     resolveChatSettings({ ...chSettings, [key]: { runtime: "claude" } }, ch, th, "claude", known),
-    { runtime: "claude", model: "", effort: "" },
+    { runtime: "claude", profile: "", target: "claude", model: "", effort: "" },
   );
 
   // Channel uses agent default runtime with a model/effort; thread switches to codex.
@@ -216,14 +230,97 @@ test("resolveChatSettings: thread inherits channel unless it switches runtime", 
       "claude",
       known,
     ),
-    { runtime: "codex", model: "", effort: "" },
+    { runtime: "codex", profile: "", target: "codex", model: "", effort: "" },
   );
 
   // Unknown runtime falls back to default.
   assert.deepEqual(
     resolveChatSettings({ [ch]: { runtime: "unknown-rt" } }, ch, null, "claude", known),
-    { runtime: "claude", model: "", effort: "" },
+    { runtime: "claude", profile: "", target: "claude", model: "", effort: "" },
   );
+
+  // Hermes profiles: defaultProfile propagates, thread switching profile drops model/effort,
+  // and explicit profile: "" overrides channel's named profile back to default.
+  assert.deepEqual(resolveChatSettings({}, ch, th, "hermes", known, "career-lead"), {
+    runtime: "hermes",
+    profile: "career-lead",
+    target: "hermes:career-lead",
+    model: "",
+    effort: "",
+  });
+  const hermesCh = { [ch]: { runtime: "hermes", profile: "career-lead", model: "go:flash", effort: "high" } };
+  assert.deepEqual(
+    resolveChatSettings({ ...hermesCh, [key]: { runtime: "hermes", profile: "selfhost" } }, ch, th, "claude", known),
+    { runtime: "hermes", profile: "selfhost", target: "hermes:selfhost", model: "", effort: "" },
+  );
+  assert.deepEqual(
+    resolveChatSettings({ ...hermesCh, [key]: { runtime: "hermes", profile: "" } }, ch, th, "claude", known),
+    { runtime: "hermes", profile: "", target: "hermes", model: "", effort: "" },
+  );
+});
+
+test("parseTarget / formatTarget and forComposer (Option A)", () => {
+  const known = new Set(["claude", "codex", "hermes", "antigravity"]);
+  assert.equal(formatTarget("hermes", "career-lead"), "hermes:career-lead");
+  assert.equal(formatTarget("hermes", "default"), "hermes");
+  assert.equal(formatTarget("claude", "ignored"), "claude");
+  assert.deepEqual(parseTarget("hermes:career-lead", known), {
+    runtime: "hermes",
+    profile: "career-lead",
+    target: "hermes:career-lead",
+  });
+  assert.deepEqual(parseTarget("hermes:default", known), {
+    runtime: "hermes",
+    profile: "",
+    target: "hermes",
+  });
+  assert.equal(parseTarget("claude:foo", known), null);
+  assert.equal(parseTarget("hermes:bad space", known), null);
+
+  // Long Hermes model IDs (68 chars) stay pickable.
+  const longId = "claude-subscription-directsdk-experimental:claude-haiku-4-5-20251001";
+  const hermesModels = toModels({
+    model: {
+      current: "go:flash",
+      options: [
+        { value: "go:flash", name: "OpenCode Go · flash" },
+        { value: longId, name: "Claude · haiku" },
+      ],
+    },
+    effort: { current: "medium", options: [{ value: "low" }, { value: "medium" }, { value: "high" }] },
+  });
+  assert.ok(hermesModels.models.some((m) => m.id === longId));
+
+  const runtimes = [
+    { id: "claude", label: "Claude Code" },
+    { id: "hermes", label: "Hermes · default", group: "Hermes" },
+    { id: "hermes:career-lead", label: "Hermes · career-lead", group: "Hermes" },
+  ];
+  // Active runtime matches chat: applies chat model & effort without mutating input.
+  const matched = forComposer({
+    active: { target: "hermes:career-lead", ...hermesModels },
+    runtimes,
+    currentRuntime: "hermes:career-lead",
+    chat: { target: "hermes:career-lead", model: longId, effort: "high" },
+  });
+  assert.equal(matched.currentRuntime, "hermes:career-lead");
+  assert.equal(matched.modelsRuntime, "hermes:career-lead");
+  assert.equal(matched.current, longId);
+  assert.equal(matched.models.find((m) => m.id === longId).effort, "high");
+  assert.equal(matched.models[0].group, "OpenCode Go", "provider group only, no Hermes prefix");
+  assert.equal(hermesModels.models[1].effort, "medium", "does not mutate cached catalog");
+
+  // Previewing another runtime: keeps chat's currentRuntime, does NOT apply old chat model/effort.
+  const preview = forComposer({
+    active: { target: "hermes:career-lead", ...hermesModels },
+    runtimes,
+    currentRuntime: "claude",
+    chat: { target: "claude", model: "opus", effort: "high" },
+  });
+  assert.equal(preview.currentRuntime, "claude");
+  assert.equal(preview.modelsRuntime, "hermes:career-lead");
+  assert.equal(preview.current, "go:flash");
+  assert.equal(preview.models.find((m) => m.id === "go:flash").effort, "medium");
 });
 
 test("withRuntimes with per-chat settings selects active runtime, model and effort", () => {

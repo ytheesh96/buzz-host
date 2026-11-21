@@ -22,7 +22,7 @@ import { createAttention } from "./attention.mjs";
 import { createMemory } from "./memory.mjs";
 import { createOrchestrator } from "./orchestrator.mjs";
 import { createRelayWatcher } from "./attention-relay.mjs";
-import { catalogs, resolveChatSettings, toModels, withRuntimes } from "./catalog.mjs";
+import { catalogs, forComposer, formatTarget, parseTarget, resolveChatSettings, toModels } from "./catalog.mjs";
 import { proxyControl as routeControl } from "./control.mjs";
 import * as desktop from "./desktop/desktop.mjs";
 import { acquire as leaseAcquire, release as leaseRelease, publicView } from "./desktop/lease.mjs";
@@ -248,6 +248,7 @@ async function writeRuntimeEnv(pubkey, m) {
     BUZZ_ACP_MODEL: m.model || undefined,
     // The Hermes profile: hermes-acp and its gateway session use this home.
     HERMES_HOME: profile ? hermesHome(profile) : undefined,
+    BUZZ_HOST_HERMES_PROFILE: profile || undefined,
     BUZZ_ACP_SYSTEM_PROMPT_FILE: m.hasInstructions
       ? path.join(dir(pubkey), "instructions.md")
       : undefined,
@@ -364,33 +365,78 @@ async function runtimeCatalog(runtime, profile = "", configured = "", { wait = t
 const installed = (command) => fs.access(command, fs.constants.X_OK).then(() => true, () => false);
 const RUNTIME_IDS = new Set(Object.keys(RUNTIMES));
 
-async function chatSettingsFor(pubkey, channelId, threadRootId, defaultRuntime) {
+async function chatSettingsFor(pubkey, channelId, threadRootId, defaultRuntime, defaultProfile = "") {
   const settings = await readJson(path.join(dir(pubkey), "chat-settings.json"), {});
-  return resolveChatSettings(settings, channelId, threadRootId, defaultRuntime, RUNTIME_IDS);
+  return resolveChatSettings(settings, channelId, threadRootId, defaultRuntime, RUNTIME_IDS, defaultProfile);
 }
 
-/** The agent's own runtime's models, and every other installed runtime's
- * that has answered a probe (one not signed in never does; it's left out).
- * Only the agent's own (and the chat's active runtime, if switched) are
- * waited for: the others are probed in the background and join a later
- * answer (`runtimesPending` until then). */
-async function chatCatalog(runtime, profile, configured, chat = null) {
-  const own = await runtimeCatalog(runtime, profile, configured);
+/** Build the composer catalog for one agent (Option A: separate runtime/profile
+ * selector + clean model list for the displayed runtime/profile).
+ * Only the displayed runtime/profile is waited for; other non-Hermes runtimes
+ * probe in the background (so unsigned-in ones like Codex stay hidden), and
+ * other Hermes profiles are listed immediately and probed lazily on demand when
+ * selected. */
+async function chatCatalog(ownRuntime, ownProfile, configured, chat = null, requestedRuntime = "") {
+  const ownTarget = formatTarget(ownRuntime, ownProfile);
+  const currentTarget = chat?.target || ownTarget;
+  let display = parseTarget(currentTarget, RUNTIME_IDS) ?? {
+    runtime: ownRuntime,
+    profile: ownRuntime === "hermes" ? ownProfile : "",
+    target: ownTarget,
+  };
+  if (requestedRuntime) {
+    const parsed = parseTarget(requestedRuntime, RUNTIME_IDS);
+    if (!parsed) throw new Error("Unknown runtime");
+    if (parsed.runtime === "hermes" && parsed.profile) await checkProfile(parsed.profile);
+    display = parsed;
+  }
+
   let pending = false;
-  const activeRuntime = chat?.runtime && chat.runtime !== runtime ? chat.runtime : "";
-  const others = await Promise.all(
-    Object.entries(RUNTIMES)
-      .filter(([id]) => id !== runtime)
-      .map(async ([id, r]) => {
-        if (!(await installed(r.command))) return null;
-        const wait = id === activeRuntime;
-        const models = await runtimeCatalog(id, "", "", { wait }).catch(() => null);
-        if (models === undefined) pending = true;
-        return models?.models?.length ? { runtime: id, title: r.title, ...models } : null;
-      }),
-  );
-  const all = withRuntimes({ runtime, title: RUNTIMES[runtime].title, ...own }, others.filter(Boolean), chat);
-  return pending ? { ...all, runtimesPending: true } : all;
+  const runtimes = [];
+  for (const [id, r] of Object.entries(RUNTIMES)) {
+    if (!(await installed(r.command))) continue;
+    if (id === "hermes") {
+      const rows = await hermesProfiles().catch(() => []);
+      const names = [];
+      const addName = (n) => {
+        const clean = n === "" || n === "default" ? "default" : n;
+        if (!names.includes(clean)) names.push(clean);
+      };
+      addName("default");
+      for (const row of rows) addName(row.name);
+      if (ownRuntime === "hermes" && ownProfile) addName(ownProfile);
+      if (chat?.runtime === "hermes" && chat.profile) addName(chat.profile);
+      if (display.runtime === "hermes" && display.profile) addName(display.profile);
+      const multi = names.length > 1;
+      for (const name of names) {
+        const targetId = name === "default" ? "hermes" : `hermes:${name}`;
+        runtimes.push({
+          id: targetId,
+          label: multi ? `Hermes · ${name}` : "Hermes",
+          ...(multi ? { group: "Hermes" } : {}),
+        });
+      }
+      continue;
+    }
+    const mustInclude = id === ownRuntime || id === chat?.runtime || id === display.runtime;
+    if (mustInclude) {
+      runtimes.push({ id, label: r.title });
+      continue;
+    }
+    const models = await runtimeCatalog(id, "", "", { wait: false }).catch(() => null);
+    if (models === undefined) pending = true;
+    if (models?.models?.length) runtimes.push({ id, label: r.title });
+  }
+
+  const activeConfigured = display.target === ownTarget ? configured : "";
+  const activeModels = await runtimeCatalog(display.runtime, display.profile, activeConfigured, { wait: true });
+  const result = forComposer({
+    active: { ...display, ...activeModels },
+    runtimes,
+    currentRuntime: currentTarget,
+    chat,
+  });
+  return pending ? { ...result, runtimesPending: true } : result;
 }
 
 function checkPlace(channelId, threadRootId) {
@@ -736,13 +782,15 @@ const methods = {
   // `current` reflects that conversation's active runtime/model/effort from
   // chat-settings.json. acp-proxy applies a pick from the message tags; one on
   // another runtime moves the chat there.
-  async catalog(config, { pubkey, channelId, threadRootId }) {
+  async catalog(config, { pubkey, channelId, threadRootId, runtime: requestedRuntime }) {
     checkPubkey(pubkey);
     if (channelId != null) checkPlace(channelId, threadRootId);
+    if (requestedRuntime != null && typeof requestedRuntime !== "string")
+      throw new Error("Invalid runtime");
     const m = await meta(pubkey);
     const { runtime, profile } = settingsFrom(m);
-    const chat = channelId ? await chatSettingsFor(pubkey, channelId, threadRootId, runtime) : null;
-    return chatCatalog(runtime, profile, m.model || "", chat);
+    const chat = channelId ? await chatSettingsFor(pubkey, channelId, threadRootId, runtime, profile) : null;
+    return chatCatalog(runtime, profile, m.model || "", chat, requestedRuntime || "");
   },
 
   // Buzz's session controls for one conversation (channel + thread root).
@@ -750,7 +798,7 @@ const methods = {
     checkPubkey(pubkey);
     checkPlace(channelId, threadRootId);
     const m = await meta(pubkey);
-    const { runtime } = settingsFrom(m);
+    const { runtime, profile } = settingsFrom(m);
     const [reply, chat] = await Promise.all([
       proxyControl(
         pubkey,
@@ -758,7 +806,7 @@ const methods = {
         5_000,
         { state: "unavailable" },
       ).catch(() => ({ state: "unavailable" })),
-      chatSettingsFor(pubkey, channelId, threadRootId, runtime),
+      chatSettingsFor(pubkey, channelId, threadRootId, runtime, profile),
     ]);
     return { state: reply.state ?? "unavailable", chat };
   },
@@ -997,7 +1045,22 @@ const orchestrator = createOrchestrator({
   catalog: (runtime) => runtimeCatalog(runtime),
   ensureHermes: (profile) => ensureSessionEnv(profile || ""),
 });
-const attention = createAttention({ dataDir: DATA, runDir: RUN_DIR, extra: [memory, orchestrator] });
+const hermesHostExtra = {
+  handles: (name) => name === "_ensure_hermes_profile",
+  async call(_pubkey, _name, args) {
+    const raw = typeof args?.profile === "string" ? args.profile.trim() : "";
+    const profile = raw.toLowerCase() === "default" ? "" : raw;
+    if (profile && !PROFILE.test(profile)) throw new Error("Invalid Hermes profile name");
+    await checkProfile(profile);
+    await ensureSessionEnv(profile);
+    return { ok: true, profile };
+  },
+};
+const attention = createAttention({
+  dataDir: DATA,
+  runDir: RUN_DIR,
+  extra: [memory, orchestrator, hermesHostExtra],
+});
 // Event watches: one relay connection per agent that has any, fed to Attention.
 const watcher = createRelayWatcher({
   dataDir: DATA,
