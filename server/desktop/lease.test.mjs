@@ -1,11 +1,20 @@
-import test from "node:test";
+import test, { after } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import * as L from "./lease.mjs";
 
-const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), "lease-"));
+// Temp dirs made by this file, removed when it finishes.
+const tmpDirs = [];
+after(() => {
+  for (const d of tmpDirs) fs.rmSync(d, { recursive: true, force: true });
+});
+const tmp = () => {
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), "lease-"));
+  tmpDirs.push(d);
+  return d;
+};
 
 test("fresh desktop: the agent holds", () => {
   const d = tmp();

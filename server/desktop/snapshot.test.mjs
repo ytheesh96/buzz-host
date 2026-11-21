@@ -1,4 +1,4 @@
-import test from "node:test";
+import test, { after } from "node:test";
 import assert from "node:assert/strict";
 import net from "node:net";
 import fs from "node:fs";
@@ -70,7 +70,16 @@ function fakeServer(sockPath, W, H, { bellFirst = false } = {}) {
   return new Promise((resolve) => server.listen(sockPath, () => resolve({ server, seen })));
 }
 
-const tmpSock = () => path.join(fs.mkdtempSync(path.join(os.tmpdir(), "snap-")), "rfb.sock");
+// Temp dirs made by this file, removed when it finishes.
+const tmpDirs = [];
+after(() => {
+  for (const d of tmpDirs) fs.rmSync(d, { recursive: true, force: true });
+});
+const tmpSock = () => {
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), "snap-"));
+  tmpDirs.push(d);
+  return path.join(d, "rfb.sock");
+};
 
 /** Inflate and un-filter an RGB PNG from encodePng (Paeth rows only). */
 function decodePng(png) {

@@ -1,10 +1,14 @@
 // node --test server/
-import test from "node:test";
+import test, { after } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { probe, toModels, catalogs, effortLabel } from "./catalog.mjs";
+
+// Temp dirs made by this file, removed when it finishes.
+const tmpDirs = [];
+after(() => Promise.all(tmpDirs.map((d) => fs.rm(d, { recursive: true, force: true }))));
 
 // A stand-in ACP adapter: Claude-like options, where `old` lacks xhigh and
 // `fixed` has no effort option at all. It fails the test if prompted.
@@ -43,6 +47,7 @@ process.stdin.on("data", (d) => {
 
 async function adapter() {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "catalog-"));
+  tmpDirs.push(dir);
   const file = path.join(dir, "adapter.mjs");
   await fs.writeFile(file, ADAPTER);
   return { dir, command: process.execPath, args: [file], cwd: dir };
@@ -102,6 +107,7 @@ test("Hermes: providers become groups, and its resting level shows", () => {
 
 test("catalogs: cached on disk, refreshed in the background when old", async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "catalogs-"));
+  tmpDirs.push(dir);
   let n = 0;
   const probeWith = async () => ({ n: ++n });
   const get = catalogs({ dir, probeWith, maxAgeMs: 50 });

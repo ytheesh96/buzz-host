@@ -1,6 +1,6 @@
 // node --test attention/  — buzz-host's Attention service and MCP server,
 // through the bundled Buzz code, against a temporary agent directory.
-import { test } from "node:test";
+import { after, test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
@@ -9,6 +9,10 @@ import path from "node:path";
 import readline from "node:readline";
 import { fileURLToPath } from "node:url";
 import { createAttention } from "../server/attention.mjs";
+
+// Temp dirs made by this file, removed when it finishes.
+const tmpDirs = [];
+after(() => Promise.all(tmpDirs.map((d) => fs.rm(d, { recursive: true, force: true }))));
 
 const SERVER = path.join(path.dirname(fileURLToPath(import.meta.url)), "../server");
 const AGENT = "a".repeat(64);
@@ -24,6 +28,7 @@ const quiet = { log() {}, warn() {} };
 
 async function setup() {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "bh-attention-"));
+  tmpDirs.push(root);
   const dataDir = path.join(root, "agents");
   const xdg = path.join(root, "xdg");
   const runDir = path.join(xdg, "buzz-host");
