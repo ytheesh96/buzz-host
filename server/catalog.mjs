@@ -13,8 +13,38 @@ import path from "node:path";
 
 const EFFORT = new Set(["thought_level", "effort", "reasoning_effort", "reasoning", "thinking"]);
 // Buzz refuses a pick tag whose model id doesn't match this (relay/messages.ts).
-const PICKABLE = /^[\w.:/[\]-]{1,64}$/;
+const PICKABLE = /^[\w.:/[\]-]{1,128}$/;
 const LEVEL = /^[a-z0-9-]{1,32}$/;
+export const PROFILE_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/;
+
+/** Canonical runtime target id: "claude", "hermes" (default profile), or "hermes:<profile>". */
+export function formatTarget(runtime, profile = "") {
+  const rt = typeof runtime === "string" ? runtime.trim().toLowerCase() : "";
+  const prof = typeof profile === "string" ? profile.trim() : "";
+  if (rt === "hermes" && prof && prof.toLowerCase() !== "default") return `hermes:${prof}`;
+  return rt;
+}
+
+/** Parse a runtime target id ("claude", "hermes", "hermes:default", "hermes:career-lead")
+ * into { runtime, profile, target }, or null when invalid. */
+export function parseTarget(spec, knownRuntimes = null) {
+  if (typeof spec !== "string") return null;
+  const trimmed = spec.trim();
+  if (!trimmed) return null;
+  const idx = trimmed.indexOf(":");
+  const rt = (idx >= 0 ? trimmed.slice(0, idx) : trimmed).trim().toLowerCase();
+  const rawProfile = idx >= 0 ? trimmed.slice(idx + 1).trim() : "";
+  if (!rt || (knownRuntimes && !knownRuntimes.has(rt))) return null;
+  if (rt !== "hermes") {
+    if (rawProfile) return null;
+    return { runtime: rt, profile: "", target: rt };
+  }
+  if (!rawProfile || rawProfile.toLowerCase() === "default") {
+    return { runtime: "hermes", profile: "", target: "hermes" };
+  }
+  if (!PROFILE_RE.test(rawProfile)) return null;
+  return { runtime: "hermes", profile: rawProfile, target: `hermes:${rawProfile}` };
+}
 
 const isModel = (o) => o?.category === "model" || o?.id === "model";
 const isEffort = (o) => EFFORT.has(o?.category) || EFFORT.has(o?.id);
@@ -175,33 +205,107 @@ export function toModels(probed, configured = "") {
  * (acp-proxy's split_pick). */
 export const RUNTIME_SEP = "::";
 
-/** Resolve a chat or thread's effective {runtime, model, effort} from
- * chat-settings.json. A thread inherits its channel's settings unless it
- * overrides them; when a thread switches to a different runtime than its
- * channel, the channel's model and effort (which belonged to the old runtime)
- * are not inherited. */
-export function resolveChatSettings(settings, channelId, threadRootId, defaultRuntime, knownRuntimes = null) {
-  const validRuntime = (rt) => {
-    const s = typeof rt === "string" ? rt.trim().toLowerCase() : "";
-    if (!s) return "";
-    return knownRuntimes ? (knownRuntimes.has(s) ? s : "") : s;
-  };
+/** Resolve a chat or thread's effective {runtime, profile, target, model, effort}
+ * from chat-settings.json. A thread inherits its channel's settings unless it
+ * overrides them; when a thread switches to a different runtime or Hermes profile
+ * than its channel, the channel's model and effort (which belonged to the old
+ * runtime/profile) are not inherited. */
+export function resolveChatSettings(
+  settings,
+  channelId,
+  threadRootId,
+  defaultRuntime,
+  knownRuntimes = null,
+  defaultProfile = "",
+) {
   const validText = (v) => (typeof v === "string" ? v.trim() : "");
+  const normProfile = (v) => {
+    const s = validText(v);
+    if (!s || s.toLowerCase() === "default") return "";
+    return PROFILE_RE.test(s) ? s : "";
+  };
+  const fallback = parseTarget(formatTarget(defaultRuntime, defaultProfile), knownRuntimes) ?? {
+    runtime: validText(defaultRuntime).toLowerCase(),
+    profile: "",
+    target: validText(defaultRuntime).toLowerCase(),
+  };
+  const resolveEntry = (raw, inherited) => {
+    const hasRuntime = typeof raw?.runtime === "string" && raw.runtime.trim() !== "";
+    const hasProfile = raw && Object.hasOwn(raw, "profile") && typeof raw.profile === "string";
+    if (!hasRuntime && !hasProfile) return inherited;
+    if (hasRuntime) {
+      const parsed = parseTarget(raw.runtime, knownRuntimes);
+      if (!parsed) return inherited;
+      if (parsed.runtime !== "hermes") return parsed;
+      const profile = parsed.profile || (hasProfile ? normProfile(raw.profile) : "");
+      return { runtime: "hermes", profile, target: formatTarget("hermes", profile) };
+    }
+    // Only profile overridden (e.g. thread changing Hermes profile on a Hermes channel/agent).
+    if (inherited.runtime !== "hermes") return inherited;
+    const profile = normProfile(raw.profile);
+    return { runtime: "hermes", profile, target: formatTarget("hermes", profile) };
+  };
+
   const all = settings && typeof settings === "object" ? settings : {};
   const baseRaw = channelId && all[channelId] && typeof all[channelId] === "object" ? all[channelId] : {};
   const threadKey = channelId && threadRootId ? `${channelId}_${threadRootId}` : "";
   const ownRaw = threadKey && all[threadKey] && typeof all[threadKey] === "object" ? all[threadKey] : {};
 
-  const baseRt = validRuntime(baseRaw.runtime);
-  const ownRt = validRuntime(ownRaw.runtime);
-  const fallbackRt = validRuntime(defaultRuntime);
-  const runtime = ownRt || baseRt || fallbackRt;
+  const baseTarget = resolveEntry(baseRaw, fallback);
+  const ownTarget = resolveEntry(ownRaw, baseTarget);
 
-  const threadSwitchedRuntime = Boolean(ownRt && ownRt !== (baseRt || fallbackRt));
-  const model = validText(ownRaw.model) || (threadSwitchedRuntime ? "" : validText(baseRaw.model));
-  const effort = validText(ownRaw.effort) || (threadSwitchedRuntime ? "" : validText(baseRaw.effort));
+  const threadSwitchedTarget = ownTarget.target !== baseTarget.target;
+  const model = validText(ownRaw.model) || (threadSwitchedTarget ? "" : validText(baseRaw.model));
+  const effort = validText(ownRaw.effort) || (threadSwitchedTarget ? "" : validText(baseRaw.effort));
 
-  return { runtime, model, effort };
+  return {
+    runtime: ownTarget.runtime,
+    profile: ownTarget.profile,
+    target: ownTarget.target,
+    model,
+    effort,
+  };
+}
+
+/** Build Buzz's Option A composer `Models`: a separate `runtimes` picker (with
+ * `currentRuntime` naming the chat's active runtime/profile and `modelsRuntime`
+ * naming the runtime whose models are loaded) and `models` containing ONLY that
+ * runtime's clean, unprefixed models (Hermes grouped by provider only). */
+export function forComposer({ active, runtimes = [], currentRuntime = "", chat = null }) {
+  const models = (active?.models ?? []).map((m) => ({ ...m }));
+  let current = active?.current ?? "";
+  const modelsRuntime = active?.target || active?.runtime || "";
+  const activeIsChat = Boolean(!currentRuntime || !modelsRuntime || modelsRuntime === currentRuntime);
+
+  if (activeIsChat && chat && (chat.model || chat.effort)) {
+    if (chat.model) {
+      if (models.some((m) => m.id === chat.model)) {
+        current = chat.model;
+      } else if (PICKABLE.test(chat.model)) {
+        const base = models.find((m) => m.id === current);
+        models.unshift({
+          id: chat.model,
+          label: chat.model,
+          efforts: base?.efforts ?? [],
+        });
+        current = chat.model;
+      }
+    }
+    if (chat.effort) {
+      const idx = models.findIndex((m) => m.id === current);
+      if (idx >= 0 && models[idx].efforts?.some((e) => e.id === chat.effort)) {
+        models[idx] = { ...models[idx], effort: chat.effort };
+      }
+    }
+  }
+
+  return {
+    current,
+    models,
+    ...(currentRuntime ? { currentRuntime } : {}),
+    ...(modelsRuntime ? { modelsRuntime } : {}),
+    ...(runtimes.length ? { runtimes } : {}),
+  };
 }
 
 /** The agent's own runtime's models (`own`: toModels plus {runtime, title})

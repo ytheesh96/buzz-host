@@ -986,6 +986,98 @@ class RuntimeSwitch(Base):
         }
         self.assertEqual(self.p.wanted_for(key, same_rt), {"model": "opus", "effort": "low"})
 
+    def test_hermes_profiles_sid_commands_picks_and_env(self):
+        # Session id encoding preserves Hermes profiles unambiguously.
+        self.assertEqual(self.p.join_sid("hermes:career-lead", "h1"), "rt:hermes@career-lead:h1")
+        self.assertEqual(self.p.split_sid("rt:hermes@career-lead:h1"), ("hermes:career-lead", "h1"))
+        self.assertEqual(self.p.join_sid("hermes", "h2"), "rt:hermes:h2")
+        self.assertEqual(self.p.split_sid("rt:hermes:h2"), ("hermes", "h2"))
+
+        # Make hermes:career-lead and hermes:selfhost available via adapter overrides.
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_bin = os.path.join(tmp, "hermes-acp")
+            with open(fake_bin, "w") as f:
+                f.write("#!/bin/sh\nexit 0\n")
+            os.chmod(fake_bin, 0o755)
+            prev_env = os.environ.get("BUZZ_HOST_ADAPTERS_JSON")
+            os.environ["BUZZ_HOST_ADAPTERS_JSON"] = json.dumps({
+                "hermes": [fake_bin],
+                "hermes:career-lead": [fake_bin],
+                "hermes:selfhost": [fake_bin],
+            })
+            try:
+                _argv, env_cl = self.p.resolve_adapter_spec("hermes:career-lead")
+                self.assertEqual(env_cl["HERMES_HOME"], self.p.hermes_home("career-lead"))
+                _argv, env_def = self.p.resolve_adapter_spec("hermes")
+                self.assertIsNone(env_def["HERMES_HOME"], "default profile clears inherited HERMES_HOME")
+                self.assertFalse(self.p.runtime_starts_in_folder("hermes:career-lead"))
+                self.assertEqual(self.p.runtime_default_compact("hermes:career-lead"), "compress")
+
+                # /runtime hermes:career-lead saves runtime + profile and switches cleanly.
+                text = self.command("/runtime hermes:career-lead", rid="hp1")
+                self.assertIn("Hermes (career-lead)", text)
+                self.assertEqual(self.chat()["runtime"], "hermes")
+                self.assertEqual(self.chat()["profile"], "career-lead")
+                self.assertEqual(self.p.chat_runtime(CHANNEL), "hermes:career-lead")
+
+                # /profile selfhost switches to selfhost; /profile default switches to default Hermes.
+                text = self.command("/profile selfhost", rid="hp2")
+                self.assertIn("Hermes (selfhost)", text)
+                self.assertEqual(self.chat()["profile"], "selfhost")
+                self.assertEqual(self.p.chat_runtime(CHANNEL), "hermes:selfhost")
+
+                text = self.command("/profile default", rid="hp3")
+                self.assertIn("Runtime for this chat: Hermes.", text)
+                self.assertEqual(self.chat()["runtime"], "hermes")
+                self.assertNotIn("profile", self.chat())
+                self.assertEqual(self.p.chat_runtime(CHANNEL), "hermes")
+
+                # Thread overriding channel's hermes:career-lead back to hermes (default) stores profile: "".
+                th_key = f"{CHANNEL}_{ROOT}"
+                self.p.save_settings({CHANNEL: {"runtime": "hermes", "profile": "career-lead", "model": "go:flash"}})
+                self.p.switch_chat_runtime(th_key, "hermes", from_rt="hermes:career-lead")
+                self.assertEqual(self.p.load_settings()[th_key]["profile"], "")
+                self.assertEqual(self.p.chat_runtime(th_key), "hermes")
+                self.assertNotIn("model", self.p.wanted_for(th_key, self.p.load_settings()))
+            finally:
+                if prev_env is None:
+                    os.environ.pop("BUZZ_HOST_ADAPTERS_JSON", None)
+                else:
+                    os.environ["BUZZ_HOST_ADAPTERS_JSON"] = prev_env
+
+    def test_option_a_runtime_tag_pick_switches_profile_and_keeps_same_runtime_model_pick(self):
+        orig_avail = self.p.runtime_available
+        self.p.runtime_available = lambda rt: rt in ("claude", "codex", "hermes", "hermes:career-lead", "hermes:selfhost")
+        try:
+            # Switching runtime via ["runtime", AGENT, "hermes:career-lead"] alone uses profile default model.
+            rt, out = self.dispatch(prompt_meta("rp1", "s1", [ev(tags=[("runtime", AGENT, "hermes:career-lead")])]))
+            self.assertEqual(rt, "hermes:career-lead")
+            self.assertEqual(self.chat()["runtime"], "hermes")
+            self.assertEqual(self.chat()["profile"], "career-lead")
+            self.assertNotIn("model", self.chat())
+            self.assertIn("moved from Claude Code to Hermes (career-lead)", out["params"]["prompt"][0]["text"])
+
+            # Picking a clean model on the SAME active runtime/profile stays there without switching back to Claude.
+            rt2, _out2 = self.dispatch(prompt_meta("rp2", "s1", [ev(eid="e" * 64, tags=[
+                ("runtime", AGENT, "hermes:career-lead"),
+                ("model", AGENT, "gpt-5-mini"),
+            ])]))
+            self.assertEqual(rt2, "hermes:career-lead")
+            self.assertEqual(self.chat()["runtime"], "hermes")
+            self.assertEqual(self.chat()["profile"], "career-lead")
+            self.assertNotIn("model", self.chat(), "same-runtime model pick is per-turn only")
+
+            # Switching to another Hermes profile with an explicit model moves the chat there.
+            rt3, _out3 = self.dispatch(prompt_meta("rp3", "s1", [ev(eid="d" * 64, tags=[
+                ("runtime", AGENT, "hermes:selfhost"),
+                ("model", AGENT, "gpt-5-mini"),
+            ])]))
+            self.assertEqual(rt3, "hermes:selfhost")
+            self.assertEqual(self.chat()["profile"], "selfhost")
+            self.assertEqual(self.chat()["model"], "gpt-5-mini")
+        finally:
+            self.p.runtime_available = orig_avail
+
 
 if __name__ == "__main__":
     unittest.main()

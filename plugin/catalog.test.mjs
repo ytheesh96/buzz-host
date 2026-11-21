@@ -51,6 +51,17 @@ test("catalogKey and catalogParams scope requests to channel/thread when place i
 
   assert.equal(catalogKey(pubkey, { channelId, root }), `${pubkey}|${channelId}|${root}`);
   assert.deepEqual(catalogParams(pubkey, { channelId, root }), { pubkey, channelId, threadRootId: root });
+
+  assert.equal(
+    catalogKey(pubkey, { channelId, root }, "hermes:career-lead"),
+    `${pubkey}|${channelId}|${root}|rt:hermes:career-lead`,
+  );
+  assert.deepEqual(catalogParams(pubkey, { channelId, root }, "hermes:career-lead"), {
+    pubkey,
+    channelId,
+    threadRootId: root,
+    runtime: "hermes:career-lead",
+  });
 });
 
 test("hostedModels caches per conversation and invalidates when session.state reports a chat change", async () => {
@@ -76,14 +87,17 @@ test("hostedModels caches per conversation and invalidates when session.state re
       let result;
       if (msg.method === "catalog") {
         const current =
-          msg.params.threadRootId === thA && threadAChat.runtime === "antigravity"
-            ? "antigravity::gemini-4-neon"
-            : "default";
+          msg.params.runtime === "hermes:career-lead"
+            ? "go:flash"
+            : msg.params.threadRootId === thA && threadAChat.runtime === "antigravity"
+              ? "antigravity::gemini-4-neon"
+              : "default";
         result = {
           current,
           models: [
             { id: "default", label: "Claude Code · Default", group: "Claude Code", efforts: [] },
             { id: "antigravity::gemini-4-neon", label: "Antigravity · Gemini 4 Neon", group: "Antigravity", efforts: [] },
+            { id: "go:flash", label: "OpenCode Go · flash", group: "OpenCode Go", efforts: [] },
           ],
         };
       } else if (msg.method === "session.state") {
@@ -158,6 +172,11 @@ test("hostedModels caches per conversation and invalidates when session.state re
     assert.equal(a2.current, "antigravity::gemini-4-neon");
     assert.equal(b2.current, "default");
     assert.equal(calls.filter((c) => c.method === "catalog").length, 3);
+
+    // Runtime preview caches independently per runtime and is invalidated with the chat.
+    const preview = await registered.models(agent, placeA, "hermes:career-lead");
+    assert.equal(preview.current, "go:flash");
+    assert.equal(calls.at(-1).params.runtime, "hermes:career-lead");
 
     // Backward compatibility: older Buzz calling models(agent) with no place.
     const noPlace = await registered.models(agent);
