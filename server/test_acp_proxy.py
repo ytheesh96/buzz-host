@@ -968,6 +968,24 @@ class RuntimeSwitch(Base):
         self.assertNotIn("runtime", self.p.load_settings()[key], "its own runtime is gone")
         self.assertEqual(self.p.chat_runtime(key), "codex")
 
+    def test_thread_switching_runtime_does_not_inherit_channel_model_or_effort(self):
+        key = f"{CHANNEL}_{ROOT}"
+        settings = {
+            CHANNEL: {"runtime": "antigravity", "model": "gemini-4-neon", "effort": "high", "workspace": ["/tmp"]},
+            key: {"runtime": "claude"},
+        }
+        got = self.p.wanted_for(key, settings)
+        self.assertEqual(got.get("runtime"), "claude")
+        self.assertNotIn("model", got)
+        self.assertNotIn("effort", got)
+        self.assertEqual(got.get("workspace"), ["/tmp"], "runtime-independent settings still inherit")
+        # Same runtime on channel and thread still inherits channel's model when only effort changes.
+        same_rt = {
+            CHANNEL: {"model": "opus", "effort": "high"},
+            key: {"effort": "low"},
+        }
+        self.assertEqual(self.p.wanted_for(key, same_rt), {"model": "opus", "effort": "low"})
+
 
 if __name__ == "__main__":
     unittest.main()
