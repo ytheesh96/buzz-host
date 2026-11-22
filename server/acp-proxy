@@ -1659,6 +1659,27 @@ def reply_fallback(turn, done_payload=None):
         notify_host("_acp_turn_done", done_payload)
 
 
+# Env entries buzz-acp gives its MCP servers that must not reach the adapter.
+# claude-agent-acp hands MCP configs to the claude CLI as a --mcp-config JSON
+# argument, and any local user can read another process's argv (ps,
+# /proc/<pid>/cmdline). buzz-mcp.mjs reads the agent's key from its own file,
+# so it doesn't need the key in its env.
+MCP_SECRET_ENV = {"BUZZ_PRIVATE_KEY"}
+
+
+def scrub_mcp_secrets(params):
+    """Drop MCP_SECRET_ENV entries from every MCP server's env. True if any."""
+    changed = False
+    for server in params.get("mcpServers") or []:
+        if not isinstance(server, dict) or not isinstance(server.get("env"), list):
+            continue
+        env = [e for e in server["env"] if not (isinstance(e, dict) and e.get("name") in MCP_SECRET_ENV)]
+        if len(env) != len(server["env"]):
+            server["env"] = env
+            changed = True
+    return changed
+
+
 def label_mcp(params, key):
     """Tell the session's buzz MCP server which chat it serves (BUZZHOST_CHAT)
     and suppress orch_* tools when this chat is a delegated worker Solo chat."""
@@ -2228,6 +2249,7 @@ def dispatch_client_line(line):
         return DEFAULT_TARGET, (json.dumps(msg, separators=(",", ":")) + "\n").encode()
     if method in ("session/new", "session/load", "session/resume") and "id" in msg:
         sid = params.get("sessionId")
+        scrubbed = scrub_mcp_secrets(params)
         # What buzz-acp starts its sessions with, for one this proxy opens on
         # another runtime when the chat moves there (open_runtime_session).
         base = {"cwd": params.get("cwd"), "mcpServers": copy.deepcopy(params.get("mcpServers") or [])}
@@ -2236,7 +2258,7 @@ def dispatch_client_line(line):
             target_rt = start_in_workspace(msg["id"], params) if has_meta else DEFAULT_TARGET
             with lock:
                 pending_new[msg["id"]] = {"sid": sid, "runtime": target_rt, "base": base}
-            if not has_meta:
+            if not has_meta and not scrubbed:
                 return target_rt, line
             msg["params"] = params
             return target_rt, (json.dumps(msg, separators=(",", ":")) + "\n").encode()
@@ -2246,7 +2268,7 @@ def dispatch_client_line(line):
             target_rt = session_runtime_for(sid)
         with lock:
             pending_new[msg["id"]] = {"sid": sid, "runtime": target_rt, "base": base}
-        changed = False
+        changed = scrubbed
         if sid and real_sid != sid:
             params["sessionId"] = real_sid
             changed = True
