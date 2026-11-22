@@ -1,0 +1,8 @@
+{
+  "id": "local.buzz-host.viewport",
+  "name": "Viewport",
+  "apiVersion": 1,
+  "description": "Live remote desktop preview, noVNC full screen, and desktop control for self-hosted agents.",
+  "updates": { "defaultEnabled": true },
+  "discovery": { "category": "agents", "tags": ["desktop", "vnc", "self-hosted"] }
+}

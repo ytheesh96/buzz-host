@@ -74,7 +74,7 @@ export function createOrchestrator({ React, client, uiKit }) {
             : busy === "toggle"
               ? `Restarting ${name}…`
               : on
-                ? `${name} delegates tasks as real Solo chats (on itself or any Omarchy agent) across Claude, Codex, Hermes, and Antigravity.${state} Turning it off restarts ${name}.`
+                ? `${name} delegates tasks as real Solo chats (on itself or any remote agent) across Claude, Codex, Hermes, and Antigravity.${state} Turning it off restarts ${name}.`
                 : `Off: ${name} has no orchestration tools. Turning it on restarts ${name} and adds 7 orch_* tools to its sessions.`,
         trailing: info
           ? h(

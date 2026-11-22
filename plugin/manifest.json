@@ -1,6 +1,6 @@
 {
   "id": "local.buzz-host",
-  "name": "Omarchy agents",
+  "name": "Remote Agents",
   "apiVersion": 1,
   "description": "Remote agents hosted on your own server (buzz-host over Tailscale). They keep answering while this computer is off.",
   "updates": { "defaultEnabled": true },

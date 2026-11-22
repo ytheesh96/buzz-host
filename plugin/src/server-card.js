@@ -1,4 +1,4 @@
-// Settings → Plugins → Omarchy agents: server address and connection check card.
+// Settings → Plugins → Remote Agents: server address and connection check card.
 import { DEFAULT_URL, URL_KEY, storedUrl } from "./config.js";
 
 export function createServerCard({ React, client, uiKit }) {
@@ -33,7 +33,7 @@ export function createServerCard({ React, client, uiKit }) {
       h(
         Note,
         null,
-        "Agents of type Omarchy run on your server with buzz-host. Create them in Agents → New agent → Harness → Remote → Omarchy. In a chat, tag the agent with /model, /effort, /runtime, /new, /stop, /status or /help to control that chat (or thread). The composer's model picker also lists other runtimes' models; picking one moves the chat to that runtime.",
+        "Agents of type Self-hosted run on your server with buzz-host. Create them in Agents → New agent → Harness → Remote → Self-hosted. In a chat, tag the agent with /model, /effort, /runtime, /new, /stop, /status or /help to control that chat (or thread). The composer's model picker also lists other runtimes' models; picking one moves the chat to that runtime.",
       ),
       h(
         Row,
