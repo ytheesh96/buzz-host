@@ -32,9 +32,54 @@ test("an older buzz-host's single-runtime answer is used as it is", () => {
 });
 
 test("stock Buzz: the type registers again without models", () => {
-  // Stock Buzz refuses `models` on a hosted type; the fallback register stays.
-  assert.match(source, /stock Buzz refuses `models` on a hosted type/);
-  assert.match(source, /register\(\{ \.\.\.omarchyType, models: hostedModels/);
+  // Stock Buzz refuses `models` on a hosted type; the fallback registers without models/sessionControls.
+  const calls = [];
+  const cleanups = [];
+  try {
+    apply({
+      react: { createElement: () => null },
+      effect: (fn) => cleanups.push(fn()),
+      agents: {
+        register: (type) => {
+          calls.push(type);
+          if ("models" in type) throw new Error("A hosted agent type has no run, models or timeoutMs");
+        },
+        registerTab: () => {},
+      },
+      conversation: { registerAccessory: () => {} },
+      settingsCards: { register: () => {} },
+    });
+    assert.equal(calls.length, 2);
+    assert.equal(typeof calls[0].models, "function");
+    assert.ok(calls[0].sessionControls);
+    assert.equal("models" in calls[1], false);
+    assert.equal("sessionControls" in calls[1], false);
+    assert.equal(calls[1].id, "omarchy");
+  } finally {
+    for (const fn of cleanups) fn?.();
+  }
+
+  // Unrelated register errors are rethrown rather than silently swallowed.
+  assert.throws(() => {
+    const c = [];
+    try {
+      apply({
+        react: { createElement: () => null },
+        effect: (fn) => c.push(fn()),
+        agents: {
+          register: () => {
+            throw new Error("duplicate type id");
+          },
+          registerTab: () => {},
+        },
+        conversation: { registerAccessory: () => {} },
+        settingsCards: { register: () => {} },
+      });
+    } finally {
+      for (const fn of c) fn?.();
+    }
+  }, /duplicate type id/);
+
   assert.match(source, /ctx\.agents\.register\(omarchyType\)/);
 });
 
