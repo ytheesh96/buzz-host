@@ -508,6 +508,36 @@ class ReplyFallbackAndMcpLabel(Base):
         ])
         self.assertEqual(servers["other"]["env"], [])
 
+    def test_strips_private_key_from_mcp_env(self):
+        # claude-agent-acp puts MCP configs in the claude CLI's argv, which any
+        # local user can read, so the key must never reach the adapter.
+        key = {"name": "BUZZ_PRIVATE_KEY", "value": "f" * 64}
+        relay = {"name": "BUZZ_RELAY_URL", "value": "wss://relay"}
+
+        def servers():
+            return [
+                {"name": "buzz", "command": "/bin/buzz-mcp", "args": [], "env": [dict(key), dict(relay)]},
+                {"name": "other", "command": "/bin/other", "args": [], "env": [dict(key)]},
+            ]
+
+        cases = [
+            ("session/new", {"cwd": self.own, "mcpServers": servers(),
+                             "_meta": {"buzzHost": {"channelId": CHANNEL, "rootEventId": ROOT}}}),
+            ("session/new", {"cwd": self.own, "mcpServers": servers()}),  # no _meta (unpatched buzz-acp)
+            ("session/load", {"sessionId": "s-load", "cwd": self.own, "mcpServers": servers()}),
+            ("session/resume", {"sessionId": "s-res", "cwd": self.own, "mcpServers": servers()}),
+        ]
+        for i, (method, params) in enumerate(cases):
+            rid = f"k{i}"
+            raw = self.p.handle_client_line(line({"jsonrpc": "2.0", "id": rid, "method": method, "params": params}))
+            self.assertNotIn(b"f" * 64, raw, method)
+            out = json.loads(raw)
+            by_name = {s["name"]: s for s in out["params"]["mcpServers"]}
+            self.assertIn(relay, by_name["buzz"]["env"], method)
+            self.assertEqual(by_name["other"]["env"], [], method)
+            # The copy kept for reopening the chat on another runtime is clean too.
+            self.assertNotIn("f" * 64, json.dumps(self.p.pending_new[rid]["base"]), method)
+
 
 class TurnAuthors(Base):
     def read_authors(self):
