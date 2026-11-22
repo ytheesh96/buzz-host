@@ -201,6 +201,28 @@ export function toModels(probed, configured = "") {
   return { current: PICKABLE.test(current) ? current : "", models };
 }
 
+/** A probe as buzz-host's `models` RPC answer: { models: [{ id, name }],
+ * efforts: [{ value, name }] }. Falls back to legacy `available` only when the
+ * adapter omits a `model` configOption (matching `buzz-acp models` so adapters
+ * that list flattened model+effort pairs in `available` keep clean base models). */
+export function toModelList(probed) {
+  const seen = new Map();
+  const refused = new Set(probed?.unavailable ?? []);
+  const add = (id, name) => {
+    if (typeof id === "string" && id && !refused.has(id) && !seen.has(id)) seen.set(id, name || id);
+  };
+  for (const o of probed?.model?.options ?? []) add(o.value, o.name);
+  if (seen.size === 0) {
+    for (const o of probed?.available ?? []) add(o.value, o.name);
+  }
+  const efforts = [];
+  for (const o of probed?.effort?.options ?? []) {
+    if (typeof o?.value === "string" && o.value && !efforts.some((e) => e.value === o.value))
+      efforts.push({ value: o.value, name: o.name ?? o.value });
+  }
+  return { models: [...seen].map(([id, name]) => ({ id, name })), efforts };
+}
+
 /** A pick of another runtime's model names its runtime: "codex::gpt-5"
  * (acp-proxy's split_pick). */
 export const RUNTIME_SEP = "::";
