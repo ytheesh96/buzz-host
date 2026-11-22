@@ -1,0 +1,6 @@
+[Unit]
+Description=Mirror the newest patched Buzz release into the tailnet update feed
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/lib/buzz-owner-desktop/buzz-feed-sync.sh

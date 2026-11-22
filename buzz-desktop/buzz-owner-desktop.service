@@ -1,0 +1,16 @@
+[Unit]
+Description=Buzz desktop app in a headless display, viewable with noVNC (owner desktop)
+After=default.target
+
+[Service]
+ExecStart=/usr/bin/env node %h/.local/lib/buzz-owner-desktop/owner-desktop.mjs
+Restart=on-failure
+RestartSec=5
+KillMode=mixed
+TimeoutStopSec=10
+# Keep the app from starving agents or the live desktop.
+MemoryHigh=1500M
+Nice=5
+
+[Install]
+WantedBy=default.target
