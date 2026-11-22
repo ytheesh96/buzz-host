@@ -27,7 +27,7 @@ Buzz (laptop) ── plugin "Omarchy agents" ── wss://omarchy.<tailnet>:8447
 | `server/agent-bin/buzz` | `~/.local/lib/buzz-host/agent-bin/` | `buzz` CLI wrapper first on agents' PATH: loads the agent's own key from `BUZZ_HOST_AGENT` (Hermes strips secret env vars from its terminal) |
 | `server/*.service` | `~/.config/systemd/user/` | `buzz-host.service`, `buzz-agent@.service` |
 | `server/desktop/` | `~/.local/lib/buzz-host/desktop/` | Agent desktops (see below): `desktop.mjs` (Xvnc + Xfce + cua-driver per agent), `lease.mjs` (take over / hand back), `computer.mjs` (the agent's computer tools), `rfb-bridge.mjs` + `rfb-filter.mjs` (the `/desktop` live view), `launcher.sh` (Hermes Bot Desktop's) |
-| `plugin/` | installed in Buzz | Registers the **Omarchy** remote agent type (tabs: Activity, Attention, Desktop, Settings) and Settings → Plugins → Omarchy agents |
+| `plugin/` | installed in Buzz | Source modules under `plugin/src/` bundled into `plugin/plugin.js` by `node plugin/build.mjs`. Registers the **Omarchy** remote agent type (tabs: Activity, Attention, Settings), in-chat Desktop preview, and Settings → Plugins → Omarchy agents |
 | `hermes-plugin/` | `~/.hermes/plugins/` | Per-session agent identity for Hermes agents (see below) |
 
 Server-only state: `~/.config/buzz-host/config.json` (allowed Tailscale logins,
@@ -126,8 +126,8 @@ renders Buzz's own Attention markup and classes (buzz.watching's Interest cards,
 Triggers/Sources/Responds in/Status table, the Sources popover, Watch details, per-watch Activity,
 delete dialogs, sonar), so it looks like a local agent's; buzz-host adds the switch and "Recent wakes on
 your server". Instructions render as Buzz renders them: Buzz's Markdown parser (react-markdown's
-remark-parse plus remark-gfm), bundled into the end of `plugin/plugin.js` by `plugin/build-markdown.mjs`
-(rerun it after a Buzz update), and Buzz's Markdown stylesheet, whose hashed class names the plugin
+remark-parse plus remark-gfm), bundled into `plugin/src/generated/markdown-parser.js` by `plugin/build-markdown.mjs`
+(rerun it after a Buzz update, then run `node plugin/build.mjs`), and Buzz's Markdown stylesheet, whose hashed class names the plugin
 reads from the loaded CSS. `node --test plugin/` checks the output against react-markdown from a
 buzz-app checkout. A person link (`nostr:npub…`) shows as their name: Buzz gives an agent type's
 tabs no way to open a profile.
@@ -286,8 +286,8 @@ browser…, about 65), served through `desktop/computer.mjs`.
   (`BUZZHOST_CUA_DRIVER` overrides). Its tool list is cached per version in the desktop folder, so
   listing tools never starts a desktop. Needs `tigervnc`, `xfce4-panel`, `xfwm4`, `xfdesktop`,
   `xfce4-settings`, `bubblewrap` and a Chromium on the server.
-- **Watching and taking over:** a full-screen view with noVNC (bundled into `plugin.js` by
-  `plugin/build-novnc.mjs`) over `wss://…/desktop?ticket=…` (same Tailscale login and Origin checks;
+- **Watching and taking over:** a full-screen view with noVNC (bundled into `plugin/src/generated/novnc-client.js` by
+  `plugin/build-novnc.mjs` and inlined into `plugin/plugin.js` by `plugin/build.mjs`) over `wss://…/desktop?ticket=…` (same Tailscale login and Origin checks;
   `desktop.view` issues a single-use 60 s ticket and the viewer id that connection takes over with).
   **Take over** (`desktop.lease`) makes the agent's computer tools refuse every call, screenshots
   included; the bridge forwards keyboard, mouse, clipboard and resize only from the viewer holding
