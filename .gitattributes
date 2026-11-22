@@ -1,2 +1,4 @@
+plugin/src/generated/* linguist-generated=true
 plugin/plugin.js linguist-generated=true
-plugin/src/generated/** linguist-generated=true
+plugins/viewport/plugin.js linguist-generated=true
+plugins/hive-watch/plugin.js linguist-generated=true

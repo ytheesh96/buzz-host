@@ -425,7 +425,7 @@ export function createDesktop({ React, client, ctx, uiKit, Btn }) {
   }
 
   // ----- In-chat preview of the agent's desktop -----
-  // A card under the activity bubble of a request an Omarchy agent is working
+  // A card under the activity bubble of a request a remote agent is working
   // on, once that turn uses its computer tools. buzz-host records each
   // computer-tool call; the turn, its chat and its request come from Buzz's
   // own activity, so the card shows only where the agent is working. It shows

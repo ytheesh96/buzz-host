@@ -1,5 +1,5 @@
 // node --test plugin/
-// Direct unit tests for modular plugin/src/* modules and bundle sync verification.
+// Direct unit tests for modular plugin/src/* modules, split plugins, and bundle sync verification.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -8,19 +8,30 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { DEFAULT_CONCURRENCY, DEFAULT_URL, EMPTY, asConfig, storedUrl } from "./src/config.js";
+import {
+  DEFAULT_CONCURRENCY,
+  DEFAULT_URL,
+  EMPTY,
+  asConfig,
+  isSelfHostedAgent,
+  storedUrl,
+} from "./src/config.js";
 import { groupByProvider, modelChoices, profileOptions, providerOf } from "./src/ui.js";
 import { buildTurns, parseFrame, promptRequest } from "./src/activity.js";
 import { previewKeys } from "./src/desktop.js";
 import { plain, schedule, titleOf, words } from "./src/attention.js";
-import * as srcEntry from "./src/index.js";
-import * as builtEntry from "./plugin.js";
+import * as remoteAgentsSrc from "./src/index.js";
+import * as remoteAgentsBuilt from "./plugin.js";
+import * as viewportSrc from "../plugins/viewport/src/index.js";
+import * as viewportBuilt from "../plugins/viewport/plugin.js";
+import * as hiveWatchSrc from "../plugins/hive-watch/src/index.js";
+import * as hiveWatchBuilt from "../plugins/hive-watch/plugin.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const app = process.env.BUZZ_APP ?? path.join(os.homedir(), "Work/buzz-app");
 const hasRolldown = fs.existsSync(path.join(app, "node_modules/.pnpm"));
 
-test("config helpers normalize drafts and fall back to default URL", () => {
+test("config helpers normalize drafts, recognize self-hosted agents, and fall back to default URL", () => {
   assert.deepEqual(asConfig(undefined), EMPTY);
   assert.deepEqual(asConfig({ runtime: "hermes", profile: "work" }), {
     ...EMPTY,
@@ -29,6 +40,14 @@ test("config helpers normalize drafts and fall back to default URL", () => {
     concurrency: DEFAULT_CONCURRENCY,
   });
   assert.equal(storedUrl(), DEFAULT_URL);
+
+  assert.equal(isSelfHostedAgent({ type: "omarchy" }), true);
+  assert.equal(isSelfHostedAgent({ type: "local.buzz-host/omarchy" }), true);
+  assert.equal(isSelfHostedAgent({ type: "remote/omarchy" }), true);
+  assert.equal(isSelfHostedAgent({ type: "codex" }), false);
+  assert.equal(isSelfHostedAgent({ type: "claude-code" }), false);
+  assert.equal(isSelfHostedAgent(undefined), false);
+  assert.equal(isSelfHostedAgent(null), false);
 });
 
 test("ui helpers parse Hermes providers, group models, and build profile options", () => {
@@ -167,16 +186,17 @@ test("attention formatting helpers format ids, headings, and schedules", () => {
   assert.equal(schedule({ interval: 45 }), "Every 45s");
 });
 
-test("plugin/src/index.js and bundled plugin/plugin.js expose the same API surface", () => {
-  assert.deepEqual(builtEntry.inject, srcEntry.inject);
-  assert.equal(typeof builtEntry.apply, "function");
-  assert.equal(typeof builtEntry.catalogKey, "function");
-  assert.equal(typeof builtEntry.catalogParams, "function");
-  assert.equal(typeof builtEntry.composerModels, "function");
+test("Remote Agents: src and bundled plugin.js expose the same API surface", () => {
+  assert.deepEqual(remoteAgentsBuilt.inject, remoteAgentsSrc.inject);
+  assert.deepEqual(remoteAgentsBuilt.inject, ["react", "agents", "settingsCards"]);
+  assert.equal(typeof remoteAgentsBuilt.apply, "function");
+  assert.equal(typeof remoteAgentsBuilt.catalogKey, "function");
+  assert.equal(typeof remoteAgentsBuilt.catalogParams, "function");
+  assert.equal(typeof remoteAgentsBuilt.composerModels, "function");
 
-  for (const mod of [srcEntry, builtEntry]) {
+  for (const mod of [remoteAgentsSrc, remoteAgentsBuilt]) {
     const cleanups = [];
-    const registered = { types: [], tabs: [], accessories: [], cards: [] };
+    const registered = { types: [], tabs: [], cards: [] };
     try {
       mod.apply({
         react: { createElement: () => null },
@@ -185,20 +205,86 @@ test("plugin/src/index.js and bundled plugin/plugin.js expose the same API surfa
           register: (t) => registered.types.push(t),
           registerTab: (t) => registered.tabs.push(t),
         },
-        conversation: { registerAccessory: (a) => registered.accessories.push(a) },
         settingsCards: { register: (c) => registered.cards.push(c) },
       });
       assert.deepEqual(registered.types.map((t) => t.id), ["omarchy"]);
-      assert.deepEqual(registered.types[0].tabs.map((t) => t.id), ["activity", "attention", "settings"]);
+      assert.equal(registered.types[0].title, "Self-hosted");
+      assert.deepEqual(registered.types[0].tabs.map((t) => t.id), ["activity", "settings"]);
       assert.deepEqual(registered.tabs.map((t) => t.id), ["catalog-sync"]);
-      assert.deepEqual(registered.accessories.map((a) => a.id), ["desktop-preview"]);
       assert.deepEqual(registered.cards.map((c) => c.id), ["server"]);
+      assert.equal(registered.cards[0].title, "Remote Agents");
     } finally {
       for (const fn of cleanups) fn?.();
     }
   }
 });
 
-test("plugin/plugin.js matches plugin/src/ via plugin/build.mjs --check", { skip: !hasRolldown && "no buzz-app rolldown" }, () => {
+test("Viewport: src and bundled plugin.js expose the same API surface", () => {
+  assert.deepEqual(viewportBuilt.inject, viewportSrc.inject);
+  assert.deepEqual(viewportBuilt.inject, ["react", "agents", "conversation"]);
+  assert.equal(typeof viewportBuilt.apply, "function");
+  assert.equal(typeof viewportBuilt.previewKeys, "function");
+
+  for (const mod of [viewportSrc, viewportBuilt]) {
+    const cleanups = [];
+    const registered = { tabs: [], accessories: [] };
+    try {
+      mod.apply({
+        react: { createElement: () => null },
+        effect: (fn) => cleanups.push(fn()),
+        agents: {
+          registerTab: (t) => registered.tabs.push(t),
+        },
+        conversation: {
+          registerAccessory: (a) => registered.accessories.push(a),
+        },
+      });
+      assert.deepEqual(registered.tabs.map((t) => t.id), ["desktop"]);
+      assert.equal(registered.tabs[0].title, "Desktop");
+      assert.equal(registered.tabs[0].when({ type: "omarchy" }), true);
+      assert.equal(registered.tabs[0].when({ type: "local.buzz-host/omarchy" }), true);
+      assert.equal(registered.tabs[0].when({ type: "claude-code" }), false);
+
+      assert.deepEqual(registered.accessories.map((a) => a.id), ["desktop-preview"]);
+      assert.equal(registered.accessories[0].title, "Agent desktop preview");
+      assert.equal(registered.accessories[0].placement, "response");
+    } finally {
+      for (const fn of cleanups) fn?.();
+    }
+  }
+});
+
+test("Hive Watch: src and bundled plugin.js expose the same API surface", () => {
+  assert.deepEqual(hiveWatchBuilt.inject, hiveWatchSrc.inject);
+  assert.deepEqual(hiveWatchBuilt.inject, ["react", "agents"]);
+  assert.equal(typeof hiveWatchBuilt.apply, "function");
+  assert.equal(typeof hiveWatchBuilt.plain, "function");
+  assert.equal(typeof hiveWatchBuilt.schedule, "function");
+  assert.equal(typeof hiveWatchBuilt.titleOf, "function");
+  assert.equal(typeof hiveWatchBuilt.words, "function");
+
+  for (const mod of [hiveWatchSrc, hiveWatchBuilt]) {
+    const cleanups = [];
+    const registered = { tabs: [] };
+    try {
+      mod.apply({
+        react: { createElement: () => null },
+        effect: (fn) => cleanups.push(fn()),
+        agents: {
+          registerTab: (t) => registered.tabs.push(t),
+        },
+      });
+      assert.deepEqual(registered.tabs.map((t) => t.id), ["attention"]);
+      assert.equal(registered.tabs[0].title, "Attention");
+      assert.equal(registered.tabs[0].when({ type: "omarchy" }), true);
+      assert.equal(registered.tabs[0].when({ type: "local.buzz-host/omarchy" }), true);
+      assert.equal(registered.tabs[0].when({ type: "claude-code" }), false);
+    } finally {
+      for (const fn of cleanups) fn?.();
+    }
+  }
+});
+
+test("all plugin bundles match their sources via plugin/build.mjs --check", { skip: !hasRolldown && "no buzz-app rolldown" }, () => {
   execFileSync(process.execPath, [path.join(here, "build.mjs"), "--check", app], { stdio: "pipe" });
 });

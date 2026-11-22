@@ -1,4 +1,4 @@
-// Shared constants and local server URL storage for the Omarchy agents plugin.
+// Shared constants and local server URL storage for the Remote Agents plugin.
 
 export const URL_KEY = "local.buzz-host.url";
 export const DEFAULT_URL = "wss://omarchy.tail65c5a9.ts.net:8447";
@@ -16,6 +16,19 @@ export const CONCURRENCY_OPTIONS = CONCURRENCY_VALUES.map((n) => ({
 }));
 export const EMPTY = { runtime: "claude", model: "", instructions: "", profile: "", concurrency: DEFAULT_CONCURRENCY };
 export const PROFILE_HINT = "Which Hermes home runs this agent: its config, memory, skills and provider.";
+
+export const AGENT_TYPE_ID = "omarchy";
+export const CORE_PLUGIN_ID = "local.buzz-host";
+
+/** Matches self-hosted agents created via Remote Agents (omarchy / local.buzz-host/omarchy). */
+export function isSelfHostedAgent(agent) {
+  const type = agent?.type;
+  return (
+    type === AGENT_TYPE_ID ||
+    type === `${CORE_PLUGIN_ID}/${AGENT_TYPE_ID}` ||
+    (typeof type === "string" && type.endsWith(`/${AGENT_TYPE_ID}`))
+  );
+}
 
 export const asConfig = (value) => ({ ...EMPTY, ...(value && typeof value === "object" ? value : {}) });
 

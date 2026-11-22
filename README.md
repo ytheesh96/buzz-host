@@ -5,7 +5,7 @@ uses, so agents run on your own server and keep answering while your laptop is
 closed. You create and edit them from Buzz on any device.
 
 ```
-Buzz (laptop) ── plugin "Omarchy agents" ── wss://omarchy.<tailnet>:8447 (tailscale serve)
+Buzz (laptop) ── plugins (Remote Agents, Viewport, Hive Watch) ── wss://omarchy.<tailnet>:8447 (tailscale serve)
                                                    │
                                      buzz-host.mjs (127.0.0.1:8457, systemd --user)
                                                    │ per agent
@@ -27,7 +27,9 @@ Buzz (laptop) ── plugin "Omarchy agents" ── wss://omarchy.<tailnet>:8447
 | `server/agent-bin/buzz` | `~/.local/lib/buzz-host/agent-bin/` | `buzz` CLI wrapper first on agents' PATH: loads the agent's own key from `BUZZ_HOST_AGENT` (Hermes strips secret env vars from its terminal) |
 | `server/*.service` | `~/.config/systemd/user/` | `buzz-host.service`, `buzz-agent@.service` |
 | `server/desktop/` | `~/.local/lib/buzz-host/desktop/` | Agent desktops (see below): `desktop.mjs` (Xvnc + Xfce + cua-driver per agent), `lease.mjs` (take over / hand back), `computer.mjs` (the agent's computer tools), `rfb-bridge.mjs` + `rfb-filter.mjs` (the `/desktop` live view), `launcher.sh` (Hermes Bot Desktop's) |
-| `plugin/` | installed in Buzz | Source modules under `plugin/src/` bundled into `plugin/plugin.js` by `node plugin/build.mjs`. Registers the **Omarchy** remote agent type (tabs: Activity, Attention, Settings), in-chat Desktop preview, and Settings → Plugins → Omarchy agents |
+| `plugin/` | installed in Buzz | **Remote Agents** plugin (ID `local.buzz-host`): source modules under `plugin/src/` bundled into `plugin/plugin.js` by `node plugin/build.mjs`. Registers the **Self-hosted** agent type (ID `omarchy`, tabs: Activity, Settings), composer runtime/model/effort picker & session controls, Orchestrator settings, and Settings → Plugins → Remote Agents |
+| `plugins/viewport/` | installed in Buzz | **Viewport** plugin (ID `local.buzz-host.viewport`): adds dedicated **Desktop** tab on self-hosted agents, in-chat desktop preview accessory, and full-screen noVNC viewer |
+| `plugins/hive-watch/` | installed in Buzz | **Hive Watch** plugin (ID `local.buzz-host.hive-watch`): adds dedicated **Attention** tab on self-hosted agents, backed by buzz-host's native Attention adapter |
 | `hermes-plugin/` | `~/.hermes/plugins/` | Per-session agent identity for Hermes agents (see below) |
 
 Server-only state: `~/.config/buzz-host/config.json` (allowed Tailscale logins,
@@ -198,7 +200,7 @@ Buzz the plugin falls back to its own plain controls. Patch 0002 likewise gives 
 Buzz's own panel.
 
 **Attention tab:** patch 0005 provides Buzz's own Attention tab
-(`ctx.reflect.get("attentionTab").create(source, setting)`). The plugin feeds it from buzz-host:
+(`ctx.reflect.get("attentionTab").create(source, setting)`). The **Hive Watch** plugin (`plugins/hive-watch/`) feeds it from buzz-host and registers a dedicated **Attention** tab on self-hosted agents:
 
 - `attention.view` returns the agent's record in Buzz's shape (`attention`, `skipped`, `timers`,
   `attentionHistory`).
@@ -212,7 +214,7 @@ Buzz's own panel.
 ## Model, effort and session controls in the composer
 
 With Buzz patch `0006-models-for-hosted.patch`, a hosted type may offer `models` and
-`sessionControls`, so the composer's gauge button works for Omarchy agents as for local ones:
+`sessionControls`, so the composer's gauge button works for self-hosted agents as for local ones:
 
 - **Catalog:** the plugin's `models(agent, place)` calls buzz-host `catalog` (with `channelId` and
   `threadRootId` when Buzz passes `place`). buzz-host (`server/catalog.mjs`) opens one unprompted
@@ -292,10 +294,9 @@ browser…, about 65), served through `desktop/computer.mjs`.
   **Take over** (`desktop.lease`) makes the agent's computer tools refuse every call, screenshots
   included; the bridge forwards keyboard, mouse, clipboard and resize only from the viewer holding
   control. **Hand back**, or closing the view, returns control. The lease file fails closed.
-- **Where:** the agent's Settings tab has a Desktop group (on/off switch, which restarts the agent;
-  **Open desktop**; **Stop desktop** while it runs). There is no Desktop tab: the in-chat preview
-  covers watching during a turn, and Open desktop covers the rest (e.g. signing in to a site for the
-  agent). Both open the same full-screen view (the plugin's `desktopViewer`): an overlay on
+- **Where:** the **Viewport** plugin (`plugins/viewport/`) registers a dedicated **Desktop** tab on self-hosted agents (on/off switch, which restarts the agent;
+  **Open desktop**; **Stop desktop** while it runs), alongside the in-chat preview
+  during a turn. Both open the same full-screen view (the plugin's `desktopViewer`): an overlay on
   `document.body`, refitted after it is placed (noVNC rescaled, back buffer redrawn: WebKitGTK
   otherwise shows a newly placed canvas black until the next frame). Closing it closes the view.
   Buzz's webview takes the Esc key to leave monitor-wide full screen, so the toolbar has an **Esc**

@@ -1,4 +1,4 @@
-// Omarchy remote agent type: creation forms, Settings tab, and agent type registration.
+// Self-hosted remote agent type: creation forms, Settings tab, and agent type registration.
 import {
   CONCURRENCY_OPTIONS,
   DEFAULT_CONCURRENCY,
@@ -23,8 +23,6 @@ export function createType({
   uiKit,
   invalidateCatalog,
   ActivityTab,
-  AttentionTab,
-  DesktopSettings,
   OrchestratorSettings,
   hostedModels,
   hostedSessions,
@@ -394,7 +392,6 @@ export function createType({
             },
             logs || "(no log lines)",
           ),
-        h(DesktopSettings, { ui, agent }),
         h(OrchestratorSettings, { ui, agent }),
         settingsContent,
       );
@@ -659,7 +656,6 @@ export function createType({
           },
           logs || "(no log lines)",
         ),
-      h(DesktopSettings, { agent }),
       h(OrchestratorSettings, { agent }),
       !settingsSection && settingsContent,
     );
@@ -667,7 +663,7 @@ export function createType({
 
   const omarchyType = {
     id: "omarchy",
-    title: "Omarchy",
+    title: "Self-hosted",
     description: "Hosted on your own server with buzz-host; keeps answering while this computer is off.",
     defaults: () => ({ config: { ...EMPTY } }),
     adopt: (carry, saved) => ({ ...asConfig(saved), instructions: carry.instructions ?? asConfig(saved).instructions }),
@@ -677,7 +673,6 @@ export function createType({
     CreateConfiguration,
     tabs: [
       { id: "activity", title: "Activity", role: "activity", component: ActivityTab },
-      { id: "attention", title: "Attention", component: AttentionTab },
       { id: "settings", title: "Settings", role: "settings", splitSettings: true, component: SettingsTab },
     ],
     remote: {
