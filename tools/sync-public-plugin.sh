@@ -17,7 +17,7 @@ if [ ! -d "$APP_DIR/.git" ]; then
 fi
 
 echo "Building plugin bundles from $ROOT/plugin/src..."
-node "$ROOT/plugin/build.mjs" "$APP_DIR"
+(cd "$ROOT" && node plugin/build.mjs "$APP_DIR")
 
 mkdir -p "$DEST"
 cp -f "$ROOT/plugin/manifest.json" "$DEST/manifest.json"
