@@ -8118,12 +8118,7 @@ function createDesktop({ React, client, ctx, uiKit, Btn, Icon, navigation, panel
 			variant: "prominent",
 			disabled: working,
 			onClick: () => void viewer.takeOver()
-		}, view.busy === "take" ? "Taking over…" : "Take over")), view.status === "live" && h(Btn, {
-			size: "sm",
-			variant: "ghost",
-			disabled: working,
-			onClick: () => viewer.disconnect()
-		}, "Disconnect"), view.status === "off" && activePubkey && desktopEnabled && h(Btn, {
+		}, view.busy === "take" ? "Taking over…" : "Take over")), view.status === "off" && activePubkey && desktopEnabled && h(Btn, {
 			size: "sm",
 			variant: "prominent",
 			disabled: working,
