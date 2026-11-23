@@ -317,6 +317,14 @@ browser…, about 65), served through `desktop/computer.mjs`.
   Removing the agent stops its desktop.
 - Tests: `node --test server/desktop/` (lease, RFB filter, snapshot and per-chat activity).
 
+## Deploying & Auto-deploy
+
+- **Manual deploy:** `./deploy.sh [host]` (default `omarchy`, over SSH) or `./deploy.sh --local` directly on the server (atomic temp-file + `mv` installs, preserving unmanaged binaries like `bin/buzz-acp` and `npm/`).
+- **Pull-based auto-deploy on merge (`buzz-host-deploy.timer`):**
+  - Enable once on the server: `./server/enable-auto-deploy.sh --seed` (or without `--seed` to deploy immediately).
+  - Every 2 minutes `server/auto-deploy.sh` fetches `origin/main` into a dedicated clean checkout (`~/.local/share/buzz-host-deploy/repo`, separate from `~/Work/buzz-host`), skips restarting if no files under `server/`, `hermes-plugin/`, or `deploy.sh` changed, runs the local server test suites, snapshots managed files, installs atomically via `deploy.sh --local`, restarts `buzz-host.service`, and verifies `is-active` + `http://127.0.0.1:<port>/health` — rolling back automatically on failure.
+  - Trigger on demand: `systemctl --user start buzz-host-deploy.service`; inspect logs with `journalctl --user -u buzz-host-deploy.service`.
+
 ## Limits
 
 - Buzz's own Attention doesn't run remote agents; buzz-host's does (above), without classifiers or source watches yet.
