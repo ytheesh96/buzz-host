@@ -5,6 +5,7 @@ import { createBuzzPrimitives, ui } from "../../../plugin/src/ui.js";
 import {
   VIEWPORT_PAGE_ICON,
   VIEWPORT_PAGE_ID,
+  agentActivityPanelTarget,
   createDesktop,
   parseViewportRoute,
   previewKeys,
@@ -16,13 +17,14 @@ import { isSelfHostedAgent } from "../../../plugin/src/config.js";
 export {
   VIEWPORT_PAGE_ICON,
   VIEWPORT_PAGE_ID,
+  agentActivityPanelTarget,
   parseViewportRoute,
   previewKeys,
   validateViewportRoute,
   viewportPageTarget,
 };
 
-export const inject = ["react", "agents", "conversation", "pages", "navigation"];
+export const inject = ["react", "agents", "conversation", "pages", "navigation", "panels"];
 
 export function apply(ctx) {
   const React = ctx.react;
@@ -40,6 +42,7 @@ export function apply(ctx) {
     Btn,
     Icon,
     navigation: ctx.navigation,
+    panels: ctx.panels,
     pluginId,
   });
 

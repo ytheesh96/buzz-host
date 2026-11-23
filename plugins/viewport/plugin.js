@@ -338,7 +338,8 @@ const ICONS = {
 		"M15 16v4"
 	],
 	sidebar: ["M4 6a2 2 0 0 1 2 -2h12a2 2 0 0 1 2 2v12a2 2 0 0 1 -2 2h-12a2 2 0 0 1 -2 -2z", "M9 4l0 16"],
-	refresh: ["M20 11a8.1 8.1 0 0 0 -15.5 -2m-.5 -4v4h4", "M4 13a8.1 8.1 0 0 0 15.5 2m.5 4v-4h-4"]
+	refresh: ["M20 11a8.1 8.1 0 0 0 -15.5 -2m-.5 -4v4h4", "M4 13a8.1 8.1 0 0 0 15.5 2m.5 4v-4h-4"],
+	activity: ["M3 12h4l3 8l4 -16l3 8h4"]
 };
 function createBuzzPrimitives(React) {
 	const h = React.createElement;
@@ -7434,6 +7435,10 @@ function parseViewportRoute(params) {
 function validateViewportRoute(params) {
 	return parseViewportRoute(params) !== null;
 }
+/** Target string for Buzz's native agent sidebar panel opened to its Activity tab. */
+function agentActivityPanelTarget(pubkey) {
+	return typeof pubkey === "string" && HEX_PUBKEY.test(pubkey) ? `buzz:profile?agent=${pubkey.toLowerCase()}&tab=activity` : "";
+}
 /** Build a Buzz navigation target that opens the Viewport page inside the app. */
 function viewportPageTarget(pluginId, pubkey, { take = false } = {}) {
 	const normalized = typeof pubkey === "string" && HEX_PUBKEY.test(pubkey) ? pubkey.toLowerCase() : "";
@@ -7474,8 +7479,15 @@ function sortDesktopAgents(agents) {
 		return String(a.name || a.pubkey).localeCompare(String(b.name || b.pubkey), "en");
 	});
 }
-function createDesktop({ React, client, ctx, uiKit, Btn, Icon, navigation, pluginId }) {
+function createDesktop({ React, client, ctx, uiKit, Btn, Icon, navigation, panels, pluginId }) {
 	const { h, Note } = uiKit;
+	const emptyPanels = () => [];
+	const useNoopSplit = () => ({
+		ref: React.useRef(null),
+		handle: null
+	});
+	const useSideSplit = panels?.ui?.useSplit ?? useNoopSplit;
+	const PanelWorkspace = panels?.ui?.Workspace;
 	const viewers = /* @__PURE__ */ new Map();
 	function desktopViewer(pubkey) {
 		let v = viewers.get(pubkey);
@@ -7678,6 +7690,7 @@ function createDesktop({ React, client, ctx, uiKit, Btn, Icon, navigation, plugi
 		const [loadError, setLoadError] = React.useState("");
 		const [selectedPubkey, setSelectedPubkey] = React.useState(() => route?.pubkey ?? "");
 		const [sidebarOpen, setSidebarOpen] = React.useState(true);
+		const [inspectorOpen, setInspectorOpen] = React.useState(false);
 		const [actionBusy, setActionBusy] = React.useState("");
 		const [actionError, setActionError] = React.useState("");
 		const [autoOpen, setAutoOpen] = React.useState(() => route?.pubkey ? {
@@ -7687,6 +7700,15 @@ function createDesktop({ React, client, ctx, uiKit, Btn, Icon, navigation, plugi
 		} : null);
 		const stageRef = React.useRef(null);
 		const initialSelectDone = React.useRef(Boolean(route?.pubkey));
+		React.useSyncExternalStore(panels?.subscribe ?? noSubscribe, panels?.snapshot ?? emptyPanels);
+		const relayScope = (() => {
+			try {
+				return ctx.reflect?.get?.("relay")?.snapshot?.()?.scope;
+			} catch {
+				return;
+			}
+		})();
+		const split = useSideSplit(relayScope, `${pluginId || "local.buzz-host.viewport"}:agent-sidebar`, 400, 300);
 		const loadAgents = React.useCallback(async (signal) => {
 			setLoading(true);
 			try {
@@ -7795,7 +7817,15 @@ function createDesktop({ React, client, ctx, uiKit, Btn, Icon, navigation, plugi
 		]);
 		React.useEffect(() => {
 			viewer?.refit();
-		}, [sidebarOpen, viewer]);
+		}, [
+			sidebarOpen,
+			inspectorOpen,
+			viewer
+		]);
+		const inspectorTarget = activePubkey ? agentActivityPanelTarget(activePubkey) : "";
+		const inspectorPanel = inspectorTarget ? panels?.resolve?.(inspectorTarget) : void 0;
+		const canInspect = Boolean(inspectorPanel && inspectorTarget);
+		const showInspector = Boolean(inspectorOpen && canInspect);
 		const selectAgent = (agent) => {
 			setActionError("");
 			setSelectedPubkey(agent.pubkey);
@@ -7982,7 +8012,16 @@ function createDesktop({ React, client, ctx, uiKit, Btn, Icon, navigation, plugi
 				fontWeight: 600,
 				letterSpacing: "0.02em"
 			}
-		}, "Desktop off"), ...disabledAgents.map(renderAgentRow))), h("section", {
+		}, "Desktop off"), ...disabledAgents.map(renderAgentRow))), h("div", {
+			ref: split.ref,
+			style: {
+				flex: 1,
+				minWidth: 0,
+				minHeight: 0,
+				display: "flex",
+				overflow: "hidden"
+			}
+		}, h("section", {
 			"aria-label": "Remote desktop",
 			style: {
 				flex: 1,
@@ -8013,7 +8052,27 @@ function createDesktop({ React, client, ctx, uiKit, Btn, Icon, navigation, plugi
 		}, Icon ? h(Icon, {
 			name: "sidebar",
 			size: 16
-		}) : sidebarOpen ? "Hide list" : "Show list"), h("h2", {
+		}) : sidebarOpen ? "Hide list" : "Show list"), canInspect ? h("button", {
+			type: "button",
+			onClick: () => setInspectorOpen((v) => !v),
+			title: showInspector ? `Close ${activeName} sidebar` : `Open ${activeName} Activity sidebar`,
+			style: {
+				all: "unset",
+				cursor: "pointer",
+				minWidth: 0,
+				overflow: "hidden",
+				textOverflow: "ellipsis",
+				whiteSpace: "nowrap"
+			}
+		}, h("h2", {
+			className: "text-label text-primary",
+			style: {
+				margin: 0,
+				overflow: "hidden",
+				textOverflow: "ellipsis",
+				whiteSpace: "nowrap"
+			}
+		}, activeName)) : h("h2", {
 			className: "text-label text-primary",
 			style: {
 				margin: 0,
@@ -8064,7 +8123,21 @@ function createDesktop({ React, client, ctx, uiKit, Btn, Icon, navigation, plugi
 			variant: "ghost",
 			disabled: working,
 			onClick: () => void handleStopDesktop()
-		}, actionBusy === "stop" ? "Stopping…" : "Stop desktop"))), h("div", { style: {
+		}, actionBusy === "stop" ? "Stopping…" : "Stop desktop"), canInspect && h(Btn, {
+			size: "sm",
+			variant: showInspector ? "outline" : "ghost",
+			onClick: () => setInspectorOpen((v) => !v),
+			title: showInspector ? `Hide ${activeName} sidebar` : `Open ${activeName} Activity sidebar`,
+			"aria-label": showInspector ? `Hide ${activeName} sidebar` : `Open ${activeName} Activity sidebar`,
+			"aria-pressed": showInspector
+		}, h("span", { style: {
+			display: "inline-flex",
+			alignItems: "center",
+			gap: 6
+		} }, Icon && h(Icon, {
+			name: "activity",
+			size: 15
+		}), "Activity")))), h("div", { style: {
 			flex: 1,
 			minWidth: 0,
 			minHeight: 0,
@@ -8119,7 +8192,44 @@ function createDesktop({ React, client, ctx, uiKit, Btn, Icon, navigation, plugi
 			variant: "outline",
 			disabled: working,
 			onClick: () => handleOpen(true)
-		}, view.busy === "take" ? "Taking over…" : "Take over"))), (actionError || view.error) && h(Note, { tone: "error" }, actionError || view.error)))));
+		}, view.busy === "take" ? "Taking over…" : "Take over"))), (actionError || view.error) && h(Note, { tone: "error" }, actionError || view.error)))), showInspector && h("aside", {
+			"aria-label": `${activeName} details`,
+			"data-buzz-viewport-inspector": "",
+			style: {
+				position: "relative",
+				width: "var(--secondary-panel-width, 25rem)",
+				minWidth: "18rem",
+				maxWidth: "55%",
+				flexShrink: 0,
+				display: "flex",
+				flexDirection: "column",
+				minHeight: 0,
+				borderInlineStart: "1px solid var(--border-standard)",
+				overflow: "hidden"
+			}
+		}, split.handle, PanelWorkspace ? h(PanelWorkspace, {
+			label: `${activeName} details`,
+			value: inspectorTarget,
+			select: () => {},
+			items: [{
+				id: inspectorTarget,
+				label: `${activeName} · Activity`,
+				close: () => setInspectorOpen(false),
+				content: h(inspectorPanel.component, {
+					key: inspectorTarget,
+					target: inspectorTarget,
+					close: () => setInspectorOpen(false)
+				})
+			}]
+		}) : h("div", { style: {
+			flex: 1,
+			minHeight: 0,
+			overflow: "auto"
+		} }, h(inspectorPanel.component, {
+			key: inspectorTarget,
+			target: inspectorTarget,
+			close: () => setInspectorOpen(false)
+		})))));
 	}
 	function DesktopSettings({ ui, agent }) {
 		const pubkey = agent.pubkey;
@@ -8536,7 +8646,8 @@ const inject = [
 	"agents",
 	"conversation",
 	"pages",
-	"navigation"
+	"navigation",
+	"panels"
 ];
 function apply(ctx) {
 	const React = ctx.react;
@@ -8553,6 +8664,7 @@ function apply(ctx) {
 		Btn,
 		Icon,
 		navigation: ctx.navigation,
+		panels: ctx.panels,
 		pluginId
 	});
 	const agentUi = () => {
@@ -8599,4 +8711,4 @@ function apply(ctx) {
 }
 
 //#endregion
-export { VIEWPORT_PAGE_ICON, VIEWPORT_PAGE_ID, apply, inject, parseViewportRoute, previewKeys, validateViewportRoute, viewportPageTarget };
+export { VIEWPORT_PAGE_ICON, VIEWPORT_PAGE_ID, agentActivityPanelTarget, apply, inject, parseViewportRoute, previewKeys, validateViewportRoute, viewportPageTarget };

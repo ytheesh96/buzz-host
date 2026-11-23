@@ -38,6 +38,13 @@ export function validateViewportRoute(params) {
   return parseViewportRoute(params) !== null;
 }
 
+/** Target string for Buzz's native agent sidebar panel opened to its Activity tab. */
+export function agentActivityPanelTarget(pubkey) {
+  return typeof pubkey === "string" && HEX_PUBKEY.test(pubkey)
+    ? `buzz:profile?agent=${pubkey.toLowerCase()}&tab=activity`
+    : "";
+}
+
 /** Build a Buzz navigation target that opens the Viewport page inside the app. */
 export function viewportPageTarget(pluginId, pubkey, { take = false } = {}) {
   const normalized = typeof pubkey === "string" && HEX_PUBKEY.test(pubkey) ? pubkey.toLowerCase() : "";
@@ -77,8 +84,12 @@ function sortDesktopAgents(agents) {
   });
 }
 
-export function createDesktop({ React, client, ctx, uiKit, Btn, Icon, navigation, pluginId }) {
+export function createDesktop({ React, client, ctx, uiKit, Btn, Icon, navigation, panels, pluginId }) {
   const { h, Note } = uiKit;
+  const emptyPanels = () => [];
+  const useNoopSplit = () => ({ ref: React.useRef(null), handle: null });
+  const useSideSplit = panels?.ui?.useSplit ?? useNoopSplit;
+  const PanelWorkspace = panels?.ui?.Workspace;
 
   // ----- Agent desktop: one inline live view per agent -----
   // Mounted directly inside Buzz's Viewport workspace page (never monitor-wide
@@ -289,6 +300,7 @@ export function createDesktop({ React, client, ctx, uiKit, Btn, Icon, navigation
     const [loadError, setLoadError] = React.useState("");
     const [selectedPubkey, setSelectedPubkey] = React.useState(() => route?.pubkey ?? "");
     const [sidebarOpen, setSidebarOpen] = React.useState(true);
+    const [inspectorOpen, setInspectorOpen] = React.useState(false);
     const [actionBusy, setActionBusy] = React.useState("");
     const [actionError, setActionError] = React.useState("");
     const [autoOpen, setAutoOpen] = React.useState(() =>
@@ -296,6 +308,15 @@ export function createDesktop({ React, client, ctx, uiKit, Btn, Icon, navigation
     );
     const stageRef = React.useRef(null);
     const initialSelectDone = React.useRef(Boolean(route?.pubkey));
+    React.useSyncExternalStore(panels?.subscribe ?? noSubscribe, panels?.snapshot ?? emptyPanels);
+    const relayScope = (() => {
+      try {
+        return ctx.reflect?.get?.("relay")?.snapshot?.()?.scope;
+      } catch {
+        return undefined;
+      }
+    })();
+    const split = useSideSplit(relayScope, `${pluginId || "local.buzz-host.viewport"}:agent-sidebar`, 400, 300);
 
     const loadAgents = React.useCallback(async (signal) => {
       setLoading(true);
@@ -407,10 +428,15 @@ export function createDesktop({ React, client, ctx, uiKit, Btn, Icon, navigation
       }
     }, [activePubkey, view.status, view.mine]);
 
-    // Refit noVNC whenever the sidebar toggles.
+    // Refit noVNC whenever the left or right sidebar toggles.
     React.useEffect(() => {
       viewer?.refit();
-    }, [sidebarOpen, viewer]);
+    }, [sidebarOpen, inspectorOpen, viewer]);
+
+    const inspectorTarget = activePubkey ? agentActivityPanelTarget(activePubkey) : "";
+    const inspectorPanel = inspectorTarget ? panels?.resolve?.(inspectorTarget) : undefined;
+    const canInspect = Boolean(inspectorPanel && inspectorTarget);
+    const showInspector = Boolean(inspectorOpen && canInspect);
 
     const selectAgent = (agent) => {
       setActionError("");
@@ -664,220 +690,324 @@ export function createDesktop({ React, client, ctx, uiKit, Btn, Icon, navigation
           ),
         ),
 
-      // Right pane: header controls + live inline desktop stage
+      // Right area: live inline desktop stage + optional Buzz agent Activity right sidebar
       h(
-        "section",
+        "div",
         {
-          "aria-label": "Remote desktop",
+          ref: split.ref,
           style: {
             flex: 1,
             minWidth: 0,
             minHeight: 0,
             display: "flex",
-            flexDirection: "column",
             overflow: "hidden",
           },
         },
         h(
-          "header",
-          { "data-buzz-ui": "", className: "panel-header" },
-          h(
-            "div",
-            { className: "panel-header-title", style: { display: "flex", alignItems: "center", gap: "var(--space-2)", minWidth: 0 } },
-            h(
-              Btn,
-              {
-                size: "sm",
-                variant: "ghost",
-                onClick: () => setSidebarOpen((v) => !v),
-                title: sidebarOpen ? "Hide agent list" : "Show agent list",
-                "aria-label": sidebarOpen ? "Hide agent list" : "Show agent list",
-                "aria-pressed": sidebarOpen,
-              },
-              Icon ? h(Icon, { name: "sidebar", size: 16 }) : sidebarOpen ? "Hide list" : "Show list",
-            ),
-            h(
-              "h2",
-              {
-                className: "text-label text-primary",
-                style: { margin: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" },
-              },
-              activeName,
-            ),
-            statusText &&
-              h(
-                "span",
-                {
-                  "data-buzz-viewport-status": view.mine ? "control" : view.status,
-                  className: "text-caption",
-                  style: {
-                    padding: "2px 8px",
-                    borderRadius: 999,
-                    whiteSpace: "nowrap",
-                    fontWeight: 500,
-                    background: view.mine
-                      ? "var(--accent-subtle, rgba(34,197,94,.16))"
-                      : "var(--surface-inset, rgba(128,128,128,.14))",
-                    color: view.mine ? "var(--text-primary)" : "var(--text-secondary)",
-                  },
-                },
-                statusText,
-              ),
-          ),
-          h(
-            "div",
-            { className: "panel-header-actions", style: { display: "flex", alignItems: "center", gap: "var(--space-2)" } },
-            view.status === "live" &&
-              (view.mine
-                ? h(
-                    Btn,
-                    { size: "sm", variant: "outline", disabled: working, onClick: () => void viewer.handBack() },
-                    view.busy === "back" ? "Handing back…" : "Hand back",
-                  )
-                : h(
-                    Btn,
-                    { size: "sm", variant: "prominent", disabled: working, onClick: () => void viewer.takeOver() },
-                    view.busy === "take" ? "Taking over…" : "Take over",
-                  )),
-            view.status === "live" &&
-              h(
-                Btn,
-                { size: "sm", variant: "ghost", disabled: working, onClick: () => viewer.disconnect() },
-                "Disconnect",
-              ),
-            view.status === "off" &&
-              activePubkey &&
-              desktopEnabled &&
-              h(
-                Btn,
-                { size: "sm", variant: "prominent", disabled: working, onClick: () => handleOpen(false) },
-                view.busy === "watch" ? "Opening…" : "Open desktop",
-              ),
-            activePubkey &&
-              desktopEnabled &&
-              desktopRunning &&
-              h(
-                Btn,
-                { size: "sm", variant: "ghost", disabled: working, onClick: () => void handleStopDesktop() },
-                actionBusy === "stop" ? "Stopping…" : "Stop desktop",
-              ),
-          ),
-        ),
-        h(
-          "div",
+          "section",
           {
+            "aria-label": "Remote desktop",
             style: {
               flex: 1,
               minWidth: 0,
               minHeight: 0,
-              position: "relative",
               display: "flex",
-              alignItems: "center",
-              justifyContent: "center",
-              background: showStage ? "#000" : "transparent",
+              flexDirection: "column",
               overflow: "hidden",
             },
           },
-          // Dedicated DOM host for noVNC (React never manages children inside stageRef).
-          h("div", {
-            ref: stageRef,
-            style: {
-              position: "absolute",
-              inset: 0,
-              display: showStage ? "block" : "none",
-            },
-          }),
-          view.status === "connecting" &&
+          h(
+            "header",
+            { "data-buzz-ui": "", className: "panel-header" },
             h(
               "div",
-              {
-                className: "ui-card",
-                style: {
-                  position: "relative",
-                  zIndex: 1,
-                  padding: "var(--space-3) var(--space-4)",
-                  display: "flex",
-                  alignItems: "center",
-                  gap: "var(--space-2)",
+              { className: "panel-header-title", style: { display: "flex", alignItems: "center", gap: "var(--space-2)", minWidth: 0 } },
+              h(
+                Btn,
+                {
+                  size: "sm",
+                  variant: "ghost",
+                  onClick: () => setSidebarOpen((v) => !v),
+                  title: sidebarOpen ? "Hide agent list" : "Show agent list",
+                  "aria-label": sidebarOpen ? "Hide agent list" : "Show agent list",
+                  "aria-pressed": sidebarOpen,
                 },
-              },
-              h("span", { className: "text-body-sm text-secondary" }, `Connecting to ${activeName}’s desktop…`),
-            ),
-          !showStage &&
-            h(
-              "div",
-              {
-                style: {
-                  maxWidth: "28rem",
-                  padding: "var(--space-6)",
-                  display: "grid",
-                  gap: "var(--space-3)",
-                  textAlign: "center",
-                  justifyItems: "center",
-                },
-              },
-              Icon &&
-                h(Icon, {
-                  name: "monitor",
-                  size: 36,
-                  style: { color: "var(--text-subtle)" },
-                }),
-              !activePubkey
+                Icon ? h(Icon, { name: "sidebar", size: 16 }) : sidebarOpen ? "Hide list" : "Show list",
+              ),
+              canInspect
                 ? h(
-                    React.Fragment,
-                    null,
-                    h("h3", { style: { margin: 0 } }, "No agent desktop selected"),
+                    "button",
+                    {
+                      type: "button",
+                      onClick: () => setInspectorOpen((v) => !v),
+                      title: showInspector ? `Close ${activeName} sidebar` : `Open ${activeName} Activity sidebar`,
+                      style: {
+                        all: "unset",
+                        cursor: "pointer",
+                        minWidth: 0,
+                        overflow: "hidden",
+                        textOverflow: "ellipsis",
+                        whiteSpace: "nowrap",
+                      },
+                    },
                     h(
-                      Note,
-                      null,
-                      "Select a self-hosted agent from the list to watch or take over its remote desktop inside Buzz.",
+                      "h2",
+                      {
+                        className: "text-label text-primary",
+                        style: { margin: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" },
+                      },
+                      activeName,
                     ),
                   )
-                : !desktopEnabled
+                : h(
+                    "h2",
+                    {
+                      className: "text-label text-primary",
+                      style: { margin: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" },
+                    },
+                    activeName,
+                  ),
+              statusText &&
+                h(
+                  "span",
+                  {
+                    "data-buzz-viewport-status": view.mine ? "control" : view.status,
+                    className: "text-caption",
+                    style: {
+                      padding: "2px 8px",
+                      borderRadius: 999,
+                      whiteSpace: "nowrap",
+                      fontWeight: 500,
+                      background: view.mine
+                        ? "var(--accent-subtle, rgba(34,197,94,.16))"
+                        : "var(--surface-inset, rgba(128,128,128,.14))",
+                      color: view.mine ? "var(--text-primary)" : "var(--text-secondary)",
+                    },
+                  },
+                  statusText,
+                ),
+            ),
+            h(
+              "div",
+              { className: "panel-header-actions", style: { display: "flex", alignItems: "center", gap: "var(--space-2)" } },
+              view.status === "live" &&
+                (view.mine
+                  ? h(
+                      Btn,
+                      { size: "sm", variant: "outline", disabled: working, onClick: () => void viewer.handBack() },
+                      view.busy === "back" ? "Handing back…" : "Hand back",
+                    )
+                  : h(
+                      Btn,
+                      { size: "sm", variant: "prominent", disabled: working, onClick: () => void viewer.takeOver() },
+                      view.busy === "take" ? "Taking over…" : "Take over",
+                    )),
+              view.status === "live" &&
+                h(
+                  Btn,
+                  { size: "sm", variant: "ghost", disabled: working, onClick: () => viewer.disconnect() },
+                  "Disconnect",
+                ),
+              view.status === "off" &&
+                activePubkey &&
+                desktopEnabled &&
+                h(
+                  Btn,
+                  { size: "sm", variant: "prominent", disabled: working, onClick: () => handleOpen(false) },
+                  view.busy === "watch" ? "Opening…" : "Open desktop",
+                ),
+              activePubkey &&
+                desktopEnabled &&
+                desktopRunning &&
+                h(
+                  Btn,
+                  { size: "sm", variant: "ghost", disabled: working, onClick: () => void handleStopDesktop() },
+                  actionBusy === "stop" ? "Stopping…" : "Stop desktop",
+                ),
+              canInspect &&
+                h(
+                  Btn,
+                  {
+                    size: "sm",
+                    variant: showInspector ? "outline" : "ghost",
+                    onClick: () => setInspectorOpen((v) => !v),
+                    title: showInspector ? `Hide ${activeName} sidebar` : `Open ${activeName} Activity sidebar`,
+                    "aria-label": showInspector ? `Hide ${activeName} sidebar` : `Open ${activeName} Activity sidebar`,
+                    "aria-pressed": showInspector,
+                  },
+                  h(
+                    "span",
+                    { style: { display: "inline-flex", alignItems: "center", gap: 6 } },
+                    Icon && h(Icon, { name: "activity", size: 15 }),
+                    "Activity",
+                  ),
+                ),
+            ),
+          ),
+          h(
+            "div",
+            {
+              style: {
+                flex: 1,
+                minWidth: 0,
+                minHeight: 0,
+                position: "relative",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                background: showStage ? "#000" : "transparent",
+                overflow: "hidden",
+              },
+            },
+            // Dedicated DOM host for noVNC (React never manages children inside stageRef).
+            h("div", {
+              ref: stageRef,
+              style: {
+                position: "absolute",
+                inset: 0,
+                display: showStage ? "block" : "none",
+              },
+            }),
+            view.status === "connecting" &&
+              h(
+                "div",
+                {
+                  className: "ui-card",
+                  style: {
+                    position: "relative",
+                    zIndex: 1,
+                    padding: "var(--space-3) var(--space-4)",
+                    display: "flex",
+                    alignItems: "center",
+                    gap: "var(--space-2)",
+                  },
+                },
+                h("span", { className: "text-body-sm text-secondary" }, `Connecting to ${activeName}’s desktop…`),
+              ),
+            !showStage &&
+              h(
+                "div",
+                {
+                  style: {
+                    maxWidth: "28rem",
+                    padding: "var(--space-6)",
+                    display: "grid",
+                    gap: "var(--space-3)",
+                    textAlign: "center",
+                    justifyItems: "center",
+                  },
+                },
+                Icon &&
+                  h(Icon, {
+                    name: "monitor",
+                    size: 36,
+                    style: { color: "var(--text-subtle)" },
+                  }),
+                !activePubkey
                   ? h(
                       React.Fragment,
                       null,
-                      h("h3", { style: { margin: 0 } }, `Desktop is off for ${activeName}`),
+                      h("h3", { style: { margin: 0 } }, "No agent desktop selected"),
                       h(
                         Note,
                         null,
-                        `Turn on Desktop to give ${activeName} its own Linux desktop (Xfce and a browser) on your server. Turning it on restarts ${activeName}.`,
-                      ),
-                      h(
-                        Btn,
-                        { variant: "prominent", disabled: working, onClick: () => void handleEnableDesktop() },
-                        actionBusy === "enable" ? `Enabling for ${activeName}…` : "Turn on Desktop",
+                        "Select a self-hosted agent from the list to watch or take over its remote desktop inside Buzz.",
                       ),
                     )
-                  : h(
-                      React.Fragment,
-                      null,
-                      h("h3", { style: { margin: 0 } }, `${activeName}’s desktop`),
-                      h(
-                        Note,
+                  : !desktopEnabled
+                    ? h(
+                        React.Fragment,
                         null,
-                        desktopRunning
-                          ? "Running on your server. Connect to watch or take over directly inside Buzz."
-                          : "Stopped. Opening it starts the desktop on your server.",
-                      ),
-                      h(
-                        "div",
-                        { style: { display: "flex", gap: "var(--space-2)", flexWrap: "wrap", justifyContent: "center" } },
+                        h("h3", { style: { margin: 0 } }, `Desktop is off for ${activeName}`),
                         h(
-                          Btn,
-                          { variant: "prominent", disabled: working, onClick: () => handleOpen(false) },
-                          view.busy === "watch" ? "Opening…" : "Open desktop",
+                          Note,
+                          null,
+                          `Turn on Desktop to give ${activeName} its own Linux desktop (Xfce and a browser) on your server. Turning it on restarts ${activeName}.`,
                         ),
                         h(
                           Btn,
-                          { variant: "outline", disabled: working, onClick: () => handleOpen(true) },
-                          view.busy === "take" ? "Taking over…" : "Take over",
+                          { variant: "prominent", disabled: working, onClick: () => void handleEnableDesktop() },
+                          actionBusy === "enable" ? `Enabling for ${activeName}…` : "Turn on Desktop",
+                        ),
+                      )
+                    : h(
+                        React.Fragment,
+                        null,
+                        h("h3", { style: { margin: 0 } }, `${activeName}’s desktop`),
+                        h(
+                          Note,
+                          null,
+                          desktopRunning
+                            ? "Running on your server. Connect to watch or take over directly inside Buzz."
+                            : "Stopped. Opening it starts the desktop on your server.",
+                        ),
+                        h(
+                          "div",
+                          { style: { display: "flex", gap: "var(--space-2)", flexWrap: "wrap", justifyContent: "center" } },
+                          h(
+                            Btn,
+                            { variant: "prominent", disabled: working, onClick: () => handleOpen(false) },
+                            view.busy === "watch" ? "Opening…" : "Open desktop",
+                          ),
+                          h(
+                            Btn,
+                            { variant: "outline", disabled: working, onClick: () => handleOpen(true) },
+                            view.busy === "take" ? "Taking over…" : "Take over",
+                          ),
                         ),
                       ),
-                    ),
-              (actionError || view.error) && h(Note, { tone: "error" }, actionError || view.error),
-            ),
+                (actionError || view.error) && h(Note, { tone: "error" }, actionError || view.error),
+              ),
+          ),
         ),
+        showInspector &&
+          h(
+            "aside",
+            {
+              "aria-label": `${activeName} details`,
+              "data-buzz-viewport-inspector": "",
+              style: {
+                position: "relative",
+                width: "var(--secondary-panel-width, 25rem)",
+                minWidth: "18rem",
+                maxWidth: "55%",
+                flexShrink: 0,
+                display: "flex",
+                flexDirection: "column",
+                minHeight: 0,
+                borderInlineStart: "1px solid var(--border-standard)",
+                overflow: "hidden",
+              },
+            },
+            split.handle,
+            PanelWorkspace
+              ? h(PanelWorkspace, {
+                  label: `${activeName} details`,
+                  value: inspectorTarget,
+                  select: () => {},
+                  items: [
+                    {
+                      id: inspectorTarget,
+                      label: `${activeName} · Activity`,
+                      close: () => setInspectorOpen(false),
+                      content: h(inspectorPanel.component, {
+                        key: inspectorTarget,
+                        target: inspectorTarget,
+                        close: () => setInspectorOpen(false),
+                      }),
+                    },
+                  ],
+                })
+              : h(
+                  "div",
+                  { style: { flex: 1, minHeight: 0, overflow: "auto" } },
+                  h(inspectorPanel.component, {
+                    key: inspectorTarget,
+                    target: inspectorTarget,
+                    close: () => setInspectorOpen(false),
+                  }),
+                ),
+          ),
       ),
     );
   }

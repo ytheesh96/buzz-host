@@ -28,6 +28,7 @@ import { buildTurns, parseFrame, promptRequest } from "./src/activity.js";
 import {
   VIEWPORT_PAGE_ICON,
   VIEWPORT_PAGE_ID,
+  agentActivityPanelTarget,
   parseViewportRoute,
   previewKeys,
   validateViewportRoute,
@@ -330,6 +331,9 @@ test("Viewport route parsing, navigation targets, and no fullscreen/Esc-exit hij
     route: { version: 1, params: { pubkey: pk, take: true } },
   });
 
+  assert.equal(agentActivityPanelTarget(pk.toUpperCase()), `buzz:profile?agent=${pk}&tab=activity`);
+  assert.equal(agentActivityPanelTarget("bad"), "");
+
   // Viewport opens inside Buzz's own page, never monitor-wide requestFullscreen.
   const desktopSrc = fs.readFileSync(path.join(here, "src/desktop.js"), "utf8");
   assert.equal(/requestFullscreen|exitFullscreen|fullscreenchange/.test(desktopSrc), false);
@@ -339,12 +343,13 @@ test("Viewport route parsing, navigation targets, and no fullscreen/Esc-exit hij
 
 test("Viewport: src and bundled plugin.js expose the same API surface", () => {
   assert.deepEqual(viewportBuilt.inject, viewportSrc.inject);
-  assert.deepEqual(viewportBuilt.inject, ["react", "agents", "conversation", "pages", "navigation"]);
+  assert.deepEqual(viewportBuilt.inject, ["react", "agents", "conversation", "pages", "navigation", "panels"]);
   assert.equal(typeof viewportBuilt.apply, "function");
   assert.equal(typeof viewportBuilt.previewKeys, "function");
   assert.equal(typeof viewportBuilt.parseViewportRoute, "function");
   assert.equal(typeof viewportBuilt.validateViewportRoute, "function");
   assert.equal(typeof viewportBuilt.viewportPageTarget, "function");
+  assert.equal(typeof viewportBuilt.agentActivityPanelTarget, "function");
 
   for (const mod of [viewportSrc, viewportBuilt]) {
     const cleanups = [];
@@ -365,6 +370,11 @@ test("Viewport: src and bundled plugin.js expose the same API surface", () => {
         },
         navigation: {
           open: async () => ({ status: "opened" }),
+        },
+        panels: {
+          resolve: () => undefined,
+          snapshot: () => [],
+          subscribe: () => () => {},
         },
       });
       assert.deepEqual(registered.pages.map((p) => p.id), [VIEWPORT_PAGE_ID]);
