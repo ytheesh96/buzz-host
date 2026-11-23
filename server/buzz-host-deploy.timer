@@ -1,0 +1,10 @@
+[Unit]
+Description=Check buzz-host origin/main for server deploys every 2 minutes
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=2min
+RandomizedDelaySec=10s
+
+[Install]
+WantedBy=timers.target

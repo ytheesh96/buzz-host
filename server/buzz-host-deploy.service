@@ -1,0 +1,9 @@
+[Unit]
+Description=Auto-deploy buzz-host from origin/main when server files change
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/lib/buzz-host/auto-deploy.sh
+Environment=PATH=%h/.local/share/mise/shims:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
