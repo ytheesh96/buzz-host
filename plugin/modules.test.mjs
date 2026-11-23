@@ -25,7 +25,14 @@ import {
 } from "./src/config.js";
 import { groupByProvider, modelChoices, profileOptions, providerOf } from "./src/ui.js";
 import { buildTurns, parseFrame, promptRequest } from "./src/activity.js";
-import { previewKeys } from "./src/desktop.js";
+import {
+  VIEWPORT_PAGE_ICON,
+  VIEWPORT_PAGE_ID,
+  parseViewportRoute,
+  previewKeys,
+  validateViewportRoute,
+  viewportPageTarget,
+} from "./src/desktop.js";
 import { plain, schedule, titleOf, words } from "./src/attention.js";
 import * as remoteAgentsSrc from "./src/index.js";
 import * as remoteAgentsBuilt from "./plugin.js";
@@ -296,18 +303,56 @@ test("Remote Agents: src and bundled plugin.js expose the same API surface", () 
   }
 });
 
+test("Viewport route parsing, navigation targets, and no fullscreen/Esc-exit hijack", () => {
+  const pk = "a".repeat(64);
+  assert.deepEqual(parseViewportRoute({}), { pubkey: "", take: false });
+  assert.deepEqual(parseViewportRoute({ pubkey: pk.toUpperCase() }), { pubkey: pk, take: false });
+  assert.deepEqual(parseViewportRoute({ pubkey: pk, take: true }), { pubkey: pk, take: true });
+  assert.deepEqual(parseViewportRoute({ pubkey: pk, take: "1" }), { pubkey: pk, take: true });
+  assert.equal(parseViewportRoute({ pubkey: "not-hex" }), null);
+  assert.equal(parseViewportRoute({ take: true }), null);
+  assert.equal(parseViewportRoute({ pubkey: pk, extra: 1 }), null);
+  assert.equal(validateViewportRoute({ pubkey: pk, take: true }), true);
+  assert.equal(validateViewportRoute({ pubkey: "bad" }), false);
+
+  assert.deepEqual(viewportPageTarget("local.buzz-host.viewport", pk), {
+    version: 1,
+    kind: "page",
+    pluginId: "local.buzz-host.viewport",
+    pageId: VIEWPORT_PAGE_ID,
+    route: { version: 1, params: { pubkey: pk } },
+  });
+  assert.deepEqual(viewportPageTarget("local.buzz-host.viewport", pk, { take: true }), {
+    version: 1,
+    kind: "page",
+    pluginId: "local.buzz-host.viewport",
+    pageId: VIEWPORT_PAGE_ID,
+    route: { version: 1, params: { pubkey: pk, take: true } },
+  });
+
+  // Viewport opens inside Buzz's own page, never monitor-wide requestFullscreen.
+  const desktopSrc = fs.readFileSync(path.join(here, "src/desktop.js"), "utf8");
+  assert.equal(/requestFullscreen|exitFullscreen|fullscreenchange/.test(desktopSrc), false);
+  assert.ok(VIEWPORT_PAGE_ICON.startsWith("data:image/svg+xml,"));
+  assert.ok(decodeURIComponent(VIEWPORT_PAGE_ICON).includes('stroke="currentColor"'));
+});
+
 test("Viewport: src and bundled plugin.js expose the same API surface", () => {
   assert.deepEqual(viewportBuilt.inject, viewportSrc.inject);
-  assert.deepEqual(viewportBuilt.inject, ["react", "agents", "conversation"]);
+  assert.deepEqual(viewportBuilt.inject, ["react", "agents", "conversation", "pages", "navigation"]);
   assert.equal(typeof viewportBuilt.apply, "function");
   assert.equal(typeof viewportBuilt.previewKeys, "function");
+  assert.equal(typeof viewportBuilt.parseViewportRoute, "function");
+  assert.equal(typeof viewportBuilt.validateViewportRoute, "function");
+  assert.equal(typeof viewportBuilt.viewportPageTarget, "function");
 
   for (const mod of [viewportSrc, viewportBuilt]) {
     const cleanups = [];
-    const registered = { tabs: [], accessories: [] };
+    const registered = { tabs: [], accessories: [], pages: [] };
     try {
       mod.apply({
         react: { createElement: () => null },
+        pluginOwner: { id: "local.buzz-host.viewport" },
         effect: (fn) => cleanups.push(fn()),
         agents: {
           registerTab: (t) => registered.tabs.push(t),
@@ -315,7 +360,23 @@ test("Viewport: src and bundled plugin.js expose the same API surface", () => {
         conversation: {
           registerAccessory: (a) => registered.accessories.push(a),
         },
+        pages: {
+          register: (p) => registered.pages.push(p),
+        },
+        navigation: {
+          open: async () => ({ status: "opened" }),
+        },
       });
+      assert.deepEqual(registered.pages.map((p) => p.id), [VIEWPORT_PAGE_ID]);
+      assert.equal(registered.pages[0].title, "Viewport");
+      assert.equal(registered.pages[0].layout, "workspace");
+      assert.equal(registered.pages[0].primary, true);
+      assert.equal(registered.pages[0].placement, "dock");
+      assert.equal(registered.pages[0].icon, VIEWPORT_PAGE_ICON);
+      assert.equal(registered.pages[0].route.version, 1);
+      assert.equal(registered.pages[0].route.validate({ pubkey: "a".repeat(64), take: true }), true);
+      assert.equal(registered.pages[0].route.validate({ pubkey: "invalid" }), false);
+
       assert.deepEqual(registered.tabs.map((t) => t.id), ["desktop"]);
       assert.equal(registered.tabs[0].title, "Desktop");
       assert.equal(registered.tabs[0].when({ type: "omarchy" }), true);

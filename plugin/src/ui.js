@@ -58,6 +58,9 @@ export const ICONS = {
   ],
   circle: ["M3 12a9 9 0 1 0 18 0a9 9 0 1 0 -18 0"],
   x: ["M18 6l-12 12", "M6 6l12 12"],
+  monitor: ["M3 5a1 1 0 0 1 1 -1h16a1 1 0 0 1 1 1v10a1 1 0 0 1 -1 1h-16a1 1 0 0 1 -1 -1v-10", "M7 20h10", "M9 16v4", "M15 16v4"],
+  sidebar: ["M4 6a2 2 0 0 1 2 -2h12a2 2 0 0 1 2 2v12a2 2 0 0 1 -2 2h-12a2 2 0 0 1 -2 -2z", "M9 4l0 16"],
+  refresh: ["M20 11a8.1 8.1 0 0 0 -15.5 -2m-.5 -4v4h4", "M4 13a8.1 8.1 0 0 0 15.5 2m.5 4v-4h-4"],
 };
 
 export function createBuzzPrimitives(React) {

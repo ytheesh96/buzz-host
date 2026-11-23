@@ -59,7 +59,7 @@ EOF
 cat > "$VIEWPORT_DEST/README.md" <<'EOF'
 # Viewport (Buzz Plugin)
 
-Live remote desktop preview, full-screen noVNC view, and takeover controls for self-hosted agents on a `buzz-host` server.
+Live remote desktop preview, in-app Viewport page, and takeover controls for self-hosted agents on a `buzz-host` server.
 
 ## Install in Buzz
 
@@ -69,7 +69,7 @@ Live remote desktop preview, full-screen noVNC view, and takeover controls for s
    - **Repository:** `https://github.com/ytheesh96/buzz-app.git`
    - **Folder:** `plugins/viewport`
 4. Enable **Viewport** — it automatically reuses the server connection and invite token saved by **Remote Agents**.
-5. Open your self-hosted agent's **Desktop** tab to enable and open its remote desktop (requires an admin connection or a trusted guest invite with remote desktop enabled).
+5. Open **Viewport** from the app dock (or open your self-hosted agent's **Desktop** tab) to enable and view its remote desktop inside Buzz (requires an admin connection or a trusted guest invite with remote desktop enabled).
 
 > This folder is synced from `buzz-host` via `tools/sync-public-plugin.sh` with private host defaults scrubbed. Do not edit `plugin.js` directly here.
 EOF

@@ -970,6 +970,7 @@ const methods = {
     const agents = [];
     for (const m of metas) {
       if (!canAccessAgent(session, m)) continue;
+      const dst = m.desktop === true ? desktop.status(m.pubkey) : null;
       agents.push({
         pubkey: m.pubkey,
         name: m.name,
@@ -981,6 +982,8 @@ const methods = {
         respondTo: normalizeRespondTo(m.respondTo, "owner-only"),
         activated: m.activated,
         desktop: m.desktop === true,
+        desktopRunning: dst ? dst.running === true : false,
+        desktopLease: dst ? dst.lease : null,
         orchestrate: m.orchestrate === true,
         status: m.activated ? await active(m.pubkey) : "provisioned",
       });
