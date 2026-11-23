@@ -148,6 +148,12 @@ test("host credential proxy authenticates per-agent tokens and swaps real creden
         headers: { "content-type": "application/json" },
       });
     }
+    if (url === "https://gemini.example/v1beta/models/gemini-4-neon:generateContent") {
+      return new Response(JSON.stringify({ ok: true, provider: "gemini" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
     return new Response("unexpected", { status: 500 });
   };
 
@@ -159,10 +165,13 @@ test("host credential proxy authenticates per-agent tokens and swaps real creden
       opencodeGo: "https://opencode.example/zen/go",
       anthropic: "https://anthropic.example",
       agyCloudcode: "https://cloudcode.example",
+      agyGemini: "https://gemini.example",
     },
     credentials: {
       opencodeGo: async () => ({ apiKey: "REAL_OPENCODE_SECRET" }),
       anthropic: async () => ({ mode: "oauth", value: "REAL_CLAUDE_OAUTH_SECRET" }),
+      geminiApiKey: async () => ({ apiKey: "REAL_GEMINI_API_SECRET" }),
+      hasGeminiApiKey: async () => true,
       agyAccessToken: async () => {
         agyRefreshCalls += 1;
         return "REAL_GOOGLE_ACCESS_SECRET";
@@ -247,6 +256,17 @@ test("host credential proxy authenticates per-agent tokens and swaps real creden
   assert.equal(JSON.parse(agy.body).tier, "pro");
   assert.equal(upstreamCalls.at(-1).headers.authorization, "Bearer REAL_GOOGLE_ACCESS_SECRET");
   assert.equal(agyRefreshCalls, 1);
+
+  // 6b. Antigravity /agy/gemini/* swaps x-goog-api-key for real host GEMINI_API_KEY.
+  const gem = await unixHttpRequest(sockPath, {
+    method: "POST",
+    path: "/agy/gemini/v1beta/models/gemini-4-neon:generateContent",
+    headers: { "x-goog-api-key": token, "content-type": "application/json" },
+    body: JSON.stringify({ contents: [] }),
+  });
+  assert.equal(gem.status, 200);
+  assert.equal(JSON.parse(gem.body).provider, "gemini");
+  assert.equal(upstreamCalls.at(-1).headers["x-goog-api-key"], "REAL_GEMINI_API_SECRET");
 
   // 7. Unknown route returns 404.
   const missing = await unixHttpRequest(sockPath, {
@@ -343,11 +363,15 @@ test("Docker sandbox config and args harden container and never leak host secret
 
   const hermesYaml = await fs.readFile(path.join(sandboxHome, ".hermes/config.yaml"), "utf8");
   const hermesEnv = await fs.readFile(path.join(sandboxHome, ".hermes/.env"), "utf8");
+  const agySettings = JSON.parse(
+    await fs.readFile(path.join(sandboxHome, ".gemini/antigravity-acp/settings.json"), "utf8"),
+  );
   const agyToken = JSON.parse(
     await fs.readFile(path.join(sandboxHome, ".gemini/antigravity-acp/acp_token.json"), "utf8"),
   );
   assert.match(hermesYaml, /http:\/\/127\.0\.0\.1:18461\/opencode-go\/v1/);
   assert.match(hermesEnv, new RegExp(`OPENCODE_GO_API_KEY=${proxyToken}`));
+  assert.deepEqual(agySettings, { auth: { type: "oauth-personal" } });
   assert.equal(agyToken.token_uri, "http://127.0.0.1:18461/agy/token");
   assert.equal(agyToken.refresh_token, proxyToken);
   assert.equal(agyToken.project_id, "proj-123");
