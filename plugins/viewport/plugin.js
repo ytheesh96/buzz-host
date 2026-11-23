@@ -338,8 +338,8 @@ const ICONS = {
 		"M15 16v4"
 	],
 	sidebar: ["M4 6a2 2 0 0 1 2 -2h12a2 2 0 0 1 2 2v12a2 2 0 0 1 -2 2h-12a2 2 0 0 1 -2 -2z", "M9 4l0 16"],
-	refresh: ["M20 11a8.1 8.1 0 0 0 -15.5 -2m-.5 -4v4h4", "M4 13a8.1 8.1 0 0 0 15.5 2m.5 4v-4h-4"],
-	activity: ["M3 12h4l3 8l4 -16l3 8h4"]
+	sidebarRight: ["M4 6a2 2 0 0 1 2 -2h12a2 2 0 0 1 2 2v12a2 2 0 0 1 -2 2h-12a2 2 0 0 1 -2 -2z", "M15 4l0 16"],
+	refresh: ["M20 11a8.1 8.1 0 0 0 -15.5 -2m-.5 -4v4h4", "M4 13a8.1 8.1 0 0 0 15.5 2m.5 4v-4h-4"]
 };
 function createBuzzPrimitives(React) {
 	const h = React.createElement;
@@ -8127,17 +8127,13 @@ function createDesktop({ React, client, ctx, uiKit, Btn, Icon, navigation, panel
 			size: "sm",
 			variant: showInspector ? "outline" : "ghost",
 			onClick: () => setInspectorOpen((v) => !v),
-			title: showInspector ? `Hide ${activeName} sidebar` : `Open ${activeName} Activity sidebar`,
-			"aria-label": showInspector ? `Hide ${activeName} sidebar` : `Open ${activeName} Activity sidebar`,
+			title: showInspector ? `Hide ${activeName} sidebar` : `Show ${activeName} sidebar`,
+			"aria-label": showInspector ? `Hide ${activeName} sidebar` : `Show ${activeName} sidebar`,
 			"aria-pressed": showInspector
-		}, h("span", { style: {
-			display: "inline-flex",
-			alignItems: "center",
-			gap: 6
-		} }, Icon && h(Icon, {
-			name: "activity",
-			size: 15
-		}), "Activity")))), h("div", { style: {
+		}, Icon ? h(Icon, {
+			name: "sidebarRight",
+			size: 16
+		}) : showInspector ? "Hide sidebar" : "Show sidebar"))), h("div", { style: {
 			flex: 1,
 			minWidth: 0,
 			minHeight: 0,
