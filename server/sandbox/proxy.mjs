@@ -24,6 +24,7 @@ const HEX64 = /^[0-9a-f]{64}$/;
 const DEFAULT_RATE_LIMIT = 120; // requests per minute per agent
 const RATE_WINDOW_MS = 60_000;
 const AGY_DEFAULT_ENDPOINT = "https://daily-cloudcode-pa.googleapis.com";
+const GEMINI_DEFAULT_ENDPOINT = "https://generativelanguage.googleapis.com";
 const ANTHROPIC_DEFAULT_ENDPOINT = "https://api.anthropic.com";
 const OPENCODE_GO_DEFAULT_ENDPOINT = "https://opencode.ai/zen/go";
 
@@ -186,9 +187,23 @@ export function createHostCredentialLoaders({
     return typeof meta?.project_id === "string" ? meta.project_id : "";
   }
 
+  async function loadGeminiApiKey() {
+    if (env.GEMINI_API_KEY) return { apiKey: env.GEMINI_API_KEY };
+    const dotEnv = await fs.readFile(path.join(homeDir, ".hermes/.env"), "utf8").catch(() => "");
+    const apiKey = parseDotEnvValue(dotEnv, "GEMINI_API_KEY");
+    if (!apiKey) throw new Error("GEMINI_API_KEY is not configured on host");
+    return { apiKey };
+  }
+
+  async function hasGeminiApiKey() {
+    return loadGeminiApiKey().then(() => true, () => false);
+  }
+
   return {
     opencodeGo: loadOpenCodeGo,
     anthropic: loadAnthropic,
+    geminiApiKey: loadGeminiApiKey,
+    hasGeminiApiKey,
     agyAccessToken: loadAgyAccessToken,
     agyProjectId: getAgyProjectId,
   };
@@ -210,6 +225,7 @@ export function createSandboxProxy({
     opencodeGo: (upstreams.opencodeGo || OPENCODE_GO_DEFAULT_ENDPOINT).replace(/\/+$/, ""),
     anthropic: (upstreams.anthropic || ANTHROPIC_DEFAULT_ENDPOINT).replace(/\/+$/, ""),
     agyCloudcode: (upstreams.agyCloudcode || AGY_DEFAULT_ENDPOINT).replace(/\/+$/, ""),
+    agyGemini: (upstreams.agyGemini || GEMINI_DEFAULT_ENDPOINT).replace(/\/+$/, ""),
   };
 
   /** pubkey -> { token, server, sockPath, hits: number[] } */
@@ -383,6 +399,21 @@ export function createSandboxProxy({
         return;
       }
 
+      // 6. Antigravity Gemini Developer API: /agy/gemini/* -> https://generativelanguage.googleapis.com/*
+      if (pathname.startsWith("/agy/gemini/")) {
+        const suffix = pathname.slice("/agy/gemini".length);
+        const { apiKey } = await creds.geminiApiKey();
+        const bodyBuf = method === "GET" || method === "HEAD" ? null : await readBodyBuffer(req);
+        await forwardUpstream({
+          req,
+          res,
+          targetUrl: `${endpoints.agyGemini}${suffix}${search}`,
+          extraHeaders: { "x-goog-api-key": apiKey },
+          bodyBuf,
+        });
+        return;
+      }
+
       sendJson(res, 404, { error: { message: `Unknown sandbox proxy route: ${pathname}` } });
     } catch (error) {
       const code = error?.statusCode || 502;
@@ -441,5 +472,6 @@ export function createSandboxProxy({
     close,
     sockPathFor,
     getAgyProjectId: () => creds.agyProjectId?.() ?? Promise.resolve(""),
+    hasGeminiApiKey: () => creds.hasGeminiApiKey?.() ?? Promise.resolve(false),
   };
 }

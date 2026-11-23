@@ -57,17 +57,20 @@ export async function prepareSandboxHome({
   model = "",
   proxyToken,
   agyProjectId = "",
+  useGeminiApiKey = false,
   proxyPort = CONTAINER_PROXY_PORT,
 }) {
   const sandboxHome = path.join(agentDir, "sandbox-home");
   const hermesDir = path.join(sandboxHome, ".hermes");
   const claudeDir = path.join(sandboxHome, ".claude");
   const agyDir = path.join(sandboxHome, ".gemini", "antigravity-acp");
+  const agyCliDir = path.join(sandboxHome, ".gemini", "antigravity-cli");
 
   await Promise.all([
     fs.mkdir(hermesDir, { recursive: true, mode: 0o700 }),
     fs.mkdir(claudeDir, { recursive: true, mode: 0o700 }),
     fs.mkdir(agyDir, { recursive: true, mode: 0o700 }),
+    fs.mkdir(agyCliDir, { recursive: true, mode: 0o700 }),
   ]);
 
   const proxyBase = `http://127.0.0.1:${proxyPort}`;
@@ -100,13 +103,28 @@ export async function prepareSandboxHome({
   ].join("\n");
   await writePrivate(path.join(hermesDir, ".env"), hermesEnv);
 
-  // Claude Code settings (no credentials here; CLAUDE_CODE_OAUTH_TOKEN + ANTHROPIC_BASE_URL passed via env).
+  // Claude Code settings + onboarding flag (no credentials here; CLAUDE_CODE_OAUTH_TOKEN + ANTHROPIC_BASE_URL passed via env).
   await writePrivate(
     path.join(claudeDir, "settings.json"),
     `${JSON.stringify({ skipDangerousModePermissionPrompt: true }, null, 2)}\n`,
   );
+  await writePrivate(
+    path.join(sandboxHome, ".claude.json"),
+    `${JSON.stringify({ hasCompletedOnboarding: true, numStartups: 1 }, null, 2)}\n`,
+  );
 
-  // Antigravity synthetic OAuth token file pointing token_uri at the local proxy bridge.
+  // Antigravity settings: prefer headless gemini-api-key mode via host proxy when
+  // GEMINI_API_KEY is configured on host; otherwise configure synthetic OAuth metadata.
+  await writePrivate(
+    path.join(agyDir, "settings.json"),
+    `${JSON.stringify({ auth: { type: useGeminiApiKey ? "gemini-api-key" : "oauth-personal" } }, null, 2)}\n`,
+  );
+  if (useGeminiApiKey) {
+    await writePrivate(
+      path.join(agyCliDir, "settings.json"),
+      `${JSON.stringify({ modelProvider: "gemini" }, null, 2)}\n`,
+    );
+  }
   await writePrivate(
     path.join(agyDir, "acp_token.json"),
     `${JSON.stringify(
@@ -135,6 +153,7 @@ export async function writeSandboxEnv({
   meta,
   proxyToken,
   withAttention = false,
+  useGeminiApiKey = false,
   proxyPort = CONTAINER_PROXY_PORT,
 }) {
   const proxyBase = `http://127.0.0.1:${proxyPort}`;
@@ -197,6 +216,12 @@ export async function writeSandboxEnv({
     ANTHROPIC_BASE_URL: `${proxyBase}/anthropic`,
     CLAUDE_CODE_OAUTH_TOKEN: proxyToken,
     BUZZ_SANDBOX_AGY_ENDPOINT: `${proxyBase}/agy/cloudcode`,
+    ...(useGeminiApiKey
+      ? {
+          GEMINI_API_KEY: proxyToken,
+          GOOGLE_GEMINI_BASE_URL: `${proxyBase}/agy/gemini`,
+        }
+      : {}),
   };
 
   // Docker --env-file format: raw KEY=VALUE lines (no shell quoting, no embedded newlines).

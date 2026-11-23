@@ -166,10 +166,11 @@ export function createRunnerManager({
       fs.mkdir(path.join(workDir, pubkey), { recursive: true }),
     ]);
 
-    const [{ token }, _mcp, agyProjectId] = await Promise.all([
+    const [{ token }, _mcp, agyProjectId, useGeminiApiKey] = await Promise.all([
       proxy.ensureAgent(pubkey),
       mcpBridge.ensureAgent(pubkey),
       proxy.getAgyProjectId().catch(() => ""),
+      proxy.hasGeminiApiKey().catch(() => false),
     ]);
 
     await prepareSandboxHome({
@@ -178,6 +179,7 @@ export function createRunnerManager({
       model: meta.model || "",
       proxyToken: token,
       agyProjectId,
+      useGeminiApiKey,
     });
 
     const withAttention = isAttentionEnabled ? await isAttentionEnabled(pubkey) : false;
@@ -188,6 +190,7 @@ export function createRunnerManager({
       meta,
       proxyToken: token,
       withAttention,
+      useGeminiApiKey,
     });
 
     return { sandboxRunDir: runSubdir, controlDir, envFile, libDir };
