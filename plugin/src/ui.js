@@ -123,6 +123,28 @@ export function useModels(React, client, runtime, profile = "") {
   return state.key === key ? state : { key, models: undefined, error: "" };
 }
 
+// The server's role, limits, and capabilities from `hello`.
+export function useServerInfo(React, client) {
+  const snap = React.useSyncExternalStore(client.subscribe, client.snapshot);
+  const key = `${snap.url}#${snap.epoch ?? 0}`;
+  const [state, setState] = React.useState(() => ({
+    key,
+    info: snap.session ? { ...snap.session } : undefined,
+    error: "",
+  }));
+  React.useEffect(() => {
+    const controller = new AbortController();
+    client.call("hello", {}, { signal: controller.signal, timeoutMs: 20000 }).then(
+      (info) => !controller.signal.aborted && setState({ key, info, error: "" }),
+      (e) => !controller.signal.aborted && setState({ key, info: undefined, error: String(e.message ?? e) }),
+    );
+    return () => controller.abort();
+  }, [client, key]);
+  return state.key === key
+    ? state
+    : { key, info: snap.session ? { ...snap.session } : undefined, error: "" };
+}
+
 // The server's Hermes profiles, from `hermes profile list`.
 export function useProfiles(React, client, enabled) {
   const [state, setState] = React.useState({ profiles: undefined, error: "" });

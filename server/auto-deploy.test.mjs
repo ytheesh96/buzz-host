@@ -59,6 +59,7 @@ function makeFixture(t) {
   const serverFiles = [
     "buzz-host.mjs",
     "agent-run",
+    "auth.mjs",
     "attention.mjs",
     "attention-core.mjs",
     "buzz-mcp.mjs",
@@ -79,6 +80,8 @@ function makeFixture(t) {
   }
   fs.writeFileSync(path.join(work, "server", "acp-proxy"), "#!/bin/sh\necho v1\n");
   fs.chmodSync(path.join(work, "server", "acp-proxy"), 0o755);
+  fs.writeFileSync(path.join(work, "server", "buzz-host-tokens"), "#!/bin/sh\necho v1\n");
+  fs.chmodSync(path.join(work, "server", "buzz-host-tokens"), 0o755);
   fs.writeFileSync(path.join(work, "server", "desktop", "desktop.mjs"), "// desktop v1\n");
   fs.writeFileSync(path.join(work, "server", "desktop", "desktop.test.mjs"), "// should not deploy\n");
   fs.writeFileSync(path.join(work, "server", "desktop", "launcher.sh"), "#!/bin/sh\n");

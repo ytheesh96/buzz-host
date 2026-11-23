@@ -11,6 +11,7 @@ SERVER_DIR="$REPO_ROOT/server"
 SERVER_FILES=(
   buzz-host.mjs
   agent-run
+  auth.mjs
   attention.mjs
   attention-core.mjs
   buzz-mcp.mjs
@@ -97,6 +98,9 @@ deploy_local() {
   fi
 
   atomic_copy "$SERVER_DIR/acp-proxy" "$lib_dir/bin/acp-proxy" 0755
+  if [ -f "$SERVER_DIR/buzz-host-tokens" ]; then
+    atomic_copy "$SERVER_DIR/buzz-host-tokens" "$lib_dir/bin/buzz-host-tokens" 0755
+  fi
 
   for f in "$SERVER_DIR"/shims/*; do
     [ -f "$f" ] || continue
@@ -151,6 +155,9 @@ deploy_ssh() {
     ssh "$host" 'find ~/.local/lib/buzz-host/sandbox -name "*.test.mjs" -delete'
   fi
   scp -q acp-proxy "$host":.local/lib/buzz-host/bin/
+  if [ -f buzz-host-tokens ]; then
+    scp -q buzz-host-tokens "$host":.local/lib/buzz-host/bin/
+  fi
   scp -q shims/* "$host":.local/lib/buzz-host/shims/
   scp -q agent-bin/* "$host":.local/lib/buzz-host/agent-bin/
   scp -q buzz-host.service buzz-agent@.service "$host":.config/systemd/user/

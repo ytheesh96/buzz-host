@@ -1,6 +1,7 @@
-// Shared constants and local server URL storage for the Remote Agents plugin.
+// Shared constants and local server URL / access token storage for the Remote Agents plugin.
 
 export const URL_KEY = "local.buzz-host.url";
+export const TOKEN_KEY = "local.buzz-host.token";
 export const DEFAULT_URL = "wss://omarchy.tail65c5a9.ts.net:8447";
 export const RUNTIMES = [
   { id: "claude", title: "Claude Code" },
@@ -65,6 +66,22 @@ export function formatAllowlistText(list) {
   return Array.isArray(list) ? list.join("\n") : String(list ?? "");
 }
 
+/**
+ * Parse a Server field input that may be either a plain wss:// URL or a
+ * 1-paste guest invite link (`wss://host/_buzz-host#token=bhg_...`).
+ */
+export function parseInviteInput(raw) {
+  const text = String(raw ?? "").trim();
+  const hashIndex = text.indexOf("#");
+  if (hashIndex < 0) return { url: text, token: undefined };
+  const base = text.slice(0, hashIndex).trim();
+  const fragment = text.slice(hashIndex + 1);
+  const params = new URLSearchParams(fragment);
+  const token = params.get("token")?.trim();
+  if (!token) return { url: text, token: undefined };
+  return { url: base, token };
+}
+
 /** Update respondTo while enforcing the sandbox invariant in the UI draft. */
 export function applyRespondToChange(draft, respondTo) {
   const next = { ...draft, respondTo };
@@ -90,6 +107,26 @@ export function applyRunnerChange(draft, runner) {
   return next;
 }
 
+/** Enforce guest-mode constraints on an agent draft (sandboxed runner, allowed runtimes, concurrency cap). */
+export function applyGuestConstraints(draft, serverInfo) {
+  if (serverInfo?.role !== "guest") return draft;
+  const limits = serverInfo.limits ?? {};
+  const allowedRuntimes = Array.isArray(limits.allowedRuntimes) && limits.allowedRuntimes.length
+    ? limits.allowedRuntimes
+    : RUNTIMES.map((r) => r.id);
+  const maxConcurrency = Number(limits.maxConcurrency) > 0 ? Number(limits.maxConcurrency) : 2;
+  const next = { ...draft };
+  next.runner = "docker";
+  next.profile = "";
+  if (!allowedRuntimes.includes(next.runtime)) {
+    next.runtime = allowedRuntimes[0];
+    next.model = "";
+  }
+  const currentConc = Number(next.concurrency) || maxConcurrency;
+  next.concurrency = Math.min(currentConc, maxConcurrency);
+  return next;
+}
+
 export const asConfig = (value) => {
   const merged = { ...EMPTY, ...(value && typeof value === "object" ? value : {}) };
   merged.runner = merged.runner || (merged.respondTo && merged.respondTo !== "owner-only" ? "docker" : "host");
@@ -104,4 +141,28 @@ export function storedUrl() {
   } catch {
     return DEFAULT_URL;
   }
+}
+
+export function setStoredUrl(url) {
+  try {
+    const clean = String(url ?? "").trim();
+    if (clean) localStorage.setItem(URL_KEY, clean);
+    else localStorage.removeItem(URL_KEY);
+  } catch {}
+}
+
+export function storedToken() {
+  try {
+    return (localStorage.getItem(TOKEN_KEY) || "").trim();
+  } catch {
+    return "";
+  }
+}
+
+export function setStoredToken(token) {
+  try {
+    const clean = String(token ?? "").trim();
+    if (clean) localStorage.setItem(TOKEN_KEY, clean);
+    else localStorage.removeItem(TOKEN_KEY);
+  } catch {}
 }

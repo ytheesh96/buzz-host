@@ -170,9 +170,11 @@ backup_live() {
       cp -p "$f" "$BACKUP_DIR/lib/"
     fi
   done
-  if [ -f "$LIB_DIR/bin/acp-proxy" ]; then
-    cp -p "$LIB_DIR/bin/acp-proxy" "$BACKUP_DIR/lib/bin/"
-  fi
+  for f in acp-proxy buzz-host-tokens; do
+    if [ -f "$LIB_DIR/bin/$f" ]; then
+      cp -p "$LIB_DIR/bin/$f" "$BACKUP_DIR/lib/bin/"
+    fi
+  done
   for d in desktop sandbox shims agent-bin hermes-plugin; do
     if [ -d "$LIB_DIR/$d" ]; then
       cp -rp "$LIB_DIR/$d" "$BACKUP_DIR/lib/"
@@ -198,11 +200,13 @@ restore_backup() {
       mv -f "$tmp" "$LIB_DIR/$(basename "$f")"
     fi
   done
-  if [ -f "$BACKUP_DIR/lib/bin/acp-proxy" ]; then
-    tmp="$(mktemp "$LIB_DIR/bin/.restore.tmp.XXXXXX")"
-    cp -p "$BACKUP_DIR/lib/bin/acp-proxy" "$tmp"
-    mv -f "$tmp" "$LIB_DIR/bin/acp-proxy"
-  fi
+  for f in acp-proxy buzz-host-tokens; do
+    if [ -f "$BACKUP_DIR/lib/bin/$f" ]; then
+      tmp="$(mktemp "$LIB_DIR/bin/.restore.tmp.XXXXXX")"
+      cp -p "$BACKUP_DIR/lib/bin/$f" "$tmp"
+      mv -f "$tmp" "$LIB_DIR/bin/$f"
+    fi
+  done
   for d in desktop sandbox shims agent-bin hermes-plugin; do
     if [ -d "$BACKUP_DIR/lib/$d" ]; then
       tmp="$(mktemp -d "$LIB_DIR/.restore-${d}.tmp.XXXXXX")"

@@ -12,12 +12,15 @@ import {
   DEFAULT_CONCURRENCY,
   DEFAULT_URL,
   EMPTY,
+  applyGuestConstraints,
   applyRespondToChange,
   applyRunnerChange,
   asConfig,
   formatAllowlistText,
   isSelfHostedAgent,
   parseAllowlistText,
+  parseInviteInput,
+  storedToken,
   storedUrl,
 } from "./src/config.js";
 import { groupByProvider, modelChoices, profileOptions, providerOf } from "./src/ui.js";
@@ -68,6 +71,41 @@ test("config helpers normalize drafts, recognize self-hosted agents, and fall ba
   const pk2 = "b".repeat(64);
   assert.deepEqual(parseAllowlistText(`${pk1.toUpperCase()}, ${pk2}\n${pk1}`), [pk1, pk2]);
   assert.equal(formatAllowlistText([pk1, pk2]), `${pk1}\n${pk2}`);
+  assert.equal(storedToken(), "");
+
+  // 1-paste invite URL parsing
+  assert.deepEqual(parseInviteInput("wss://omarchy.tail65c5a9.ts.net:8447"), {
+    url: "wss://omarchy.tail65c5a9.ts.net:8447",
+    token: undefined,
+  });
+  assert.deepEqual(parseInviteInput("wss://omarchy.tail65c5a9.ts.net/_buzz-host#token=bhg_abc123"), {
+    url: "wss://omarchy.tail65c5a9.ts.net/_buzz-host",
+    token: "bhg_abc123",
+  });
+  assert.deepEqual(parseInviteInput("wss://example.com/_buzz-host#foo=bar"), {
+    url: "wss://example.com/_buzz-host#foo=bar",
+    token: undefined,
+  });
+
+  // Guest UI constraints enforce docker runner, runtime allowlist, and concurrency cap
+  const guestInfo = {
+    role: "guest",
+    limits: { maxAgents: 2, maxConcurrency: 2, allowedRuntimes: ["hermes", "claude"] },
+  };
+  const constrained = applyGuestConstraints(
+    { ...EMPTY, runtime: "codex", model: "o3", profile: "work", concurrency: 8, runner: "host", respondTo: "anyone" },
+    guestInfo,
+  );
+  assert.equal(constrained.runner, "docker");
+  assert.equal(constrained.profile, "");
+  assert.equal(constrained.runtime, "hermes");
+  assert.equal(constrained.model, "");
+  assert.equal(constrained.concurrency, 2);
+  assert.equal(constrained.respondTo, "anyone");
+
+  // Admin draft is unchanged by applyGuestConstraints
+  const adminDraft = { ...EMPTY, runtime: "codex", runner: "host", concurrency: 8 };
+  assert.deepEqual(applyGuestConstraints(adminDraft, { role: "admin" }), adminDraft);
 });
 
 test("ui helpers parse Hermes providers, group models, and build profile options", () => {

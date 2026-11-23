@@ -400,6 +400,8 @@ test("Docker sandbox config and args harden container and never leak host secret
   });
   const envContent = await fs.readFile(envFile, "utf8");
   assert.match(envContent, /BUZZ_ACP_RESPOND_TO=anyone/);
+  assert.match(envContent, /BUZZ_ACP_LAZY_POOL=true/);
+  assert.match(envContent, /BUZZ_ACP_IDLE_POOL_SLEEP=300/);
   assert.match(envContent, /ANTHROPIC_BASE_URL=http:\/\/127\.0\.0\.1:18461\/anthropic/);
   assert.match(envContent, new RegExp(`CLAUDE_CODE_OAUTH_TOKEN=${proxyToken}`));
   assert.match(envContent, /BUZZ_HOST_SANDBOX=1/);

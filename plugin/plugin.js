@@ -2,6 +2,7 @@
 // edit files under plugin/src/ and run `node plugin/build.mjs`.
 //#region plugin/src/config.js
 const URL_KEY = "local.buzz-host.url";
+const TOKEN_KEY = "local.buzz-host.token";
 const DEFAULT_URL = "wss://omarchy.tail65c5a9.ts.net:8447";
 const RUNTIMES = [
 	{
@@ -82,6 +83,29 @@ function parseAllowlistText(value) {
 function formatAllowlistText(list) {
 	return Array.isArray(list) ? list.join("\n") : String(list ?? "");
 }
+/**
+* Parse a Server field input that may be either a plain wss:// URL or a
+* 1-paste guest invite link (`wss://host/_buzz-host#token=bhg_...`).
+*/
+function parseInviteInput(raw) {
+	const text = String(raw ?? "").trim();
+	const hashIndex = text.indexOf("#");
+	if (hashIndex < 0) return {
+		url: text,
+		token: void 0
+	};
+	const base = text.slice(0, hashIndex).trim();
+	const fragment = text.slice(hashIndex + 1);
+	const token = new URLSearchParams(fragment).get("token")?.trim();
+	if (!token) return {
+		url: text,
+		token: void 0
+	};
+	return {
+		url: base,
+		token
+	};
+}
 /** Update respondTo while enforcing the sandbox invariant in the UI draft. */
 function applyRespondToChange(draft, respondTo) {
 	const next = {
@@ -108,6 +132,23 @@ function applyRunnerChange(draft, runner) {
 	}
 	return next;
 }
+/** Enforce guest-mode constraints on an agent draft (sandboxed runner, allowed runtimes, concurrency cap). */
+function applyGuestConstraints(draft, serverInfo) {
+	if (serverInfo?.role !== "guest") return draft;
+	const limits = serverInfo.limits ?? {};
+	const allowedRuntimes = Array.isArray(limits.allowedRuntimes) && limits.allowedRuntimes.length ? limits.allowedRuntimes : RUNTIMES.map((r) => r.id);
+	const maxConcurrency = Number(limits.maxConcurrency) > 0 ? Number(limits.maxConcurrency) : 2;
+	const next = { ...draft };
+	next.runner = "docker";
+	next.profile = "";
+	if (!allowedRuntimes.includes(next.runtime)) {
+		next.runtime = allowedRuntimes[0];
+		next.model = "";
+	}
+	const currentConc = Number(next.concurrency) || maxConcurrency;
+	next.concurrency = Math.min(currentConc, maxConcurrency);
+	return next;
+}
 const asConfig = (value) => {
 	const merged = {
 		...EMPTY,
@@ -125,6 +166,27 @@ function storedUrl() {
 		return DEFAULT_URL;
 	}
 }
+function setStoredUrl(url) {
+	try {
+		const clean = String(url ?? "").trim();
+		if (clean) localStorage.setItem(URL_KEY, clean);
+		else localStorage.removeItem(URL_KEY);
+	} catch {}
+}
+function storedToken() {
+	try {
+		return (localStorage.getItem("local.buzz-host.token") || "").trim();
+	} catch {
+		return "";
+	}
+}
+function setStoredToken(token) {
+	try {
+		const clean = String(token ?? "").trim();
+		if (clean) localStorage.setItem(TOKEN_KEY, clean);
+		else localStorage.removeItem(TOKEN_KEY);
+	} catch {}
+}
 
 //#endregion
 //#region plugin/src/client.js
@@ -137,7 +199,9 @@ function createClient() {
 	let state = {
 		status: "idle",
 		url: storedUrl(),
-		error: ""
+		error: "",
+		session: null,
+		epoch: 0
 	};
 	const set = (patch) => {
 		state = {
@@ -147,74 +211,14 @@ function createClient() {
 		for (const listener of listeners) listener();
 	};
 	function fail(error) {
-		for (const [, p] of pending) p.reject(error);
+		for (const [, p] of pending) {
+			clearTimeout(p.timer);
+			p.reject(error);
+		}
 		pending.clear();
 	}
-	function open() {
-		if (socket && socket.readyState === WebSocket.OPEN) return Promise.resolve(socket);
-		if (opening) return opening;
-		const url = storedUrl();
-		set({
-			status: "connecting",
-			url,
-			error: ""
-		});
-		opening = new Promise((resolve, reject) => {
-			let ws;
-			try {
-				ws = new WebSocket(url);
-			} catch (error) {
-				opening = void 0;
-				set({
-					status: "error",
-					error: String(error.message ?? error)
-				});
-				reject(error);
-				return;
-			}
-			const timer = setTimeout(() => ws.close(), 2e4);
-			ws.onopen = () => {
-				clearTimeout(timer);
-				socket = ws;
-				opening = void 0;
-				set({ status: "connected" });
-				resolve(ws);
-			};
-			ws.onmessage = (event) => {
-				let message;
-				try {
-					message = JSON.parse(event.data);
-				} catch {
-					return;
-				}
-				const p = pending.get(message.id);
-				if (!p) return;
-				pending.delete(message.id);
-				clearTimeout(p.timer);
-				if (message.error) p.reject(new Error(message.error));
-				else p.resolve(message.result);
-			};
-			ws.onclose = () => {
-				clearTimeout(timer);
-				const wasOpen = socket === ws;
-				if (wasOpen) socket = void 0;
-				if (opening && !wasOpen) {
-					opening = void 0;
-					const error = /* @__PURE__ */ new Error(`Could not reach buzz-host at ${url}. Check that the server is up and this device is on the tailnet.`);
-					set({
-						status: "error",
-						error: error.message
-					});
-					reject(error);
-				} else set({ status: "idle" });
-				fail(/* @__PURE__ */ new Error("Connection to buzz-host closed"));
-			};
-		});
-		return opening;
-	}
-	async function call(method, params = {}, { signal, timeoutMs = 12e4 } = {}) {
-		if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
-		const ws = await open();
+	function sendRaw(ws, method, params = {}, { signal, timeoutMs = 12e4 } = {}) {
+		if (signal?.aborted) return Promise.reject(new DOMException("Aborted", "AbortError"));
 		const id = next++;
 		return new Promise((resolve, reject) => {
 			const timer = setTimeout(() => {
@@ -238,6 +242,122 @@ function createClient() {
 			}));
 		});
 	}
+	function open() {
+		if (socket && socket.readyState === WebSocket.OPEN) return Promise.resolve(socket);
+		if (opening) return opening;
+		const url = storedUrl();
+		const token = storedToken();
+		set({
+			status: "connecting",
+			url,
+			error: ""
+		});
+		opening = new Promise((resolve, reject) => {
+			let settled = false;
+			let ws;
+			try {
+				ws = new WebSocket(url);
+			} catch (error) {
+				opening = void 0;
+				set({
+					status: "error",
+					error: String(error.message ?? error),
+					session: null
+				});
+				reject(error);
+				return;
+			}
+			const timer = setTimeout(() => ws.close(), 2e4);
+			ws.onopen = async () => {
+				clearTimeout(timer);
+				if (token) {
+					try {
+						const auth = await sendRaw(ws, "auth", { token }, { timeoutMs: 15e3 });
+						socket = ws;
+						opening = void 0;
+						settled = true;
+						set({
+							status: "connected",
+							error: "",
+							session: {
+								role: auth.role || "guest",
+								label: auth.label ?? null,
+								ownerPubkey: auth.ownerPubkey ?? null,
+								limits: auth.limits ?? null
+							}
+						});
+						resolve(ws);
+					} catch (error) {
+						opening = void 0;
+						settled = true;
+						const err = error instanceof Error ? error : new Error(String(error));
+						set({
+							status: "error",
+							error: err.message,
+							session: null
+						});
+						try {
+							ws.close();
+						} catch {}
+						reject(err);
+					}
+					return;
+				}
+				socket = ws;
+				opening = void 0;
+				settled = true;
+				set({
+					status: "connected",
+					error: ""
+				});
+				resolve(ws);
+			};
+			ws.onmessage = (event) => {
+				let message;
+				try {
+					message = JSON.parse(event.data);
+				} catch {
+					return;
+				}
+				const p = pending.get(message.id);
+				if (!p) return;
+				pending.delete(message.id);
+				clearTimeout(p.timer);
+				if (message.error) p.reject(new Error(message.error));
+				else p.resolve(message.result);
+			};
+			ws.onclose = () => {
+				clearTimeout(timer);
+				const wasOpen = socket === ws;
+				if (wasOpen) socket = void 0;
+				if (!settled && opening && !wasOpen) {
+					opening = void 0;
+					settled = true;
+					const error = /* @__PURE__ */ new Error(token ? `Could not reach buzz-host at ${url}. Check that the server is up and the invite URL is correct.` : `Could not reach buzz-host at ${url}. Check that the server is up and this device is on the tailnet.`);
+					set({
+						status: "error",
+						error: error.message,
+						session: null
+					});
+					reject(error);
+				} else if (wasOpen) set({ status: "idle" });
+				fail(/* @__PURE__ */ new Error("Connection to buzz-host closed"));
+			};
+		});
+		return opening;
+	}
+	async function call(method, params = {}, options = {}) {
+		if (options.signal?.aborted) throw new DOMException("Aborted", "AbortError");
+		const result = await sendRaw(await open(), method, params, options);
+		if (method === "hello" && result && typeof result === "object") set({ session: {
+			role: result.role || "admin",
+			label: result.label ?? null,
+			ownerPubkey: result.ownerPubkey ?? null,
+			limits: result.limits ?? null,
+			publicGuestUrl: result.publicGuestUrl ?? null
+		} });
+		return result;
+	}
 	return {
 		call,
 		snapshot: () => state,
@@ -246,9 +366,17 @@ function createClient() {
 			return () => listeners.delete(listener);
 		},
 		reconnect() {
-			socket?.close();
+			const old = socket;
 			socket = void 0;
-			set({ url: storedUrl() });
+			opening = void 0;
+			try {
+				old?.close();
+			} catch {}
+			set({
+				url: storedUrl(),
+				session: null,
+				epoch: state.epoch + 1
+			});
 			return open();
 		},
 		close() {
@@ -352,6 +480,36 @@ function useModels(React, client, runtime, profile = "") {
 	return state.key === key ? state : {
 		key,
 		models: void 0,
+		error: ""
+	};
+}
+function useServerInfo(React, client) {
+	const snap = React.useSyncExternalStore(client.subscribe, client.snapshot);
+	const key = `${snap.url}#${snap.epoch ?? 0}`;
+	const [state, setState] = React.useState(() => ({
+		key,
+		info: snap.session ? { ...snap.session } : void 0,
+		error: ""
+	}));
+	React.useEffect(() => {
+		const controller = new AbortController();
+		client.call("hello", {}, {
+			signal: controller.signal,
+			timeoutMs: 2e4
+		}).then((info) => !controller.signal.aborted && setState({
+			key,
+			info,
+			error: ""
+		}), (e) => !controller.signal.aborted && setState({
+			key,
+			info: void 0,
+			error: String(e.message ?? e)
+		}));
+		return () => controller.abort();
+	}, [client, key]);
+	return state.key === key ? state : {
+		key,
+		info: snap.session ? { ...snap.session } : void 0,
 		error: ""
 	};
 }
@@ -1096,15 +1254,33 @@ function createType({ React, client, ctx, uiKit, invalidateCatalog, ActivityTab,
 		label: "",
 		options
 	}];
+	function runtimeOptionsFor(serverInfo) {
+		if (serverInfo?.role !== "guest") return runtimeOptions;
+		const allowed = new Set(serverInfo.limits?.allowedRuntimes ?? []);
+		return RUNTIMES.filter((r) => allowed.size === 0 || allowed.has(r.id)).map((r) => ({
+			value: r.id,
+			label: r.title
+		}));
+	}
+	function concurrencyOptionsFor(serverInfo) {
+		if (serverInfo?.role !== "guest") return CONCURRENCY_OPTIONS;
+		const max = Number(serverInfo.limits?.maxConcurrency) || 2;
+		return CONCURRENCY_VALUES.filter((n) => n <= max).map((n) => ({
+			value: String(n),
+			label: n === 1 ? "1 (sequential)" : n === max ? `${n} (max)` : `${n} parallel`
+		}));
+	}
 	/** Runtime, Hermes profile, Model, Concurrency, Access and Runner rows, for a SettingsGroup. */
-	function RuntimeRows({ ui, draft, onChange, disabled }) {
-		const sandboxed = (draft.runner || "host") !== "host";
-		const { models, error } = useModels(React, client, draft.runtime, sandboxed ? "" : draft.profile);
-		const hermes = draft.runtime === "hermes" && !sandboxed;
+	function RuntimeRows({ ui, draft, onChange, disabled, serverInfo }) {
+		const isGuest = serverInfo?.role === "guest";
+		const effective = isGuest ? applyGuestConstraints(draft, serverInfo) : draft;
+		const sandboxed = isGuest || (effective.runner || "host") !== "host";
+		const { models, error } = useModels(React, client, effective.runtime, sandboxed ? "" : effective.profile);
+		const hermes = !isGuest && effective.runtime === "hermes" && !sandboxed;
 		const { profiles, error: profileError } = useProfiles(React, client, hermes);
 		const choice = modelChoices(models);
-		const respondTo = draft.respondTo || "owner-only";
-		const runnerChoices = respondTo === "owner-only" ? RUNNERS.map((r) => ({
+		const respondTo = effective.respondTo || "owner-only";
+		const runnerChoices = !isGuest && respondTo === "owner-only" ? RUNNERS.map((r) => ({
 			value: r.id,
 			label: r.title
 		})) : RUNNERS.filter((r) => r.id !== "host").map((r) => ({
@@ -1114,14 +1290,11 @@ function createType({ React, client, ctx, uiKit, invalidateCatalog, ActivityTab,
 		return h(React.Fragment, null, h(ui.Select, {
 			label: "Runtime",
 			variant: "preference",
-			value: draft.runtime,
+			value: effective.runtime,
 			disabled,
-			groups: one(RUNTIMES.map((r) => ({
-				value: r.id,
-				label: r.title
-			}))),
+			groups: one(runtimeOptionsFor(serverInfo)),
 			onValueChange: (runtime) => onChange({
-				...draft,
+				...effective,
 				runtime,
 				model: "",
 				profile: ""
@@ -1129,19 +1302,19 @@ function createType({ React, client, ctx, uiKit, invalidateCatalog, ActivityTab,
 		}), hermes && h(ui.Select, {
 			label: "Hermes profile",
 			variant: "preference",
-			value: draft.profile || "",
+			value: effective.profile || "",
 			disabled: disabled || profiles === void 0,
 			...profileError ? { description: `Profile list unavailable: ${profileError}` } : {},
-			groups: one(profileOptions(profiles, draft.profile)),
+			groups: one(profileOptions(profiles, effective.profile)),
 			onValueChange: (profile) => onChange({
-				...draft,
+				...effective,
 				profile
 			})
 		}), h(ui.ModelPicker, {
 			label: "Model",
 			models: choice.models,
 			groupByFamily: choice.byFamily,
-			value: draft.model,
+			value: effective.model,
 			allowCustomModel: true,
 			defaultLabel: "Runtime default",
 			defaultDescription: "The model this runtime uses on the server",
@@ -1149,17 +1322,17 @@ function createType({ React, client, ctx, uiKit, invalidateCatalog, ActivityTab,
 			disabled,
 			...error ? { description: `Model list unavailable: ${error}` } : {},
 			onChange: (model) => onChange({
-				...draft,
+				...effective,
 				model
 			})
 		}), h(ui.Select, {
 			label: "Parallel conversations",
 			variant: "preference",
-			value: String(draft.concurrency ?? 4),
+			value: String(effective.concurrency ?? (isGuest ? serverInfo?.limits?.maxConcurrency ?? 2 : 4)),
 			disabled,
-			groups: one(CONCURRENCY_OPTIONS),
+			groups: one(concurrencyOptionsFor(serverInfo)),
 			onValueChange: (v) => onChange({
-				...draft,
+				...effective,
 				concurrency: Number(v) || 4
 			})
 		}), h(ui.Select, {
@@ -1169,17 +1342,21 @@ function createType({ React, client, ctx, uiKit, invalidateCatalog, ActivityTab,
 			disabled,
 			groups: one(RESPOND_TO_OPTIONS),
 			onValueChange: (nextMode) => onChange({
-				...applyRespondToChange(draft, nextMode),
-				allowlistText: nextMode === "allowlist" ? draft.allowlistText ?? formatAllowlistText(draft.respondToAllowlist) : ""
+				...applyRespondToChange(effective, nextMode),
+				...isGuest ? {
+					runner: "docker",
+					profile: ""
+				} : {},
+				allowlistText: nextMode === "allowlist" ? effective.allowlistText ?? formatAllowlistText(effective.respondToAllowlist) : ""
 			})
 		}), h(ui.Select, {
 			label: "Sandbox runner",
 			variant: "preference",
-			value: draft.runner || "host",
-			disabled,
-			...respondTo !== "owner-only" ? { description: "Shared agents always run in an isolated sandbox container." } : {},
+			value: effective.runner || (isGuest ? "docker" : "host"),
+			disabled: disabled || isGuest,
+			...isGuest ? { description: "Guest accounts always run agents in an isolated Docker sandbox." } : respondTo !== "owner-only" ? { description: "Shared agents always run in an isolated sandbox container." } : {},
 			groups: one(runnerChoices),
-			onValueChange: (nextRunner) => onChange(applyRunnerChange(draft, nextRunner))
+			onValueChange: (nextRunner) => onChange(applyRunnerChange(effective, nextRunner))
 		}));
 	}
 	function AllowlistField({ draft, onChange, disabled }) {
@@ -1223,31 +1400,45 @@ function createType({ React, client, ctx, uiKit, invalidateCatalog, ActivityTab,
 	function CreateConfiguration({ agent, config, onChange, disabled, harnessControl, onReadyChange }) {
 		React.useEffect(() => onReadyChange?.(true), [onReadyChange]);
 		const ui = agentUi();
+		const { info: serverInfo } = useServerInfo(React, client);
+		const isGuest = serverInfo?.role === "guest";
+		const draft = isGuest ? applyGuestConstraints(asConfig(config), serverInfo) : asConfig(config);
+		React.useEffect(() => {
+			if (agent || !isGuest) return;
+			const raw = asConfig(config);
+			const constrained = applyGuestConstraints(raw, serverInfo);
+			if (constrained.runner !== raw.runner || constrained.runtime !== raw.runtime || constrained.concurrency !== raw.concurrency || constrained.profile !== raw.profile) onChange(constrained);
+		}, [
+			agent,
+			isGuest,
+			serverInfo
+		]);
 		if (agent) return h(RunsWith, {
 			ui,
 			agent,
 			harnessControl
 		});
-		const draft = asConfig(config);
 		if (!ui) return h("div", { style: {
 			display: "grid",
 			gap: "var(--space-3)"
 		} }, harnessControl, h(CreateFields, {
-			config,
+			config: draft,
 			onChange,
 			disabled,
-			part: "runtime"
+			part: "runtime",
+			serverInfo
 		}));
 		return h("div", { className: "grid gap-2" }, h(ui.SettingsGroup, null, harnessControl, h(RuntimeRows, {
 			ui,
 			draft,
 			onChange,
-			disabled
+			disabled,
+			serverInfo
 		})), h(AllowlistField, {
 			draft,
 			onChange,
 			disabled
-		}), h("p", { className: "m-0 text-body-sm text-secondary" }, "Runs on your server with buzz-acp and uses that machine's sign-ins."));
+		}), h("p", { className: "m-0 text-body-sm text-secondary" }, isGuest ? "Runs in an isolated Docker sandbox on your host's server." : "Runs on your server with buzz-acp and uses that machine's sign-ins."));
 	}
 	function RunsWith({ ui, agent, harnessControl }) {
 		const text = useRunsWith(agent.pubkey);
@@ -1306,9 +1497,15 @@ function createType({ React, client, ctx, uiKit, invalidateCatalog, ActivityTab,
 		});
 	}
 	/** This plugin's own fields, for a Buzz without agentUi. */
-	function CreateFields({ config, onChange, disabled, part }) {
-		const draft = asConfig(config);
-		const change = (patch) => onChange({
+	function CreateFields({ config, onChange, disabled, part, serverInfo: passedServerInfo }) {
+		const { info: fetchedInfo } = useServerInfo(React, client);
+		const serverInfo = passedServerInfo ?? fetchedInfo;
+		const isGuest = serverInfo?.role === "guest";
+		const draft = isGuest ? applyGuestConstraints(asConfig(config), serverInfo) : asConfig(config);
+		const change = (patch) => onChange(isGuest ? applyGuestConstraints({
+			...draft,
+			...patch
+		}, serverInfo) : {
 			...draft,
 			...patch
 		});
@@ -1327,13 +1524,13 @@ function createType({ React, client, ctx, uiKit, invalidateCatalog, ActivityTab,
 		}, h(Select, {
 			value: draft.runtime,
 			disabled,
-			options: runtimeOptions,
+			options: runtimeOptionsFor(serverInfo),
 			onChange: (runtime) => change({
 				runtime,
 				model: "",
 				profile: ""
 			})
-		})), draft.runtime === "hermes" && (draft.runner || "host") === "host" && h(Row, {
+		})), !isGuest && draft.runtime === "hermes" && (draft.runner || "host") === "host" && h(Row, {
 			label: "Hermes profile",
 			hint: "Which Hermes home runs this agent: its config, memory, skills and provider."
 		}, h(ProfileField, {
@@ -1346,7 +1543,7 @@ function createType({ React, client, ctx, uiKit, invalidateCatalog, ActivityTab,
 			React,
 			client,
 			runtime: draft.runtime,
-			profile: (draft.runner || "host") === "host" ? draft.profile : "",
+			profile: !isGuest && (draft.runner || "host") === "host" ? draft.profile : "",
 			value: draft.model,
 			disabled,
 			onChange: (model) => change({ model })
@@ -1356,7 +1553,7 @@ function createType({ React, client, ctx, uiKit, invalidateCatalog, ActivityTab,
 		}, h(Select, {
 			value: String(draft.concurrency ?? 4),
 			disabled,
-			options: CONCURRENCY_OPTIONS,
+			options: concurrencyOptionsFor(serverInfo),
 			onChange: (v) => change({ concurrency: Number(v) || 4 })
 		})), h(Row, {
 			label: "Who can talk to this agent",
@@ -1367,6 +1564,10 @@ function createType({ React, client, ctx, uiKit, invalidateCatalog, ActivityTab,
 			options: RESPOND_TO_OPTIONS,
 			onChange: (nextMode) => onChange({
 				...applyRespondToChange(draft, nextMode),
+				...isGuest ? {
+					runner: "docker",
+					profile: ""
+				} : {},
 				allowlistText: nextMode === "allowlist" ? draft.allowlistText ?? formatAllowlistText(draft.respondToAllowlist) : ""
 			})
 		})), h(AllowlistField, {
@@ -1375,11 +1576,11 @@ function createType({ React, client, ctx, uiKit, invalidateCatalog, ActivityTab,
 			disabled
 		}), h(Row, {
 			label: "Sandbox runner",
-			hint: (draft.respondTo || "owner-only") !== "owner-only" ? "Shared agents always run in an isolated sandbox container." : "Choose Docker sandbox to isolate this agent from host files and keys."
+			hint: isGuest ? "Guest accounts always run agents in an isolated Docker sandbox." : (draft.respondTo || "owner-only") !== "owner-only" ? "Shared agents always run in an isolated sandbox container." : "Choose Docker sandbox to isolate this agent from host files and keys."
 		}, h(Select, {
-			value: draft.runner || "host",
-			disabled,
-			options: (draft.respondTo || "owner-only") === "owner-only" ? RUNNERS.map((r) => ({
+			value: draft.runner || (isGuest ? "docker" : "host"),
+			disabled: disabled || isGuest,
+			options: !isGuest && (draft.respondTo || "owner-only") === "owner-only" ? RUNNERS.map((r) => ({
 				value: r.id,
 				label: r.title
 			})) : RUNNERS.filter((r) => r.id !== "host").map((r) => ({
@@ -1429,6 +1630,8 @@ function createType({ React, client, ctx, uiKit, invalidateCatalog, ActivityTab,
 	function NativeSettings({ ui, agent, settingsSection, settingsContent, settingsHost }) {
 		const pubkey = agent.pubkey;
 		const form = React.useId();
+		const { info: serverInfo } = useServerInfo(React, client);
+		const isGuest = serverInfo?.role === "guest";
 		const { loaded, setLoaded, error: loadError, retry } = useHosted(pubkey);
 		const [draft, setDraft] = React.useState();
 		const [busy, setBusy] = React.useState("");
@@ -1510,7 +1713,7 @@ function createType({ React, client, ctx, uiKit, invalidateCatalog, ActivityTab,
 					background: "var(--surface-inset)",
 					border: "1px solid var(--border-standard)"
 				}
-			}, logs || "(no log lines)"), (loaded.runner || "host") === "host" && h(OrchestratorSettings, {
+			}, logs || "(no log lines)"), !isGuest && (loaded.runner || "host") === "host" && h(OrchestratorSettings, {
 				ui,
 				agent
 			}), settingsContent);
@@ -1560,7 +1763,8 @@ function createType({ React, client, ctx, uiKit, invalidateCatalog, ActivityTab,
 			ui,
 			draft,
 			disabled: !!busy,
-			onChange: setDraft
+			onChange: setDraft,
+			serverInfo
 		})), h(AllowlistField, {
 			draft,
 			disabled: !!busy,
@@ -1583,6 +1787,8 @@ function createType({ React, client, ctx, uiKit, invalidateCatalog, ActivityTab,
 	/** This plugin's own settings form, for a Buzz without agentUi. */
 	function OwnSettings({ agent, settingsSection, settingsContent }) {
 		if (settingsSection === "runtime") return settingsContent ?? null;
+		const { info: serverInfo } = useServerInfo(React, client);
+		const isGuest = serverInfo?.role === "guest";
 		const [loaded, setLoaded] = React.useState();
 		const [draft, setDraft] = React.useState();
 		const [busy, setBusy] = React.useState("");
@@ -1675,14 +1881,14 @@ function createType({ React, client, ctx, uiKit, invalidateCatalog, ActivityTab,
 		} }, h(Note, null, `Runs on buzz-host (${client.snapshot().url.replace(/^wss:\/\//, "")})${loaded.runtime === "hermes" ? ` · Hermes profile ${loaded.profile || "default"}` : ""} · service ${loaded.status}. Up to ${loaded.concurrency} parallel conversations.`), h(Row, { label: "Runtime" }, h(Select, {
 			value: draft.runtime,
 			disabled: !!busy,
-			options: runtimeOptions,
+			options: runtimeOptionsFor(serverInfo),
 			onChange: (runtime) => setDraft({
 				...draft,
 				runtime,
 				model: "",
 				profile: ""
 			})
-		})), draft.runtime === "hermes" && (draft.runner || "host") === "host" && h(Row, {
+		})), !isGuest && draft.runtime === "hermes" && (draft.runner || "host") === "host" && h(Row, {
 			label: "Hermes profile",
 			hint: `${"Which Hermes home runs this agent: its config, memory, skills and provider."} Changing it restarts the agent with that profile's memory.`
 		}, h(ProfileField, {
@@ -1698,7 +1904,7 @@ function createType({ React, client, ctx, uiKit, invalidateCatalog, ActivityTab,
 			React,
 			client,
 			runtime: draft.runtime,
-			profile: (draft.runner || "host") === "host" ? draft.profile : "",
+			profile: !isGuest && (draft.runner || "host") === "host" ? draft.profile : "",
 			value: draft.model,
 			disabled: !!busy,
 			onChange: (model) => setDraft({
@@ -1711,7 +1917,7 @@ function createType({ React, client, ctx, uiKit, invalidateCatalog, ActivityTab,
 		}, h(Select, {
 			value: String(draft.concurrency ?? 4),
 			disabled: !!busy,
-			options: CONCURRENCY_OPTIONS,
+			options: concurrencyOptionsFor(serverInfo),
 			onChange: (v) => setDraft({
 				...draft,
 				concurrency: Number(v) || 4
@@ -1725,6 +1931,10 @@ function createType({ React, client, ctx, uiKit, invalidateCatalog, ActivityTab,
 			options: RESPOND_TO_OPTIONS,
 			onChange: (nextMode) => setDraft({
 				...applyRespondToChange(draft, nextMode),
+				...isGuest ? {
+					runner: "docker",
+					profile: ""
+				} : {},
 				allowlistText: nextMode === "allowlist" ? draft.allowlistText ?? formatAllowlistText(draft.respondToAllowlist) : ""
 			})
 		})), h(AllowlistField, {
@@ -1733,11 +1943,11 @@ function createType({ React, client, ctx, uiKit, invalidateCatalog, ActivityTab,
 			onChange: setDraft
 		}), h(Row, {
 			label: "Sandbox runner",
-			hint: (draft.respondTo || "owner-only") !== "owner-only" ? "Shared agents always run in an isolated sandbox container." : "Choose Docker sandbox to isolate this agent from host files and keys."
+			hint: isGuest ? "Guest accounts always run agents in an isolated Docker sandbox." : (draft.respondTo || "owner-only") !== "owner-only" ? "Shared agents always run in an isolated sandbox container." : "Choose Docker sandbox to isolate this agent from host files and keys."
 		}, h(Select, {
-			value: draft.runner || "host",
-			disabled: !!busy,
-			options: (draft.respondTo || "owner-only") === "owner-only" ? RUNNERS.map((r) => ({
+			value: draft.runner || (isGuest ? "docker" : "host"),
+			disabled: !!busy || isGuest,
+			options: !isGuest && (draft.respondTo || "owner-only") === "owner-only" ? RUNNERS.map((r) => ({
 				value: r.id,
 				label: r.title
 			})) : RUNNERS.filter((r) => r.id !== "host").map((r) => ({
@@ -1794,7 +2004,7 @@ function createType({ React, client, ctx, uiKit, invalidateCatalog, ActivityTab,
 			fontSize: "var(--text-caption)",
 			whiteSpace: "pre-wrap",
 			wordBreak: "break-word"
-		} }, logs || "(no log lines)"), (loaded.runner || "host") === "host" && h(OrchestratorSettings, { agent }), !settingsSection && settingsContent);
+		} }, logs || "(no log lines)"), !isGuest && (loaded.runner || "host") === "host" && h(OrchestratorSettings, { agent }), !settingsSection && settingsContent);
 	}
 	const omarchyType = {
 		id: "omarchy",
@@ -1823,7 +2033,8 @@ function createType({ React, client, ctx, uiKit, invalidateCatalog, ActivityTab,
 		}],
 		remote: {
 			async provision({ name, picture, community, config, signal }) {
-				const c = asConfig(config);
+				const session = client.snapshot().session;
+				const c = applyGuestConstraints(asConfig(config), session);
 				return client.call("provision", {
 					name,
 					picture,
@@ -1841,7 +2052,8 @@ function createType({ React, client, ctx, uiKit, invalidateCatalog, ActivityTab,
 				}, { signal });
 			},
 			async activate({ pubkey, name, community, auth, config, signal }) {
-				const c = config === void 0 ? void 0 : asConfig(config);
+				const session = client.snapshot().session;
+				const c = config === void 0 ? void 0 : applyGuestConstraints(asConfig(config), session);
 				await client.call("activate", {
 					pubkey,
 					name,
@@ -1918,24 +2130,215 @@ function createType({ React, client, ctx, uiKit, invalidateCatalog, ActivityTab,
 //#region plugin/src/server-card.js
 function createServerCard({ React, client, uiKit }) {
 	const { h, Row, Text, Note } = uiKit;
+	function GuestInvites({ publicGuestUrl }) {
+		const [tokens, setTokens] = React.useState([]);
+		const [loading, setLoading] = React.useState(true);
+		const [label, setLabel] = React.useState("");
+		const [ownerPubkey, setOwnerPubkey] = React.useState("");
+		const [maxAgents, setMaxAgents] = React.useState("2");
+		const [maxConcurrency, setMaxConcurrency] = React.useState("2");
+		const [busy, setBusy] = React.useState(false);
+		const [error, setError] = React.useState("");
+		const [created, setCreated] = React.useState(null);
+		const [copied, setCopied] = React.useState(false);
+		const refresh = async () => {
+			setLoading(true);
+			try {
+				const res = await client.call("tokens.list");
+				setTokens(Array.isArray(res?.tokens) ? res.tokens : []);
+			} catch (e) {
+				setError(String(e.message ?? e));
+			} finally {
+				setLoading(false);
+			}
+		};
+		React.useEffect(() => {
+			refresh();
+		}, []);
+		const createInvite = async () => {
+			const cleanLabel = label.trim();
+			if (!cleanLabel) {
+				setError("Enter a friend's name or label first.");
+				return;
+			}
+			setBusy(true);
+			setError("");
+			setCreated(null);
+			setCopied(false);
+			try {
+				const res = await client.call("tokens.create", {
+					label: cleanLabel,
+					...ownerPubkey.trim() ? { ownerPubkey: ownerPubkey.trim() } : {},
+					maxAgents: Number(maxAgents) || 2,
+					maxConcurrency: Number(maxConcurrency) || 2
+				});
+				setCreated(res);
+				setLabel("");
+				setOwnerPubkey("");
+				await refresh();
+			} catch (e) {
+				setError(String(e.message ?? e));
+			} finally {
+				setBusy(false);
+			}
+		};
+		const revoke = async (id) => {
+			setBusy(true);
+			setError("");
+			try {
+				await client.call("tokens.revoke", { id });
+				await refresh();
+			} catch (e) {
+				setError(String(e.message ?? e));
+			} finally {
+				setBusy(false);
+			}
+		};
+		const copyText = async (text) => {
+			try {
+				await navigator.clipboard.writeText(text);
+				setCopied(true);
+				setTimeout(() => setCopied(false), 2500);
+			} catch {
+				setError("Could not copy automatically — select and copy the link above.");
+			}
+		};
+		const activeTokens = tokens.filter((t) => !t.revokedAt);
+		const revokedTokens = tokens.filter((t) => t.revokedAt);
+		return h("div", { style: {
+			display: "grid",
+			gap: "var(--space-3)",
+			paddingTop: "var(--space-3)",
+			borderTop: "1px solid var(--border-standard)"
+		} }, h("strong", null, "Guest invites (friends)"), h(Note, null, `Create a personal invite link so a friend can host sandboxed agents on this server.${publicGuestUrl ? ` Guest endpoint: ${publicGuestUrl}` : ""}`), h("div", { style: {
+			display: "grid",
+			gap: "var(--space-2)",
+			gridTemplateColumns: "minmax(0, 1fr) minmax(0, 1fr)"
+		} }, h(Row, {
+			label: "Friend label",
+			hint: "Shown in your invite list (e.g. Alex)."
+		}, h(Text, {
+			value: label,
+			disabled: busy,
+			placeholder: "Alex",
+			onChange: (e) => setLabel(e.target.value)
+		})), h(Row, {
+			label: "Owner pubkey (optional)",
+			hint: "Leave blank to bind automatically on their first agent."
+		}, h(Text, {
+			value: ownerPubkey,
+			disabled: busy,
+			placeholder: "64-char hex pubkey (optional)",
+			onChange: (e) => setOwnerPubkey(e.target.value)
+		}))), h("div", { style: {
+			display: "grid",
+			gap: "var(--space-2)",
+			gridTemplateColumns: "minmax(0, 1fr) minmax(0, 1fr)"
+		} }, h(Row, { label: "Max agents" }, h(Text, {
+			type: "number",
+			min: 1,
+			max: 20,
+			value: maxAgents,
+			disabled: busy,
+			onChange: (e) => setMaxAgents(e.target.value)
+		})), h(Row, { label: "Max parallel chats" }, h(Text, {
+			type: "number",
+			min: 1,
+			max: 8,
+			value: maxConcurrency,
+			disabled: busy,
+			onChange: (e) => setMaxConcurrency(e.target.value)
+		}))), h("div", { style: {
+			display: "flex",
+			gap: "var(--space-2)"
+		} }, h("button", {
+			type: "button",
+			disabled: busy,
+			onClick: () => void createInvite()
+		}, busy ? "Working…" : "Create guest invite")), error && h(Note, { tone: "error" }, error), created && h("div", { style: {
+			display: "grid",
+			gap: "var(--space-2)",
+			padding: "var(--space-3)",
+			borderRadius: "var(--radius-control)",
+			background: "var(--surface-inset)",
+			border: "1px solid var(--border-standard)"
+		} }, h(Note, null, `Invite created for ${created.record.label}. Copy and send it now — the secret token is shown only once.`), h(Text, {
+			readOnly: true,
+			value: created.inviteUrl || created.token,
+			onFocus: (e) => e.target.select()
+		}), h("div", { style: {
+			display: "flex",
+			gap: "var(--space-2)",
+			alignItems: "center"
+		} }, h("button", {
+			type: "button",
+			onClick: () => void copyText(created.inviteUrl || created.token)
+		}, copied ? "Copied!" : "Copy invite link"), created.inviteUrl && h("button", {
+			type: "button",
+			onClick: () => void copyText(created.token)
+		}, "Copy token only"))), loading ? h(Note, null, "Loading guest invites…") : activeTokens.length === 0 ? h(Note, null, "No active guest invites.") : h("div", { style: {
+			display: "grid",
+			gap: "var(--space-2)"
+		} }, ...activeTokens.map((t) => h("div", {
+			key: t.id,
+			style: {
+				display: "flex",
+				justifyContent: "space-between",
+				alignItems: "center",
+				gap: "var(--space-2)",
+				padding: "var(--space-2)",
+				borderRadius: "var(--radius-control)",
+				border: "1px solid var(--border-standard)"
+			}
+		}, h("div", { style: {
+			display: "grid",
+			gap: "2px",
+			minWidth: 0
+		} }, h("strong", null, `${t.label} (${t.id})`), h(Note, null, `${t.agentCount ?? 0}/${t.maxAgents} agents · max ${t.maxConcurrency} parallel · ${t.allowedRuntimes.join(", ")} · ${t.ownerPubkey ? `bound ${t.ownerPubkey.slice(0, 10)}…` : "unbound (binds on first agent)"}`)), h("button", {
+			type: "button",
+			disabled: busy,
+			onClick: () => void revoke(t.id)
+		}, "Revoke")))), revokedTokens.length > 0 && h(Note, null, `${revokedTokens.length} revoked invite${revokedTokens.length === 1 ? "" : "s"}.`));
+	}
 	return function ServerCard() {
 		const state = React.useSyncExternalStore(client.subscribe, client.snapshot);
 		const [url, setUrl] = React.useState(storedUrl());
+		const [token, setToken] = React.useState(storedToken());
+		const [showToken, setShowToken] = React.useState(false);
+		const [notice, setNotice] = React.useState("");
 		const [info, setInfo] = React.useState();
 		const [error, setError] = React.useState("");
-		const check = async () => {
+		const handleUrlChange = (raw) => {
+			const parsed = parseInviteInput(raw);
+			if (parsed.token) {
+				setUrl(parsed.url);
+				setToken(parsed.token);
+				setNotice("Invite link parsed into Server URL and Access token. Click Save and check to connect.");
+			} else {
+				setUrl(raw);
+				setNotice("");
+			}
+		};
+		const check = async (overrideUrl, overrideToken) => {
 			setError("");
 			setInfo(void 0);
+			const parsed = parseInviteInput(overrideUrl ?? url);
+			const cleanUrl = (parsed.url || "wss://omarchy.tail65c5a9.ts.net:8447").trim();
+			const cleanToken = (parsed.token ?? overrideToken ?? token).trim();
+			if (parsed.token) {
+				setUrl(cleanUrl);
+				setToken(cleanToken);
+			}
 			try {
-				try {
-					localStorage.setItem(URL_KEY, url.trim() || "wss://omarchy.tail65c5a9.ts.net:8447");
-				} catch {}
+				setStoredUrl(cleanUrl);
+				setStoredToken(cleanToken);
 				await client.reconnect();
 				const [hello, list] = await Promise.all([client.call("hello"), client.call("list")]);
 				setInfo({
 					hello,
 					list
 				});
+				setNotice("");
 			} catch (e) {
 				setError(String(e.message ?? e));
 			}
@@ -1943,25 +2346,49 @@ function createServerCard({ React, client, uiKit }) {
 		React.useEffect(() => {
 			check();
 		}, []);
+		const isGuest = info?.hello?.role === "guest";
+		const isAdmin = info?.hello?.role === "admin";
 		return h("div", { style: {
 			display: "grid",
 			gap: "var(--space-3)"
-		} }, h(Note, null, "Agents of type Self-hosted run on your server with buzz-host. Create them in Agents → New agent → Harness → Remote → Self-hosted. In a chat, tag the agent with /model, /effort, /runtime, /new, /stop, /status or /help to control that chat (or thread). The composer's model picker also lists other runtimes' models; picking one moves the chat to that runtime."), h(Row, {
-			label: "Server",
-			hint: "A wss:// address published with tailscale serve."
+		} }, h(Note, null, "Agents of type Self-hosted run on a buzz-host server. Create them in Agents → New agent → Harness → Remote → Self-hosted. In a chat, tag the agent with /model, /effort, /runtime, /new, /stop, /status or /help to control that chat (or thread)."), h(Row, {
+			label: "Server (or paste invite link)",
+			hint: "Admin: your wss:// tailscale serve address. Guest: paste the invite link from your host."
 		}, h(Text, {
 			value: url,
-			onChange: (e) => setUrl(e.target.value)
-		})), h("div", { style: {
+			onChange: (e) => handleUrlChange(e.target.value)
+		})), h(Row, {
+			label: "Access token (guests only)",
+			hint: "Leave blank on your own tailnet admin connection. Filled automatically when pasting an invite link."
+		}, h("div", { style: {
+			display: "flex",
+			gap: "var(--space-2)"
+		} }, h(Text, {
+			type: showToken ? "text" : "password",
+			value: token,
+			placeholder: "bhg_… (optional)",
+			style: { flex: 1 },
+			onChange: (e) => setToken(e.target.value)
+		}), h("button", {
+			type: "button",
+			onClick: () => setShowToken((v) => !v)
+		}, showToken ? "Hide" : "Show"))), h("div", { style: {
 			display: "flex",
 			gap: "var(--space-2)"
 		} }, h("button", {
 			type: "button",
 			onClick: () => void check()
-		}, "Save and check")), h(Note, { tone: error ? "error" : void 0 }, error || `Connection: ${state.status}`), info && h(Note, null, `Host ${info.hello.host} · runtimes: ${info.hello.runtimes.map((r) => `${r.title}${r.available ? "" : " (missing)"}`).join(", ")}` + (Array.isArray(info.hello.runners) ? `\nRunners: ${info.hello.runners.map((r) => `${r.title}${r.available ? "" : " (unavailable)"}`).join(", ")}` : "") + "\n" + (info.list.agents.length ? info.list.agents.map((a) => {
+		}, "Save and check"), token && h("button", {
+			type: "button",
+			onClick: () => {
+				setToken("");
+				setStoredToken("");
+				setNotice("Access token cleared. Click Save and check to reconnect.");
+			}
+		}, "Clear token")), notice && h(Note, null, notice), h(Note, { tone: error ? "error" : void 0 }, error || `Connection: ${state.status}`), info && h(Note, null, (isGuest ? `Guest account: ${info.hello.label} · ${info.list.agents.length}/${info.hello.limits?.maxAgents ?? 2} agents · max ${info.hello.limits?.maxConcurrency ?? 2} parallel chats\n` : "") + `Host ${info.hello.host}${info.hello.role ? ` (${info.hello.role})` : ""} · runtimes: ${info.hello.runtimes.map((r) => `${r.title}${r.available ? "" : " (missing)"}`).join(", ")}` + (Array.isArray(info.hello.runners) ? `\nRunners: ${info.hello.runners.map((r) => `${r.title}${r.available ? "" : " (unavailable)"}`).join(", ")}` : "") + "\n" + (info.list.agents.length ? info.list.agents.map((a) => {
 			const extra = [a.runner && a.runner !== "host" ? a.runner : "", a.respondTo && a.respondTo !== "owner-only" ? a.respondTo : ""].filter(Boolean).join(" · ");
 			return `• ${a.name} — ${a.runtime}${a.model ? `/${a.model}` : ""}${extra ? ` [${extra}]` : ""} — ${a.status}`;
-		}).join("\n") : "No agents yet.")));
+		}).join("\n") : "No agents yet.")), isAdmin && h(GuestInvites, { publicGuestUrl: info.hello.publicGuestUrl }));
 	};
 }
 

@@ -2,6 +2,7 @@
 // edit source files and run `node plugin/build.mjs`.
 //#region plugin/src/config.js
 const URL_KEY = "local.buzz-host.url";
+const TOKEN_KEY = "local.buzz-host.token";
 const DEFAULT_URL = "wss://omarchy.tail65c5a9.ts.net:8447";
 const DEFAULT_CONCURRENCY = 4;
 const CONCURRENCY_VALUES = [
@@ -31,6 +32,13 @@ function storedUrl() {
 		return DEFAULT_URL;
 	}
 }
+function storedToken() {
+	try {
+		return (localStorage.getItem("local.buzz-host.token") || "").trim();
+	} catch {
+		return "";
+	}
+}
 
 //#endregion
 //#region plugin/src/client.js
@@ -43,7 +51,9 @@ function createClient() {
 	let state = {
 		status: "idle",
 		url: storedUrl(),
-		error: ""
+		error: "",
+		session: null,
+		epoch: 0
 	};
 	const set = (patch) => {
 		state = {
@@ -53,74 +63,14 @@ function createClient() {
 		for (const listener of listeners) listener();
 	};
 	function fail(error) {
-		for (const [, p] of pending) p.reject(error);
+		for (const [, p] of pending) {
+			clearTimeout(p.timer);
+			p.reject(error);
+		}
 		pending.clear();
 	}
-	function open() {
-		if (socket && socket.readyState === WebSocket.OPEN) return Promise.resolve(socket);
-		if (opening) return opening;
-		const url = storedUrl();
-		set({
-			status: "connecting",
-			url,
-			error: ""
-		});
-		opening = new Promise((resolve, reject) => {
-			let ws;
-			try {
-				ws = new WebSocket(url);
-			} catch (error) {
-				opening = void 0;
-				set({
-					status: "error",
-					error: String(error.message ?? error)
-				});
-				reject(error);
-				return;
-			}
-			const timer = setTimeout(() => ws.close(), 2e4);
-			ws.onopen = () => {
-				clearTimeout(timer);
-				socket = ws;
-				opening = void 0;
-				set({ status: "connected" });
-				resolve(ws);
-			};
-			ws.onmessage = (event) => {
-				let message;
-				try {
-					message = JSON.parse(event.data);
-				} catch {
-					return;
-				}
-				const p = pending.get(message.id);
-				if (!p) return;
-				pending.delete(message.id);
-				clearTimeout(p.timer);
-				if (message.error) p.reject(new Error(message.error));
-				else p.resolve(message.result);
-			};
-			ws.onclose = () => {
-				clearTimeout(timer);
-				const wasOpen = socket === ws;
-				if (wasOpen) socket = void 0;
-				if (opening && !wasOpen) {
-					opening = void 0;
-					const error = /* @__PURE__ */ new Error(`Could not reach buzz-host at ${url}. Check that the server is up and this device is on the tailnet.`);
-					set({
-						status: "error",
-						error: error.message
-					});
-					reject(error);
-				} else set({ status: "idle" });
-				fail(/* @__PURE__ */ new Error("Connection to buzz-host closed"));
-			};
-		});
-		return opening;
-	}
-	async function call(method, params = {}, { signal, timeoutMs = 12e4 } = {}) {
-		if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
-		const ws = await open();
+	function sendRaw(ws, method, params = {}, { signal, timeoutMs = 12e4 } = {}) {
+		if (signal?.aborted) return Promise.reject(new DOMException("Aborted", "AbortError"));
 		const id = next++;
 		return new Promise((resolve, reject) => {
 			const timer = setTimeout(() => {
@@ -144,6 +94,122 @@ function createClient() {
 			}));
 		});
 	}
+	function open() {
+		if (socket && socket.readyState === WebSocket.OPEN) return Promise.resolve(socket);
+		if (opening) return opening;
+		const url = storedUrl();
+		const token = storedToken();
+		set({
+			status: "connecting",
+			url,
+			error: ""
+		});
+		opening = new Promise((resolve, reject) => {
+			let settled = false;
+			let ws;
+			try {
+				ws = new WebSocket(url);
+			} catch (error) {
+				opening = void 0;
+				set({
+					status: "error",
+					error: String(error.message ?? error),
+					session: null
+				});
+				reject(error);
+				return;
+			}
+			const timer = setTimeout(() => ws.close(), 2e4);
+			ws.onopen = async () => {
+				clearTimeout(timer);
+				if (token) {
+					try {
+						const auth = await sendRaw(ws, "auth", { token }, { timeoutMs: 15e3 });
+						socket = ws;
+						opening = void 0;
+						settled = true;
+						set({
+							status: "connected",
+							error: "",
+							session: {
+								role: auth.role || "guest",
+								label: auth.label ?? null,
+								ownerPubkey: auth.ownerPubkey ?? null,
+								limits: auth.limits ?? null
+							}
+						});
+						resolve(ws);
+					} catch (error) {
+						opening = void 0;
+						settled = true;
+						const err = error instanceof Error ? error : new Error(String(error));
+						set({
+							status: "error",
+							error: err.message,
+							session: null
+						});
+						try {
+							ws.close();
+						} catch {}
+						reject(err);
+					}
+					return;
+				}
+				socket = ws;
+				opening = void 0;
+				settled = true;
+				set({
+					status: "connected",
+					error: ""
+				});
+				resolve(ws);
+			};
+			ws.onmessage = (event) => {
+				let message;
+				try {
+					message = JSON.parse(event.data);
+				} catch {
+					return;
+				}
+				const p = pending.get(message.id);
+				if (!p) return;
+				pending.delete(message.id);
+				clearTimeout(p.timer);
+				if (message.error) p.reject(new Error(message.error));
+				else p.resolve(message.result);
+			};
+			ws.onclose = () => {
+				clearTimeout(timer);
+				const wasOpen = socket === ws;
+				if (wasOpen) socket = void 0;
+				if (!settled && opening && !wasOpen) {
+					opening = void 0;
+					settled = true;
+					const error = /* @__PURE__ */ new Error(token ? `Could not reach buzz-host at ${url}. Check that the server is up and the invite URL is correct.` : `Could not reach buzz-host at ${url}. Check that the server is up and this device is on the tailnet.`);
+					set({
+						status: "error",
+						error: error.message,
+						session: null
+					});
+					reject(error);
+				} else if (wasOpen) set({ status: "idle" });
+				fail(/* @__PURE__ */ new Error("Connection to buzz-host closed"));
+			};
+		});
+		return opening;
+	}
+	async function call(method, params = {}, options = {}) {
+		if (options.signal?.aborted) throw new DOMException("Aborted", "AbortError");
+		const result = await sendRaw(await open(), method, params, options);
+		if (method === "hello" && result && typeof result === "object") set({ session: {
+			role: result.role || "admin",
+			label: result.label ?? null,
+			ownerPubkey: result.ownerPubkey ?? null,
+			limits: result.limits ?? null,
+			publicGuestUrl: result.publicGuestUrl ?? null
+		} });
+		return result;
+	}
 	return {
 		call,
 		snapshot: () => state,
@@ -152,9 +218,17 @@ function createClient() {
 			return () => listeners.delete(listener);
 		},
 		reconnect() {
-			socket?.close();
+			const old = socket;
 			socket = void 0;
-			set({ url: storedUrl() });
+			opening = void 0;
+			try {
+				old?.close();
+			} catch {}
+			set({
+				url: storedUrl(),
+				session: null,
+				epoch: state.epoch + 1
+			});
 			return open();
 		},
 		close() {

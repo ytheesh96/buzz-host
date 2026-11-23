@@ -204,6 +204,8 @@ export async function writeSandboxEnv({
         : "",
     BUZZ_ACP_SESSION_POLICY: "thread",
     BUZZ_ACP_RELAY_OBSERVER: "true",
+    BUZZ_ACP_LAZY_POOL: meta.lazyPool === false ? "" : "true",
+    BUZZ_ACP_IDLE_POOL_SLEEP: meta.lazyPool === false ? "" : String(meta.idlePoolSleepSecs ?? 300),
     BUZZ_ACP_FRESH_SESSION_DIR: "/run/buzz-sandbox/fresh",
     BUZZ_ACP_WAKE_DIR: "/run/buzz-sandbox/wake",
     BUZZ_ACP_SYSTEM_PROMPT_FILE: meta.hasInstructions ? "/run/buzz-sandbox/instructions.md" : "",
