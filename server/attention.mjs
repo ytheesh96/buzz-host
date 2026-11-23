@@ -76,6 +76,22 @@ const TICK_MOVE_S = 30;
 const HOST_ONE_OFF =
   "On this host, post with the buzz CLI: `buzz messages send --channel <uuid> --content <text>` (add `--reply-to <event-id>` to reply in a thread).";
 
+const NO_RUNTIME_SCHEDULER_ON =
+  "Never use your runtime's built-in timer, cron, or background scheduler (such as `schedule`, `CronCreate`, `ScheduleWakeup`, or `cronjob`) — those wake invisibly outside Buzz without your owner's visibility. Always use Buzz Attention (`interest_set` + `watch_add`) for any delayed check, recurring task, or watch.";
+
+const NO_RUNTIME_SCHEDULER_OFF =
+  "Never fall back to your runtime's built-in timer, cron, or background scheduler (such as `schedule`, `CronCreate`, `ScheduleWakeup`, or `cronjob`) — those wake invisibly outside Buzz without your owner's visibility. Tell your owner that Attention is off instead.";
+
+export function withSchedulerGuard(note, enabled) {
+  const guard = enabled ? NO_RUNTIME_SCHEDULER_ON : NO_RUNTIME_SCHEDULER_OFF;
+  if (!note) return `<attention>\n${guard}\n</attention>`;
+  if (note.includes("built-in timer, cron, or background scheduler")) return note;
+  const close = "</attention>";
+  return note.endsWith(close)
+    ? `${note.slice(0, -close.length).trimEnd()}\n${guard}\n${close}`
+    : `${note}\n${guard}`;
+}
+
 const emptyRecord = (pubkey) => ({
   pubkey,
   attention: {},
@@ -166,12 +182,15 @@ export function createAttention({ dataDir, runDir, log = console, extra }) {
     await writeNote(pubkey, state.record);
   }
 
-  /** Buzz's end-of-turn note for acp-proxy; none while Attention is off. */
+  /** Buzz's end-of-turn note for acp-proxy (both when Attention is on and when it is off). */
   async function writeNote(pubkey, record) {
     const file = path.join(agentDir(pubkey), "attention-note.txt");
-    if (!record.attentionEnabled) return fs.rm(file, { force: true });
-    const note = core.interestIds(record).length ? core.ATTENTION_REVIEW : core.ATTENTION_NONE;
-    await fs.writeFile(file, note, { mode: 0o600 });
+    const base = !record.attentionEnabled
+      ? core.ATTENTION_OFF
+      : core.interestIds(record).length
+        ? core.ATTENTION_REVIEW
+        : core.ATTENTION_NONE;
+    await fs.writeFile(file, withSchedulerGuard(base, record.attentionEnabled === true), { mode: 0o600 });
   }
 
   /** Runs `change(state)` after the agent's earlier changes; it returns the
@@ -351,7 +370,9 @@ export function createAttention({ dataDir, runDir, log = console, extra }) {
   }
 
   function finishPrompt(text, channel) {
-    return [text, channel ? undefined : HOST_ONE_OFF, core.ATTENTION_REVIEW].filter(Boolean).join("\n\n");
+    return [text, channel ? undefined : HOST_ONE_OFF, withSchedulerGuard(core.ATTENTION_REVIEW, true)]
+      .filter(Boolean)
+      .join("\n\n");
   }
 
   /** Whether `watch` would hear `event` (Buzz's matching after its step 3: the
@@ -1032,6 +1053,17 @@ export function createAttention({ dataDir, runDir, log = console, extra }) {
     ownerChange,
     forget,
     load,
+    syncNotes: async (pubkeys) => {
+      for (const pubkey of pubkeys) {
+        if (!HEX64.test(pubkey)) continue;
+        try {
+          const state = await load(pubkey);
+          await writeNote(pubkey, state.record);
+        } catch (error) {
+          log.warn(`attention: syncNote ${pubkey.slice(0, 8)} failed: ${error.message}`);
+        }
+      }
+    },
     enabledAgents: async () => {
       const names = await fs.readdir(dataDir).catch(() => []);
       const out = [];

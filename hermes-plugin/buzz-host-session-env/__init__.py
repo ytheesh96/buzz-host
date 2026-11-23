@@ -20,6 +20,19 @@ from pathlib import Path
 from typing import Optional
 
 NAME = "BUZZHOST_AGENT"
+BLOCKED_CRON_TOOLS = frozenset({
+    "cronjob",
+    "cronjob_manage",
+    "schedule_cronjob",
+    "list_cronjobs",
+    "remove_cronjob",
+})
+CRON_BLOCK_MESSAGE = (
+    "Runtime scheduling (cronjob) is disabled for Buzz agents because it runs "
+    "invisibly outside Buzz. Use Buzz Attention (interest_set + watch_add) "
+    "instead so your owner has visibility in Buzz, or tell your owner if "
+    "Attention is off."
+)
 _HOME = Path.home()
 _WORKSPACE = re.compile(re.escape(str(_HOME / "buzz-agents")) + r"/([0-9a-f]{64})(?:/|$)")
 _AGENTS = _HOME / ".local/share/buzz-host/agents"
@@ -43,10 +56,11 @@ def _session_cwd(session_id: str, db_path: Optional[Path] = None) -> Optional[st
     return row[0] if row and row[0] else None
 
 
-def agent_for_cwd(cwd: Optional[str], agents: Path = _AGENTS) -> Optional[str]:
+def agent_for_cwd(cwd: Optional[str], agents: Optional[Path] = None) -> Optional[str]:
     """The buzz-host agent whose workspace is ``cwd``, if that agent exists."""
+    base = _AGENTS if agents is None else agents
     match = _WORKSPACE.match(cwd or "")
-    if match and (agents / match.group(1) / "key").is_file():
+    if match and (base / match.group(1) / "key").is_file():
         return match.group(1)
     return None
 
@@ -60,5 +74,21 @@ def resolve(session_id: str):
     return {NAME: agent}
 
 
+def block_cronjob(tool_name: str = "", session_id: str = "", **_kwargs):
+    """Block Hermes's built-in cronjob tools inside buzz-host agent sessions so
+    scheduled wakes always go through Buzz Attention (visible to the owner)."""
+    if tool_name not in BLOCKED_CRON_TOOLS or not session_id:
+        return None
+    try:
+        agent = agent_for_cwd(_session_cwd(session_id))
+    except Exception:
+        return None
+    if not agent:
+        return None
+    return {"action": "block", "message": CRON_BLOCK_MESSAGE}
+
+
 def register(ctx):
     ctx.register_session_env([NAME], resolve)
+    if hasattr(ctx, "register_hook"):
+        ctx.register_hook("pre_tool_call", block_cronjob)

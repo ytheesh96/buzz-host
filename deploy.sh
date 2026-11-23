@@ -58,6 +58,7 @@ deploy_local() {
   local lib_dir="${BUZZ_HOST_LIB_DIR:-$HOME/.local/lib/buzz-host}"
   local systemd_dir="${BUZZ_HOST_SYSTEMD_DIR:-$HOME/.config/systemd/user}"
   local hermes_dir="${BUZZ_HOST_HERMES_DIR:-$HOME/.hermes}"
+  local gemini_dir="${BUZZ_HOST_GEMINI_DIR:-$HOME/.gemini}"
 
   mkdir -p "$lib_dir"/{bin,shims,agent-bin} "$systemd_dir"
 
@@ -130,6 +131,26 @@ deploy_local() {
   mv "$hp_tmp" "$lib_dir/hermes-plugin"
   sync_hermes_plugin_local "$lib_dir/hermes-plugin/buzz-host-session-env" "$hermes_dir"
 
+  # Antigravity guard plugin: denies built-in `schedule` tool for Buzz agents.
+  if [ -d "$REPO_ROOT/agy-plugin/buzz-host-guards" ]; then
+    local ap_tmp
+    ap_tmp="$(mktemp -d "$lib_dir/.agy-plugin.tmp.XXXXXX")"
+    cp -r "$REPO_ROOT/agy-plugin/buzz-host-guards" "$ap_tmp/"
+    chmod 0755 "$ap_tmp/buzz-host-guards/deny-schedule.sh" 2>/dev/null || true
+    rm -rf "$lib_dir/agy-plugin"
+    mv "$ap_tmp" "$lib_dir/agy-plugin"
+    if [ -n "${BUZZ_HOST_GEMINI_DIR:-}" ] || [ -d "$gemini_dir" ]; then
+      local agy_target="$gemini_dir/config/plugins/buzz-host-guards"
+      mkdir -p "$gemini_dir/config/plugins"
+      local agy_tmp
+      agy_tmp="$(mktemp -d "$gemini_dir/config/plugins/.buzz-host-guards.tmp.XXXXXX")"
+      cp -r "$lib_dir/agy-plugin/buzz-host-guards/." "$agy_tmp/"
+      chmod 0755 "$agy_tmp/deny-schedule.sh" 2>/dev/null || true
+      rm -rf "$agy_target"
+      mv "$agy_tmp" "$agy_target"
+    fi
+  fi
+
   if [ "${BUZZ_HOST_SKIP_RESTART:-0}" != "1" ]; then
     systemctl --user daemon-reload
     systemctl --user restart buzz-host
@@ -174,6 +195,17 @@ deploy_ssh() {
         rm -rf "$t" && cp -r "$src" "$t"
       fi
     done'
+  if [ -d "$REPO_ROOT/agy-plugin/buzz-host-guards" ]; then
+    ssh "$host" 'rm -rf ~/.local/lib/buzz-host/agy-plugin && mkdir -p ~/.local/lib/buzz-host/agy-plugin'
+    scp -q -r ../agy-plugin/buzz-host-guards "$host":.local/lib/buzz-host/agy-plugin/
+    ssh "$host" 'chmod 0755 ~/.local/lib/buzz-host/agy-plugin/buzz-host-guards/deny-schedule.sh
+      if [ -d "$HOME/.gemini" ]; then
+        mkdir -p "$HOME/.gemini/config/plugins"
+        rm -rf "$HOME/.gemini/config/plugins/buzz-host-guards"
+        cp -r "$HOME/.local/lib/buzz-host/agy-plugin/buzz-host-guards" "$HOME/.gemini/config/plugins/buzz-host-guards"
+        chmod 0755 "$HOME/.gemini/config/plugins/buzz-host-guards/deny-schedule.sh"
+      fi'
+  fi
   if [ "${BUZZ_HOST_SKIP_RESTART:-0}" != "1" ]; then
     ssh "$host" 'systemctl --user daemon-reload && systemctl --user restart buzz-host && systemctl --user is-active buzz-host'
   fi

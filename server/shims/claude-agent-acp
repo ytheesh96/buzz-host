@@ -1,3 +1,5 @@
 #!/bin/sh
 # Named like the adapter so buzz-acp applies its Claude runtime defaults.
+# Disable Claude Code's built-in cron/loop scheduler so Buzz agents use Buzz Attention.
+export CLAUDE_CODE_DISABLE_CRON="${CLAUDE_CODE_DISABLE_CRON:-1}"
 exec "$HOME/.local/lib/buzz-host/bin/acp-proxy" "$HOME/.local/lib/buzz-host/npm/node_modules/.bin/claude-agent-acp"
