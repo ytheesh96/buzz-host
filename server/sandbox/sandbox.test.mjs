@@ -322,6 +322,11 @@ test("scoped MCP bridge pins pubkey server-side, allows memory/optional attentio
   assert.equal(mem.result, `ok:${PUBKEY_A.slice(0, 4)}:mem_get`);
   assert.equal(seenCalls.at(-1).pubkey, PUBKEY_A);
 
+  // acp-proxy reads core memory at session start via memory_core.
+  const core = await unixJsonLine(sockPath, { pubkey: PUBKEY_B, name: "memory_core", args: {} });
+  assert.equal(core.result, `ok:${PUBKEY_A.slice(0, 4)}:memory_core`);
+  assert.equal(seenCalls.at(-1).pubkey, PUBKEY_A);
+
   // Attention tools blocked while Attention is off.
   const attOff = await unixJsonLine(sockPath, { name: "interest_list", args: {} });
   assert.match(attOff.error, /not permitted/);
