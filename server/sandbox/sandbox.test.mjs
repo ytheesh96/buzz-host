@@ -415,6 +415,9 @@ test("Docker sandbox config and args harden container and never leak host secret
   assert.ok(args.includes("--cap-drop=ALL"));
   assert.ok(args.includes("--security-opt=no-new-privileges:true"));
   assert.ok(args.includes("--read-only"));
+  assert.ok(args.includes("--dns"));
+  assert.ok(args.includes("1.1.1.1"));
+  assert.ok(args.includes("--dns-search"));
   assert.ok(args.includes("--user"));
   assert.ok(args.includes("1000:1000"));
   assert.ok(args.includes("--env-file"));
