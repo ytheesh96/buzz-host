@@ -21,6 +21,70 @@ import { readLease, HUMAN, HumanHasControl } from "./lease.mjs";
 const CALL_TIMEOUT_MS = 120_000;
 const driverVersion = () => path.basename(path.dirname(desktop.CUA_DRIVER));
 
+// Curated subset of cua-driver tools exposed to agents. cua-driver publishes
+// ~65 tools (~141 KB of JSON schemas, including deprecated and cursor-theme
+// tools). Runtimes with a global eager MCP schema budget (such as Antigravity,
+// ~57 KB sorted smallest-first) silently evict large tools — including Buzz's
+// own watch_add (6.7 KB) and click (6.3 KB) — when all 65 are published.
+// Filtering to the essential Xfce desktop tools and trimming verbose parameter
+// prose keeps the combined buzz MCP server comfortably under ~35 KB so every
+// Attention and desktop tool loads eagerly.
+export const EXPOSED_TOOLS = new Set([
+  "get_desktop_state",
+  "get_screen_size",
+  "list_windows",
+  "list_apps",
+  "launch_app",
+  "kill_app",
+  "bring_to_front",
+  "set_window_frame",
+  "click",
+  "double_click",
+  "right_click",
+  "drag",
+  "scroll",
+  "move_cursor",
+  "type_text",
+  "press_key",
+  "hotkey",
+  "clipboard_read",
+  "clipboard_write",
+  "zoom",
+]);
+
+function shortDesc(text, max) {
+  if (typeof text !== "string" || !text) return "";
+  const first = text.split(/\n\n/)[0].replace(/\s+/g, " ").trim();
+  return first.length <= max ? first : `${first.slice(0, max - 1).trimEnd()}…`;
+}
+
+function compactSchema(node, depth = 0) {
+  if (!node || typeof node !== "object") return node;
+  if (Array.isArray(node)) return node.map((item) => compactSchema(item, depth + 1));
+  const out = {};
+  for (const [k, v] of Object.entries(node)) {
+    if (k === "description" && typeof v === "string") {
+      out[k] = shortDesc(v, depth > 0 ? 100 : 180);
+    } else if (k === "properties" && v && typeof v === "object") {
+      out[k] = {};
+      for (const [pk, pv] of Object.entries(v)) out[k][pk] = compactSchema(pv, depth + 1);
+    } else {
+      out[k] = compactSchema(v, depth + 1);
+    }
+  }
+  return out;
+}
+
+export function prepareTools(list) {
+  return (list ?? [])
+    .filter((tool) => tool && EXPOSED_TOOLS.has(tool.name))
+    .map((tool) => ({
+      name: tool.name,
+      description: shortDesc(tool.description, 180),
+      inputSchema: compactSchema(tool.inputSchema),
+    }));
+}
+
 export const instructions = (pubkey) =>
   "Your computer: your own Linux desktop (Xfce, 1280x800), separate from your owner's screen; it starts on first use. " +
   "Look first with get_desktop_state; for click/type use target {\"kind\":\"desktop\",\"display_id\":\"primary\"} with " +
@@ -99,13 +163,13 @@ export function createComputer(pubkey) {
   async function tools() {
     const cache = path.join(dir, `tools-${driverVersion()}.json`);
     try {
-      return JSON.parse(fs.readFileSync(cache, "utf8"));
+      return prepareTools(JSON.parse(fs.readFileSync(cache, "utf8")));
     } catch {}
     await ensure();
     const list = (await request("tools/list", {})).tools ?? [];
     fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
     fs.writeFileSync(cache, JSON.stringify(list), { mode: 0o600 });
-    return list;
+    return prepareTools(list);
   }
 
   async function call(name, args) {

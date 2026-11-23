@@ -65,12 +65,14 @@ export async function prepareSandboxHome({
   const claudeDir = path.join(sandboxHome, ".claude");
   const agyDir = path.join(sandboxHome, ".gemini", "antigravity-acp");
   const agyCliDir = path.join(sandboxHome, ".gemini", "antigravity-cli");
+  const agyGuardPluginDir = path.join(sandboxHome, ".gemini", "config", "plugins", "buzz-host-guards");
 
   await Promise.all([
     fs.mkdir(hermesDir, { recursive: true, mode: 0o700 }),
     fs.mkdir(claudeDir, { recursive: true, mode: 0o700 }),
     fs.mkdir(agyDir, { recursive: true, mode: 0o700 }),
     fs.mkdir(agyCliDir, { recursive: true, mode: 0o700 }),
+    fs.mkdir(agyGuardPluginDir, { recursive: true, mode: 0o700 }),
   ]);
 
   const proxyBase = `http://127.0.0.1:${proxyPort}`;
@@ -78,6 +80,7 @@ export async function prepareSandboxHome({
     model && !model.includes("::") ? model.replace(/^opencode-go:/, "") : "deepseek-v4.1-flash";
 
   // Hermes config + .env pointing strictly to the container-local proxy bridge.
+  // Disable Hermes's built-in cronjob toolset so scheduled wakes go through Buzz Attention.
   const hermesConfig = [
     "model:",
     `  default: ${JSON.stringify(defaultHermesModel)}`,
@@ -91,6 +94,8 @@ export async function prepareSandboxHome({
     "agent:",
     "  max_turns: 200",
     "  verbose: false",
+    "  disabled_toolsets:",
+    "    - cronjob",
     "",
   ].join("\n");
   await writePrivate(path.join(hermesDir, "config.yaml"), hermesConfig);
@@ -140,6 +145,37 @@ export async function prepareSandboxHome({
       2,
     )}\n`,
   );
+
+  // Antigravity PreToolUse guard plugin: denies built-in `schedule` so
+  // background timers/crons go through Buzz Attention instead.
+  await writePrivate(
+    path.join(agyGuardPluginDir, "plugin.json"),
+    `${JSON.stringify({ name: "buzz-host-guards" }, null, 2)}\n`,
+  );
+  await writePrivate(
+    path.join(agyGuardPluginDir, "hooks.json"),
+    `${JSON.stringify(
+      {
+        "buzz-host-no-schedule": {
+          PreToolUse: [
+            {
+              matcher: "schedule",
+              hooks: [{ type: "command", command: "./deny-schedule.sh", timeout: 5 }],
+            },
+          ],
+        },
+      },
+      null,
+      2,
+    )}\n`,
+  );
+  const denyScript = path.join(agyGuardPluginDir, "deny-schedule.sh");
+  await writePrivate(
+    denyScript,
+    "#!/bin/sh\ncat >/dev/null\n" +
+      "printf '%s\\n' '{\"decision\":\"deny\",\"reason\":\"Runtime scheduling (schedule) is disabled for Buzz agents because it wakes invisibly outside Buzz. Use Buzz Attention (interest_set + watch_add) instead so your owner has visibility in Buzz, or tell your owner if Attention is off.\"}'\n",
+  );
+  await fs.chmod(denyScript, 0o755);
 
   return sandboxHome;
 }
@@ -217,6 +253,7 @@ export async function writeSandboxEnv({
     HERMES_ACP_SKIP_CONFIGURED_MCP: "1",
     ANTHROPIC_BASE_URL: `${proxyBase}/anthropic`,
     CLAUDE_CODE_OAUTH_TOKEN: proxyToken,
+    CLAUDE_CODE_DISABLE_CRON: "1",
     BUZZ_SANDBOX_AGY_ENDPOINT: `${proxyBase}/agy/cloudcode`,
     ...(useGeminiApiKey
       ? {

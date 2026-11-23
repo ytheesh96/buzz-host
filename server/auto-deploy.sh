@@ -19,6 +19,7 @@ STATE_DIR="${BUZZ_HOST_DEPLOY_STATE:-$HOME/.local/state/buzz-host-deploy}"
 LIB_DIR="${BUZZ_HOST_LIB_DIR:-$HOME/.local/lib/buzz-host}"
 SYSTEMD_DIR="${BUZZ_HOST_SYSTEMD_DIR:-$HOME/.config/systemd/user}"
 HERMES_DIR="${BUZZ_HOST_HERMES_DIR:-$HOME/.hermes}"
+GEMINI_DIR="${BUZZ_HOST_GEMINI_DIR:-$HOME/.gemini}"
 CONFIG_PATH="${BUZZ_HOST_CONFIG:-$HOME/.config/buzz-host/config.json}"
 HEALTH_TIMEOUT="${BUZZ_HOST_HEALTH_TIMEOUT:-15}"
 
@@ -123,7 +124,7 @@ short_new="${target_sha:0:7}"
 needs_deploy=1
 if [ -n "$deployed_sha" ] && git -C "$DEPLOY_REPO" cat-file -e "${deployed_sha}^{commit}" 2>/dev/null; then
   changed="$(git -C "$DEPLOY_REPO" diff --name-only "$deployed_sha" "$target_sha")"
-  if ! printf '%s\n' "$changed" | grep -qE '^(server/|hermes-plugin/|deploy\.sh$)'; then
+  if ! printf '%s\n' "$changed" | grep -qE '^(server/|hermes-plugin/|agy-plugin/|deploy\.sh$)'; then
     needs_deploy=0
   fi
 fi
@@ -175,7 +176,7 @@ backup_live() {
       cp -p "$LIB_DIR/bin/$f" "$BACKUP_DIR/lib/bin/"
     fi
   done
-  for d in desktop sandbox shims agent-bin hermes-plugin; do
+  for d in desktop sandbox shims agent-bin hermes-plugin agy-plugin; do
     if [ -d "$LIB_DIR/$d" ]; then
       cp -rp "$LIB_DIR/$d" "$BACKUP_DIR/lib/"
     fi
@@ -207,7 +208,7 @@ restore_backup() {
       mv -f "$tmp" "$LIB_DIR/bin/$f"
     fi
   done
-  for d in desktop sandbox shims agent-bin hermes-plugin; do
+  for d in desktop sandbox shims agent-bin hermes-plugin agy-plugin; do
     if [ -d "$BACKUP_DIR/lib/$d" ]; then
       tmp="$(mktemp -d "$LIB_DIR/.restore-${d}.tmp.XXXXXX")"
       cp -rp "$BACKUP_DIR/lib/$d/." "$tmp/"
@@ -274,6 +275,7 @@ deploy_ok=0
 if BUZZ_HOST_LIB_DIR="$LIB_DIR" \
    BUZZ_HOST_SYSTEMD_DIR="$SYSTEMD_DIR" \
    BUZZ_HOST_HERMES_DIR="$HERMES_DIR" \
+   BUZZ_HOST_GEMINI_DIR="$GEMINI_DIR" \
    BUZZ_HOST_SKIP_RESTART=1 \
    "$DEPLOY_REPO/deploy.sh" --local; then
   if restart_service && check_health; then

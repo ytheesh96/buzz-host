@@ -283,3 +283,35 @@ test("Buzz's own Attention tab: the record in Buzz's shape, Buzz's edits and per
   view = await s.attention.ownerChange(AGENT, { attention: { "watch/tick": null, "interest/news": null } });
   assert.deepEqual(view.record.attention, {});
 });
+
+test("attention-note.txt and wake prompts carry the no-runtime-scheduler guardrail both on and off", async (t) => {
+  const s = await setup();
+  t.after(() => s.attention.stop());
+
+  // Syncing notes while Attention is off writes an Attention-off guardrail note.
+  await s.attention.syncNotes([AGENT]);
+  const offNote = await fs.readFile(path.join(s.agentDir, "attention-note.txt"), "utf8");
+  assert.match(offNote, /Attention is off/);
+  assert.match(offNote, /built-in timer, cron, or background scheduler/);
+  assert.match(offNote, /Tell your owner that Attention is off instead/);
+
+  // Turning Attention on switches to the active guardrail note.
+  await s.attention.setEnabled(AGENT, true);
+  const onNote = await fs.readFile(path.join(s.agentDir, "attention-note.txt"), "utf8");
+  assert.match(onNote, /Always use Buzz Attention/);
+  assert.match(onNote, /built-in timer, cron, or background scheduler/);
+
+  // Timer wake prompt also includes the guardrail.
+  await s.tool("interest_set", { id: "ci", instructions: "Watch CI.", expected_state: ABSENT });
+  await s.tool("watch_add", { interest: "ci", id: "poll", type: "timer", prompt: "Check CI.", interval_secs: 60, expected_state: ABSENT });
+  advance(61);
+  await s.attention.tick();
+  const wake = await s.takeWake();
+  assert.match(wake.prompt, /built-in timer, cron, or background scheduler/);
+
+  // Turning Attention back off restores the Attention-off guardrail note (instead of deleting it).
+  await s.attention.setEnabled(AGENT, false);
+  const offAgain = await fs.readFile(path.join(s.agentDir, "attention-note.txt"), "utf8");
+  assert.match(offAgain, /Attention is off/);
+  assert.match(offAgain, /Tell your owner that Attention is off instead/);
+});

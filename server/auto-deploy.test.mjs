@@ -37,6 +37,7 @@ function makeFixture(t) {
   const libDir = path.join(root, "lib");
   const systemdDir = path.join(root, "systemd");
   const hermesDir = path.join(root, "hermes");
+  const geminiDir = path.join(root, "gemini");
   const restartLog = path.join(root, "restarts.log");
   const testLog = path.join(root, "tests.log");
 
@@ -49,6 +50,7 @@ function makeFixture(t) {
   fs.mkdirSync(path.join(work, "server", "shims"), { recursive: true });
   fs.mkdirSync(path.join(work, "server", "agent-bin"), { recursive: true });
   fs.mkdirSync(path.join(work, "hermes-plugin", "buzz-host-session-env"), { recursive: true });
+  fs.mkdirSync(path.join(work, "agy-plugin", "buzz-host-guards"), { recursive: true });
   fs.mkdirSync(path.join(work, "plugin"), { recursive: true });
 
   fs.copyFileSync(DEPLOY_SH, path.join(work, "deploy.sh"));
@@ -94,6 +96,9 @@ function makeFixture(t) {
   fs.writeFileSync(path.join(work, "server", "buzz-host.service"), "[Unit]\nDescription=v1\n");
   fs.writeFileSync(path.join(work, "server", "buzz-agent@.service"), "[Unit]\nDescription=agent v1\n");
   fs.writeFileSync(path.join(work, "hermes-plugin", "buzz-host-session-env", "plugin.py"), "# v1\n");
+  fs.writeFileSync(path.join(work, "agy-plugin", "buzz-host-guards", "plugin.json"), '{"name":"buzz-host-guards"}\n');
+  fs.writeFileSync(path.join(work, "agy-plugin", "buzz-host-guards", "deny-schedule.sh"), "#!/bin/sh\n");
+  fs.chmodSync(path.join(work, "agy-plugin", "buzz-host-guards", "deny-schedule.sh"), 0o755);
   fs.writeFileSync(path.join(work, "plugin", "plugin.js"), "// plugin v1\n");
   fs.writeFileSync(path.join(work, "README.md"), "# v1\n");
 
@@ -117,6 +122,7 @@ function makeFixture(t) {
     BUZZ_HOST_LIB_DIR: libDir,
     BUZZ_HOST_SYSTEMD_DIR: systemdDir,
     BUZZ_HOST_HERMES_DIR: hermesDir,
+    BUZZ_HOST_GEMINI_DIR: geminiDir,
     BUZZ_HOST_HEALTH_TIMEOUT: "2",
     BUZZ_HOST_TEST_CMD: `echo ran >> "${testLog}"`,
     BUZZ_HOST_RESTART_CMD: `echo restarted >> "${restartLog}"`,

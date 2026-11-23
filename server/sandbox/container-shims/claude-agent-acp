@@ -1,3 +1,4 @@
 #!/bin/sh
 # Sandboxed Claude Code ACP shim (named like the adapter so buzz-acp applies Claude defaults).
+export CLAUDE_CODE_DISABLE_CRON="${CLAUDE_CODE_DISABLE_CRON:-1}"
 exec /opt/buzz-host/bin/acp-proxy claude-agent-acp

@@ -121,7 +121,12 @@ class Claude(Base):
         params = self.new(sessionTitle="haiku")
         self.assertEqual(params["cwd"], self.app)
         self.assertEqual(params["additionalDirectories"], [self.own, self.lib])
-        self.assertEqual(params["_meta"], {"sessionTitle": "haiku"}, "buzzHost is removed, the rest kept")
+        self.assertNotIn("buzzHost", params["_meta"], "buzzHost is removed")
+        self.assertEqual(params["_meta"]["sessionTitle"], "haiku", "the rest of _meta is kept")
+        self.assertEqual(
+            params["_meta"]["claudeCode"]["options"]["disallowedTools"],
+            list(self.p.CLAUDE_DISALLOWED_TOOLS),
+        )
         note = self.turn()[0]
         self.assertIn(f"`{self.app}`, `{self.lib}`", note)
         self.assertIn(f"This session started in `{self.app}`", note)
@@ -132,7 +137,11 @@ class Claude(Base):
         self.canvas = {"folders": ["/home/yt/Work/app", "~/Work/gone"], "canvas": CANVAS, "worktree": None}
         params = self.new()
         self.assertEqual(params["cwd"], self.app)
-        self.assertNotIn("_meta", params, "an emptied _meta is dropped, as buzz-acp omits it")
+        self.assertNotIn("buzzHost", params.get("_meta", {}), "buzzHost is dropped")
+        self.assertEqual(
+            params["_meta"]["claudeCode"]["options"]["disallowedTools"],
+            list(self.p.CLAUDE_DISALLOWED_TOOLS),
+        )
         note = self.turn()[0]
         self.assertIn("Not found on this server", note)
         self.assertIn("`~/Work/gone`", note)
@@ -157,7 +166,12 @@ class Claude(Base):
         self.assertNotIn("additionalDirectories", params)
         self.assertIsNone(self.turn(), "no note, prompt forwarded unchanged")
         raw = line({"jsonrpc": "2.0", "id": "x", "method": "session/new", "params": {"cwd": self.own}})
-        self.assertIs(self.p.handle_client_line(raw), raw, "an old buzz-acp passes through byte for byte")
+        out = json.loads(self.p.handle_client_line(raw))
+        self.assertEqual(
+            out["params"]["_meta"]["claudeCode"]["options"]["disallowedTools"],
+            list(self.p.CLAUDE_DISALLOWED_TOOLS),
+            "Claude session/new always blocks built-in cron/wakeup tools",
+        )
 
     def test_thread_uses_its_channel_setting(self):
         self.settings(["~/Work/lib"])
@@ -1107,6 +1121,124 @@ class RuntimeSwitch(Base):
             self.assertEqual(self.chat()["model"], "gpt-5-mini")
         finally:
             self.p.runtime_available = orig_avail
+
+
+class RuntimeSchedulerGuards(Base):
+    def test_claude_session_guards_disallowed_tools_and_disable_cron_env(self):
+        _argv, env = self.p.resolve_adapter_spec("claude")
+        self.assertEqual(env.get("CLAUDE_CODE_DISABLE_CRON"), "1")
+
+        # session/new merges with existing disallowedTools without duplicating.
+        out = json.loads(self.p.handle_client_line(line({
+            "jsonrpc": "2.0", "id": "n1", "method": "session/new",
+            "params": {
+                "cwd": self.own, "mcpServers": [],
+                "_meta": {
+                    "buzzHost": {"channelId": CHANNEL},
+                    "claudeCode": {"options": {"disallowedTools": ["WebFetch", "CronCreate"]}},
+                },
+            },
+        })))
+        self.assertEqual(
+            out["params"]["_meta"]["claudeCode"]["options"]["disallowedTools"],
+            ["WebFetch", "CronCreate", "CronDelete", "CronList", "ScheduleWakeup"],
+        )
+
+        # session/load and session/resume also enforce Claude disallowedTools.
+        for method in ("session/load", "session/resume"):
+            res = json.loads(self.p.handle_client_line(line({
+                "jsonrpc": "2.0", "id": f"r-{method}", "method": method,
+                "params": {"sessionId": "s1", "cwd": self.own, "mcpServers": []},
+            })))
+            self.assertEqual(
+                res["params"]["_meta"]["claudeCode"]["options"]["disallowedTools"],
+                list(self.p.CLAUDE_DISALLOWED_TOOLS),
+            )
+
+        # Non-Claude runtimes do not receive Claude-specific _meta.
+        hermes_params = {"cwd": self.own, "mcpServers": []}
+        self.assertFalse(self.p.apply_runtime_guards(hermes_params, "hermes"))
+        self.assertNotIn("_meta", hermes_params)
+
+    def test_attention_note_carries_scheduler_guard_and_sandbox_fallback(self):
+        note_path = os.path.join(self.p.agent_dir, "attention-note.txt")
+        with open(note_path, "w", encoding="utf-8") as f:
+            f.write("<attention>\nYou have no Interests.\n</attention>")
+        guarded = self.p.attention_note()
+        self.assertIn("built-in timer, cron, or background scheduler", guarded)
+        self.assertIn("Always use Buzz Attention", guarded)
+        self.assertTrue(guarded.endswith("</attention>"))
+
+        with open(note_path, "w", encoding="utf-8") as f:
+            f.write("<attention>\nAttention is off on this device.\n</attention>")
+        guarded_off = self.p.attention_note()
+        self.assertIn("Tell your owner that Attention is off instead", guarded_off)
+
+        os.remove(note_path)
+        self.p.IS_SANDBOX = True
+        try:
+            self.assertIn("Attention is off", self.p.attention_note())
+            self.assertIn("built-in timer, cron, or background scheduler", self.p.attention_note())
+        finally:
+            self.p.IS_SANDBOX = False
+
+    def test_agy_guard_script_denies_only_for_buzz_agents(self):
+        import subprocess
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        script = os.path.join(repo_root, "agy-plugin", "buzz-host-guards", "deny-schedule.sh")
+        self.assertTrue(os.access(script, os.X_OK), "deny-schedule.sh must be executable")
+        base_env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin")}
+        r_host = subprocess.run(
+            [script], input='{"toolCall":{"name":"schedule"}}', text=True,
+            capture_output=True, env={**base_env, "BUZZ_HOST_AGENT": "a" * 64}, check=True,
+        )
+        self.assertEqual(json.loads(r_host.stdout)["decision"], "deny")
+        self.assertIn("Buzz Attention", json.loads(r_host.stdout)["reason"])
+
+        r_user = subprocess.run(
+            [script], input='{"toolCall":{"name":"schedule"}}', text=True,
+            capture_output=True, env=base_env, check=True,
+        )
+        self.assertEqual(json.loads(r_user.stdout)["decision"], "allow")
+
+    def test_hermes_plugin_blocks_cronjob_only_for_buzz_host_sessions(self):
+        import importlib.util, sqlite3
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        plugin_path = os.path.join(repo_root, "hermes-plugin", "buzz-host-session-env", "__init__.py")
+        spec = importlib.util.spec_from_file_location("buzz_host_session_env_test", plugin_path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+
+        pubkey = "a" * 64
+        agents_dir = os.path.join(self.home, "agents")
+        os.makedirs(os.path.join(agents_dir, pubkey), exist_ok=True)
+        with open(os.path.join(agents_dir, pubkey, "key"), "w") as f:
+            f.write("1" * 64)
+        db_path = os.path.join(self.home, "state.db")
+        db = sqlite3.connect(db_path)
+        db.execute("create table sessions (id text primary key, cwd text)")
+        db.execute("insert into sessions values (?, ?)", ("buzz-sess", f"{self.home}/buzz-agents/{pubkey}"))
+        db.execute("insert into sessions values (?, ?)", ("user-sess", f"{self.home}/Work/app"))
+        db.commit()
+        db.close()
+
+        orig_agents = mod._AGENTS
+        orig_ws = mod._WORKSPACE
+        orig_db = mod._state_db
+        try:
+            import re
+            mod._AGENTS = mod.Path(agents_dir)
+            mod._WORKSPACE = re.compile(re.escape(os.path.join(self.home, "buzz-agents")) + r"/([0-9a-f]{64})(?:/|$)")
+            mod._state_db = lambda: mod.Path(db_path)
+            blocked = mod.block_cronjob(tool_name="cronjob_manage", session_id="buzz-sess")
+            self.assertEqual(blocked["action"], "block")
+            self.assertIn("Buzz Attention", blocked["message"])
+            self.assertIsNone(mod.block_cronjob(tool_name="terminal", session_id="buzz-sess"))
+            self.assertIsNone(mod.block_cronjob(tool_name="cronjob_manage", session_id="user-sess"))
+        finally:
+            mod._AGENTS = orig_agents
+            mod._WORKSPACE = orig_ws
+            mod._state_db = orig_db
 
 
 if __name__ == "__main__":

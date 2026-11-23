@@ -1,0 +1,16 @@
+{
+  "buzz-host-no-schedule": {
+    "PreToolUse": [
+      {
+        "matcher": "schedule",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "./deny-schedule.sh",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

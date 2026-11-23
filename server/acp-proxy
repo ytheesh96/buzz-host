@@ -123,6 +123,28 @@ ADAPTER_TO_RUNTIME = {
 DEFAULT_RUNTIME = ADAPTER_TO_RUNTIME.get(ADAPTER, ADAPTER)
 KNOWN_RUNTIMES = ("claude", "codex", "hermes", "antigravity")
 RUNTIME_TITLES = {"claude": "Claude Code", "codex": "Codex", "hermes": "Hermes", "antigravity": "Antigravity"}
+# Claude Code built-in scheduler/cron tools blocked on every Buzz-hosted session
+# so delayed checks and recurring tasks always go through Buzz Attention.
+CLAUDE_DISALLOWED_TOOLS = ("CronCreate", "CronDelete", "CronList", "ScheduleWakeup")
+NO_RUNTIME_SCHEDULER_ON = (
+    "Never use your runtime's built-in timer, cron, or background scheduler "
+    "(such as `schedule`, `CronCreate`, `ScheduleWakeup`, or `cronjob`) — those wake invisibly "
+    "outside Buzz without your owner's visibility. Always use Buzz Attention (`interest_set` + `watch_add`) "
+    "for any delayed check, recurring task, or watch."
+)
+NO_RUNTIME_SCHEDULER_OFF = (
+    "Never fall back to your runtime's built-in timer, cron, or background scheduler "
+    "(such as `schedule`, `CronCreate`, `ScheduleWakeup`, or `cronjob`) — those wake invisibly "
+    "outside Buzz without your owner's visibility. Tell your owner that Attention is off instead."
+)
+ATTENTION_OFF_FALLBACK = (
+    "<attention>\n"
+    "Attention is off on this device: the Attention tools refuse calls, and no watch or timer wakes you. "
+    "Other tools still work. If this matters to the person, say so in your own words, for example "
+    "\"I can't keep an eye on that while Attention is off.\"\n"
+    f"{NO_RUNTIME_SCHEDULER_OFF}\n"
+    "</attention>"
+)
 # A composer pick of a model on another runtime: "<runtime>::<model id>"
 # (catalog.mjs names other runtimes' models so).
 PICK_RUNTIME_SEP = "::"
@@ -383,13 +405,17 @@ def resolve_adapter_spec(runtime_id):
         base_env = {}
         if rt == "hermes":
             base_env["HERMES_HOME"] = hermes_home(profile) if profile else None
+        elif rt == "claude":
+            base_env["CLAUDE_CODE_DISABLE_CRON"] = os.environ.get("CLAUDE_CODE_DISABLE_CRON", "1")
         if isinstance(entry, list) and entry:
             return [str(x) for x in entry], base_env
         if isinstance(entry, dict) and entry.get("cmd"):
             base_env.update(dict(entry.get("env") or {}))
             return [str(x) for x in entry["cmd"]], base_env
     if rt == "claude":
-        return [os.path.join(host_lib, "npm", "node_modules", ".bin", "claude-agent-acp")], {}
+        return [os.path.join(host_lib, "npm", "node_modules", ".bin", "claude-agent-acp")], {
+            "CLAUDE_CODE_DISABLE_CRON": os.environ.get("CLAUDE_CODE_DISABLE_CRON", "1"),
+        }
     if rt == "codex":
         return [os.path.join(host_lib, "npm", "node_modules", ".bin", "codex-acp")], {}
     if rt == "hermes":
@@ -1348,6 +1374,7 @@ def open_runtime_session(client_sid, sid, key, runtime_id):
         next_id[0] += 1
         ws_id = f"buzz-host-ws-{next_id[0]}"
     start_in_workspace(ws_id, params)
+    apply_runtime_guards(params, runtime_id)
     with lock:
         ws = pending_ws.pop(ws_id, None)
     resp = proxy_request("session/new", params, timeout=120, runtime_id=runtime_id)
@@ -1699,6 +1726,35 @@ def label_mcp(params, key):
         if no_orch:
             env.append({"name": "BUZZHOST_NO_ORCHESTRATE", "value": "1"})
         server["env"] = env
+
+
+def apply_runtime_guards(params, runtime_id):
+    """Apply runtime-specific tool guards on session/new, session/load, and session/resume.
+    For Claude Code, disallows built-in cron/wakeup tools so all scheduled wakes
+    flow through Buzz Attention (visible to the owner). Returns True if params changed."""
+    if base_runtime(runtime_id) != "claude":
+        return False
+    meta = params.get("_meta")
+    if not isinstance(meta, dict):
+        meta = {}
+        params["_meta"] = meta
+    cc = meta.get("claudeCode")
+    if not isinstance(cc, dict):
+        cc = {}
+        meta["claudeCode"] = cc
+    opts = cc.get("options")
+    if not isinstance(opts, dict):
+        opts = {}
+        cc["options"] = opts
+    existing = list(opts.get("disallowedTools") or [])
+    merged = list(existing)
+    for tool in CLAUDE_DISALLOWED_TOOLS:
+        if tool not in merged:
+            merged.append(tool)
+    if merged == existing and "disallowedTools" in opts:
+        return False
+    opts["disallowedTools"] = merged
+    return True
 
 
 def describe(sid, key):
@@ -2215,16 +2271,33 @@ def memory_note():
         return ""
 
 
+def _with_scheduler_guard(note):
+    if "built-in timer, cron, or background scheduler" in note:
+        return note
+    guard = NO_RUNTIME_SCHEDULER_OFF if "Attention is off" in note else NO_RUNTIME_SCHEDULER_ON
+    close = "</attention>"
+    if note.endswith(close):
+        return f"{note[:-len(close)].rstrip()}\n{guard}\n{close}"
+    return f"{note}\n{guard}"
+
+
 def attention_note():
-    """buzz-host's attention-note.txt for this agent: Buzz's review note while
-    Attention is on (the service keeps it current), else nothing."""
+    """buzz-host's attention-note.txt for this agent (both when Attention is on
+    and when it is off), always carrying the no-runtime-scheduler guardrail."""
     if not agent_dir:
         return ""
     try:
         with open(os.path.join(agent_dir, "attention-note.txt"), encoding="utf-8") as f:
-            return f.read().strip()
+            text = f.read().strip()
+        if text:
+            return _with_scheduler_guard(text)
     except OSError:
-        return ""
+        pass
+    if IS_SANDBOX:
+        if os.environ.get("BUZZ_SANDBOX_ATTENTION") == "1":
+            return f"<attention>\n{NO_RUNTIME_SCHEDULER_ON}\n</attention>"
+        return ATTENTION_OFF_FALLBACK
+    return ""
 
 
 def dispatch_client_line(line):
@@ -2260,9 +2333,10 @@ def dispatch_client_line(line):
         if method == "session/new":
             has_meta = "buzzHost" in (params.get("_meta") or {})
             target_rt = start_in_workspace(msg["id"], params) if has_meta else DEFAULT_TARGET
+            guarded = apply_runtime_guards(params, target_rt)
             with lock:
                 pending_new[msg["id"]] = {"sid": sid, "runtime": target_rt, "base": base}
-            if not has_meta and not scrubbed:
+            if not has_meta and not scrubbed and not guarded:
                 return target_rt, line
             msg["params"] = params
             return target_rt, (json.dumps(msg, separators=(",", ":")) + "\n").encode()
@@ -2298,6 +2372,8 @@ def dispatch_client_line(line):
                     s["key"] = key
                     s["runtime"] = target_rt
                 save_session_chat(sid, key, target_rt)
+        if apply_runtime_guards(params, target_rt):
+            changed = True
         if changed:
             msg["params"] = params
             return target_rt, (json.dumps(msg, separators=(",", ":")) + "\n").encode()

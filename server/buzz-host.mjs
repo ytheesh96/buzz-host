@@ -309,6 +309,7 @@ async function writeRuntimeEnv(pubkey, m) {
     .map(([key, value]) => `export ${key}=${sq(value)}`)
     .join("\n");
   await writePrivate(path.join(dir(pubkey), "runtime.env"), `${text}\n`);
+  await attention.syncNotes([pubkey]);
 }
 
 // The agent's Buzz MCP server: a per-agent wrapper, because buzz-acp starts
@@ -1298,6 +1299,26 @@ for (const name of (await fs.readdir(DATA).catch(() => [])).filter((n) => HEX64.
   if (m) allAgentMetas.push(m);
 }
 await runnerManager.reconcileOnStartup(allAgentMetas);
+await attention.syncNotes(allAgentMetas.map((m) => m.pubkey));
+// Sync Antigravity PreToolUse guard plugin (denies `schedule` for Buzz agents)
+// into ~/.gemini/config/plugins/buzz-host-guards if bundled under LIB/agy-plugin.
+try {
+  const agySrc = path.join(LIB, "agy-plugin", "buzz-host-guards");
+  const agyDst = path.join(HOME, ".gemini", "config", "plugins", "buzz-host-guards");
+  const entries = await fs.readdir(agySrc, { withFileTypes: true }).catch(() => []);
+  if (entries.length) {
+    await fs.mkdir(agyDst, { recursive: true, mode: 0o700 });
+    for (const e of entries) {
+      if (!e.isFile()) continue;
+      const srcFile = path.join(agySrc, e.name);
+      const dstFile = path.join(agyDst, e.name);
+      await fs.copyFile(srcFile, dstFile);
+      if (e.name.endsWith(".sh")) await fs.chmod(dstFile, 0o755);
+    }
+  }
+} catch (error) {
+  console.warn(`agy guard plugin sync skipped: ${error.message}`);
+}
 // Agents set up before the "buzz" MCP server (memory, 2026-11-17) still name
 // mcp/attention, or nothing: rewrite their runtime.env once and restart them.
 for (const m of allAgentMetas) {

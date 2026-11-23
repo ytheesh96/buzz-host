@@ -375,9 +375,18 @@ test("Docker sandbox config and args harden container and never leak host secret
     await fs.readFile(path.join(sandboxHome, ".gemini/antigravity-acp/acp_token.json"), "utf8"),
   );
   assert.match(hermesYaml, /http:\/\/127\.0\.0\.1:18461\/opencode-go\/v1/);
+  assert.match(hermesYaml, /disabled_toolsets:\n\s+- cronjob/);
   assert.match(hermesEnv, new RegExp(`OPENCODE_GO_API_KEY=${proxyToken}`));
   assert.deepEqual(agySettings, { auth: { type: "oauth-personal" } });
   assert.equal(agyToken.token_uri, "http://127.0.0.1:18461/agy/token");
+
+  // Antigravity PreToolUse guard plugin denies built-in `schedule` inside sandbox.
+  const agyGuardHooks = JSON.parse(
+    await fs.readFile(path.join(sandboxHome, ".gemini/config/plugins/buzz-host-guards/hooks.json"), "utf8"),
+  );
+  assert.equal(agyGuardHooks["buzz-host-no-schedule"].PreToolUse[0].matcher, "schedule");
+  const denyStat = await fs.stat(path.join(sandboxHome, ".gemini/config/plugins/buzz-host-guards/deny-schedule.sh"));
+  assert.ok((denyStat.mode & 0o111) !== 0, "sandbox deny-schedule.sh must be executable");
   assert.equal(agyToken.refresh_token, proxyToken);
   assert.equal(agyToken.project_id, "proj-123");
 
