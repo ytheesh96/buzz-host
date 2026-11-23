@@ -1,0 +1,6 @@
+#!/bin/sh
+# Sandboxed Antigravity ACP shim (routes Cloud Code API and OAuth token exchange via host proxy).
+exec /opt/buzz-host/bin/acp-proxy /opt/antigravity/agy acp \
+  --dangerously-skip-permissions \
+  --disable-telemetry \
+  --cloud_code_endpoint "${BUZZ_SANDBOX_AGY_ENDPOINT:-http://127.0.0.1:18461/agy/cloudcode}"

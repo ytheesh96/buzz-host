@@ -1,0 +1,10 @@
+#!/bin/bash
+# Container-side `buzz` wrapper: loads this sandboxed agent's own Nostr identity
+# from /run/buzz-sandbox/agent-creds.env so even stripped-env shells (like Hermes
+# terminal tool) post cleanly as this agent.
+set -euo pipefail
+if [[ -f /run/buzz-sandbox/agent-creds.env ]]; then
+  # shellcheck source=/dev/null
+  source /run/buzz-sandbox/agent-creds.env
+fi
+exec /opt/buzz-host/bin/buzz "$@"

@@ -12,8 +12,12 @@ import {
   DEFAULT_CONCURRENCY,
   DEFAULT_URL,
   EMPTY,
+  applyRespondToChange,
+  applyRunnerChange,
   asConfig,
+  formatAllowlistText,
   isSelfHostedAgent,
+  parseAllowlistText,
   storedUrl,
 } from "./src/config.js";
 import { groupByProvider, modelChoices, profileOptions, providerOf } from "./src/ui.js";
@@ -48,6 +52,22 @@ test("config helpers normalize drafts, recognize self-hosted agents, and fall ba
   assert.equal(isSelfHostedAgent({ type: "claude-code" }), false);
   assert.equal(isSelfHostedAgent(undefined), false);
   assert.equal(isSelfHostedAgent(null), false);
+
+  // Sandbox runner & respondTo helpers enforce shared-agent isolation in UI drafts.
+  const shared = applyRespondToChange({ ...EMPTY, runtime: "hermes", profile: "work" }, "anyone");
+  assert.equal(shared.runner, "docker");
+  assert.equal(shared.profile, "");
+  assert.equal(shared.respondTo, "anyone");
+
+  const backToHost = applyRunnerChange(shared, "host");
+  assert.equal(backToHost.runner, "host");
+  assert.equal(backToHost.respondTo, "owner-only");
+  assert.deepEqual(backToHost.respondToAllowlist, []);
+
+  const pk1 = "a".repeat(64);
+  const pk2 = "b".repeat(64);
+  assert.deepEqual(parseAllowlistText(`${pk1.toUpperCase()}, ${pk2}\n${pk1}`), [pk1, pk2]);
+  assert.equal(formatAllowlistText([pk1, pk2]), `${pk1}\n${pk2}`);
 });
 
 test("ui helpers parse Hermes providers, group models, and build profile options", () => {

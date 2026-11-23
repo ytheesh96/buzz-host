@@ -1,0 +1,2 @@
+#!/bin/sh
+exec /opt/buzz-host/bin/acp-proxy codex-acp

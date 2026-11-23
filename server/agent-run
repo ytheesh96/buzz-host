@@ -10,7 +10,14 @@ BUZZ_AUTH_TAG="$(cat "$d/auth.json")"
 export BUZZ_PRIVATE_KEY BUZZ_AUTH_TAG
 # shellcheck source=/dev/null
 source "$d/runtime.env"
-export BUZZ_ACP_RESPOND_TO="${BUZZ_ACP_RESPOND_TO:-owner-only}"
+# Sandboxed runners (e.g. Docker) execute in an isolated container instead of on the host.
+if [[ "${BUZZ_HOST_RUNNER:-host}" == "docker" ]]; then
+  exec "$HOME/.local/lib/buzz-host/sandbox/docker-run" "$pubkey"
+fi
+# Defense-in-depth: host-native agents may ONLY run in owner-only mode.
+export BUZZ_ACP_ALLOWED_RESPOND_TO="owner-only"
+export BUZZ_ACP_RESPOND_TO="owner-only"
+unset BUZZ_ACP_RESPOND_TO_ALLOWLIST
 # Parallel conversations: buzz-acp spawns this many acp-proxy worker processes
 # so multiple chats/threads run concurrently instead of queuing behind one turn.
 export BUZZ_ACP_AGENTS="${BUZZ_ACP_AGENTS:-4}"

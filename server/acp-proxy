@@ -107,8 +107,10 @@ control_dir = os.environ.get("BUZZ_HOST_CONTROL_DIR", "")
 control_sock = os.environ.get("BUZZ_HOST_CONTROL_SOCK", "")
 agent_pubkey = os.environ.get("BUZZ_HOST_AGENT", "")
 host_lib = os.environ.get("BUZZ_HOST_LIB") or os.path.expanduser("~/.local/lib/buzz-host")
-host_sock = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}",
-                         "buzz-host", "attention.sock")
+host_sock = os.environ.get("BUZZ_HOST_MCP_SOCK") or os.path.join(
+    os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}",
+    "buzz-host", "attention.sock")
+IS_SANDBOX = os.environ.get("BUZZ_HOST_SANDBOX") == "1"
 ADAPTER = os.path.basename(sys.argv[1]) if len(sys.argv) > 1 else ""
 ADAPTER_TO_RUNTIME = {
     "claude-agent-acp": "claude",
@@ -423,7 +425,7 @@ def runtime_available(runtime_id):
 def ensure_hermes_profile(profile):
     """Ask buzz-host to install/enable buzz-host-session-env in this Hermes profile
     before spawning hermes-acp on demand."""
-    if not host_sock or not os.path.exists(host_sock):
+    if IS_SANDBOX or not host_sock or not os.path.exists(host_sock):
         return
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as c:
@@ -1164,6 +1166,8 @@ def chat_workspace(key, fresh=False):
     """{"source": "command"|"canvas"|None, "folders": [given...], "local":
     {given: dir or None}, "canvas": text or None, "worktree": {...} or None}.
     A /workspace setting wins over the Canvas; `/workspace off` saves []."""
+    if IS_SANDBOX:
+        return {"source": None, "folders": [], "local": {}, "canvas": None, "worktree": None, "worktree_dir": None}
     channel = (key or "").split("_", 1)[0]
     chosen = wanted_for(key, load_settings()).get("workspace") if settings_file else None
     ws = {"source": None, "folders": [], "canvas": None, "worktree": None}

@@ -1,0 +1,73 @@
+#!/bin/bash
+# Runs one sandboxed buzz-host agent inside a hardened Docker container.
+# Invoked by server/agent-run when BUZZ_HOST_RUNNER=docker.
+set -euo pipefail
+
+pubkey="$1"
+[[ "$pubkey" =~ ^[0-9a-f]{64}$ ]] || { echo "bad pubkey" >&2; exit 78; }
+
+agent_dir="$HOME/.local/share/buzz-host/agents/$pubkey"
+lib_dir="${BUZZ_HOST_LIB:-$HOME/.local/lib/buzz-host}"
+work_dir="$HOME/buzz-agents/$pubkey"
+run_root="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/buzz-host"
+prefix="${pubkey:0:16}"
+sandbox_run="$run_root/sandbox/$prefix"
+control_dir="$run_root/${prefix}.d"
+image="${BUZZ_SANDBOX_IMAGE:-buzz-host-sandbox:latest}"
+memory="${BUZZ_SANDBOX_MEMORY:-1536m}"
+cpus="${BUZZ_SANDBOX_CPUS:-2}"
+pids_limit="${BUZZ_SANDBOX_PIDS_LIMIT:-256}"
+cname="buzz-agent-${prefix}"
+
+[[ -f "$agent_dir/sandbox.env" ]] || { echo "sandbox.env missing (re-activate or restart buzz-host)" >&2; exit 78; }
+[[ -S "$sandbox_run/proxy.sock" ]] || { echo "sandbox proxy socket missing ($sandbox_run/proxy.sock); is buzz-host running?" >&2; exit 75; }
+
+mkdir -p -m 700 "$control_dir" "$agent_dir/fresh" "$agent_dir/wake/results" "$agent_dir/sandbox-home" "$sandbox_run/agent"
+mkdir -p "$work_dir"
+
+# Clean up any leftover container from an abrupt crash.
+docker rm -f "$cname" >/dev/null 2>&1 || true
+
+# Forward SIGTERM/SIGINT from systemd to graceful container stop.
+cleanup() {
+  docker stop -t 10 "$cname" >/dev/null 2>&1 || true
+}
+trap cleanup TERM INT
+
+args=(
+  run --rm --init
+  --name "$cname"
+  --user "$(id -u):$(id -g)"
+  --cap-drop=ALL
+  --security-opt=no-new-privileges:true
+  --read-only
+  "--pids-limit=${pids_limit}"
+  "--memory=${memory}"
+  "--cpus=${cpus}"
+  --tmpfs /tmp:rw,nosuid,nodev,size=256m
+  --tmpfs /var/tmp:rw,nosuid,nodev,size=128m
+  --workdir /workspace
+  --env-file "$agent_dir/sandbox.env"
+  -v "$work_dir:/workspace:rw"
+  -v "$agent_dir/sandbox-home:/home/agent:rw"
+  -v "$sandbox_run:/run/buzz-sandbox:rw"
+  -v "$control_dir:/run/buzz-sandbox/control:rw"
+  -v "$agent_dir/fresh:/run/buzz-sandbox/fresh:rw"
+  -v "$agent_dir/wake:/run/buzz-sandbox/wake:rw"
+  -v "$lib_dir:/opt/buzz-host:ro"
+)
+
+if [[ -f "$agent_dir/instructions.md" ]]; then
+  args+=(-v "$agent_dir/instructions.md:/run/buzz-sandbox/instructions.md:ro")
+fi
+
+agy_bin="${BUZZ_HOST_AGY_BIN:-$HOME/.local/share/mise/installs/antigravity-cli/latest/antigravity}"
+if [[ -x "$agy_bin" ]]; then
+  args+=(-v "$agy_bin:/opt/antigravity/agy:ro")
+fi
+
+args+=("$image" node /opt/buzz-host/sandbox/container-entry.mjs)
+
+docker "${args[@]}" &
+child=$!
+wait "$child"

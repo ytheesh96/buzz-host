@@ -86,6 +86,16 @@ deploy_local() {
   rm -rf "$lib_dir/desktop"
   mv "$desktop_tmp" "$lib_dir/desktop"
 
+  # Sandbox runner scripts, shims, and proxy modules (exclude tests).
+  if [ -d "$SERVER_DIR/sandbox" ]; then
+    local sandbox_tmp
+    sandbox_tmp="$(mktemp -d "$lib_dir/.sandbox.tmp.XXXXXX")"
+    cp -r "$SERVER_DIR/sandbox/." "$sandbox_tmp/"
+    find "$sandbox_tmp" -name '*.test.mjs' -delete
+    rm -rf "$lib_dir/sandbox"
+    mv "$sandbox_tmp" "$lib_dir/sandbox"
+  fi
+
   atomic_copy "$SERVER_DIR/acp-proxy" "$lib_dir/bin/acp-proxy" 0755
 
   for f in "$SERVER_DIR"/shims/*; do
@@ -135,6 +145,11 @@ deploy_ssh() {
   ssh "$host" 'rm -rf ~/.local/lib/buzz-host/desktop && mkdir -p ~/.local/lib/buzz-host/desktop'
   scp -q desktop/*.mjs desktop/launcher.sh desktop/wallpaper.png "$host":.local/lib/buzz-host/desktop/
   ssh "$host" 'rm -f ~/.local/lib/buzz-host/desktop/*.test.mjs'
+  if [ -d sandbox ]; then
+    ssh "$host" 'rm -rf ~/.local/lib/buzz-host/sandbox && mkdir -p ~/.local/lib/buzz-host/sandbox'
+    scp -q -r sandbox/* "$host":.local/lib/buzz-host/sandbox/
+    ssh "$host" 'find ~/.local/lib/buzz-host/sandbox -name "*.test.mjs" -delete'
+  fi
   scp -q acp-proxy "$host":.local/lib/buzz-host/bin/
   scp -q shims/* "$host":.local/lib/buzz-host/shims/
   scp -q agent-bin/* "$host":.local/lib/buzz-host/agent-bin/
