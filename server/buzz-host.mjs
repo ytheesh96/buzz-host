@@ -22,7 +22,7 @@ import { createAttention } from "./attention.mjs";
 import { createMemory } from "./memory.mjs";
 import { createOrchestrator } from "./orchestrator.mjs";
 import { createRelayWatcher } from "./attention-relay.mjs";
-import { catalogs, forComposer, formatTarget, parseTarget, resolveChatSettings, toModels } from "./catalog.mjs";
+import { catalogs, forComposer, formatTarget, parseTarget, resolveChatSettings, toModelList, toModels } from "./catalog.mjs";
 import { proxyControl as routeControl } from "./control.mjs";
 import * as desktop from "./desktop/desktop.mjs";
 import { acquire as leaseAcquire, release as leaseRelease, publicView } from "./desktop/lease.mjs";
@@ -344,11 +344,11 @@ function checkName(name) {
 const PROBE_DIR = path.join(LIB, "probe");
 const catalog = catalogs({ dir: path.join(HOME, ".local/share/buzz-host/catalog") });
 
-async function runtimeCatalog(runtime, profile = "", configured = "", { wait = true } = {}) {
+async function probeRuntime(runtime, profile = "", { wait = true } = {}) {
   if (!Object.hasOwn(RUNTIMES, runtime)) throw new Error("Unknown runtime");
   const home = runtime === "hermes" && profile ? hermesHome(profile) : "";
   await fs.mkdir(PROBE_DIR, { recursive: true });
-  const probed = await catalog(
+  return catalog(
     `${runtime}:${profile}`,
     {
       command: RUNTIMES[runtime].command,
@@ -359,6 +359,10 @@ async function runtimeCatalog(runtime, profile = "", configured = "", { wait = t
     },
     { wait },
   );
+}
+
+async function runtimeCatalog(runtime, profile = "", configured = "", { wait = true } = {}) {
+  const probed = await probeRuntime(runtime, profile, { wait });
   return probed && toModels(probed, configured);
 }
 
@@ -449,6 +453,8 @@ function checkPlace(channelId, threadRootId) {
 // behind a slow call for the same agent (a compaction runs for minutes).
 const UNSERIALIZED = new Set([
   "catalog",
+  "models",
+  "hermes.profiles",
   "session.state",
   "session.control",
   "interrupt",
@@ -691,49 +697,14 @@ const methods = {
     return { text: stdout };
   },
 
-  // Model ids the runtime offers, from `buzz-acp models --json`.
+  // Model ids the runtime offers, from the cached ACP catalog probe.
   // For Hermes, the profile's: each profile has its own providers and sign-ins.
   async models(config, { runtime, profile }) {
     if (!Object.hasOwn(RUNTIMES, runtime)) throw new Error("Unknown runtime");
     const { profile: home } = settingsFrom({ runtime, profile });
     await checkProfile(home);
-    const { stdout } = await run(path.join(BIN, "buzz-acp"), ["models", "--json"], {
-      env: {
-        ...process.env,
-        BUZZ_ACP_AGENT_COMMAND: RUNTIMES[runtime].command,
-        BUZZ_PRIVATE_KEY: "0".repeat(63) + "1",
-        ...(home ? { HERMES_HOME: hermesHome(home) } : {}),
-      },
-      cwd: WORK,
-      timeout: 45_000,
-      maxBuffer: 4 << 20,
-    });
-    const parsed = JSON.parse(stdout);
-    const seen = new Map();
-    const add = (id, name) => {
-      if (typeof id === "string" && id && !seen.has(id)) seen.set(id, name || id);
-    };
-    const flatOptions = (option) =>
-      (option.options ?? []).flatMap((v) => (Array.isArray(v?.options) ? v.options : [v]));
-    const groups = [parsed, parsed.stable ?? {}, parsed.unstable ?? {}];
-    const efforts = [];
-    const EFFORT = new Set(["thought_level", "effort", "reasoning_effort", "reasoning", "thinking"]);
-    for (const option of groups.flatMap((g) => g.configOptions ?? [])) {
-      if (option.category === "model" || option.id === "model")
-        for (const o of flatOptions(option)) add(o.value, o.name);
-      else if (EFFORT.has(option.category) || EFFORT.has(option.id))
-        for (const o of flatOptions(option))
-          if (!efforts.some((e) => e.value === o.value)) efforts.push({ value: o.value, name: o.name ?? o.value });
-    }
-    // Fall back to legacy availableModels only when the adapter omits a model configOption
-    // (some adapters, like agy acp, list flattened model+effort pairs in availableModels
-    // alongside clean base models + thought_level in configOptions).
-    if (seen.size === 0) {
-      for (const g of groups)
-        for (const m of g.availableModels ?? g.models?.availableModels ?? [])
-          add(m.modelId ?? m.id, m.name);
-    }
-    return { models: [...seen].map(([id, name]) => ({ id, name })), efforts };
+    const probed = await probeRuntime(runtime, home, { wait: true });
+    return toModelList(probed);
   },
 
   // The Hermes profiles an agent can run on, for the plugin's picker.

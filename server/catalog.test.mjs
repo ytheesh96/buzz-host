@@ -7,6 +7,7 @@ import path from "node:path";
 import {
   probe,
   toModels,
+  toModelList,
   catalogs,
   effortLabel,
   withRuntimes,
@@ -386,4 +387,63 @@ test("withRuntimes with per-chat settings selects active runtime, model and effo
   // Unavailable target runtime falls back to agent default.
   const missing = withRuntimes(own, [codex], { runtime: "hermes", model: "go:flash", effort: "" });
   assert.equal(missing.current, "default");
+});
+
+test("toModelList formats cached probe results for the models RPC", () => {
+  // Prefers clean model configOptions over flattened legacy available list, filters refused models, and dedupes efforts.
+  const list = toModelList({
+    model: {
+      id: "model",
+      current: "default",
+      options: [
+        { value: "default", name: "Default" },
+        { value: "opus", name: "Opus 5.5" },
+        { value: "opus", name: "Opus duplicate" },
+        { value: "paid", name: "Needs credits" },
+        { value: "plain" },
+      ],
+    },
+    available: [
+      { value: "opus-high", name: "Opus (High)" },
+      { value: "opus-low", name: "Opus (Low)" },
+    ],
+    effort: {
+      current: "medium",
+      options: [
+        { value: "low", name: "Low" },
+        { value: "low", name: "Low dup" },
+        { value: "high" },
+      ],
+    },
+    unavailable: ["paid"],
+  });
+  assert.deepEqual(list, {
+    models: [
+      { id: "default", name: "Default" },
+      { id: "opus", name: "Opus 5.5" },
+      { id: "plain", name: "plain" },
+    ],
+    efforts: [
+      { value: "low", name: "Low" },
+      { value: "high", name: "high" },
+    ],
+  });
+
+  // Falls back to legacy available list when model configOption is absent.
+  const legacy = toModelList({
+    model: null,
+    available: [
+      { value: "nous:anthropic/claude-opus-5.5", name: "Nous Portal · anthropic/claude-opus-5.5" },
+      { value: "opencode-go:deepseek-v4.1-flash", name: "OpenCode Go · deepseek-v4.1-flash" },
+    ],
+    effort: null,
+    unavailable: [],
+  });
+  assert.deepEqual(legacy, {
+    models: [
+      { id: "nous:anthropic/claude-opus-5.5", name: "Nous Portal · anthropic/claude-opus-5.5" },
+      { id: "opencode-go:deepseek-v4.1-flash", name: "OpenCode Go · deepseek-v4.1-flash" },
+    ],
+    efforts: [],
+  });
 });
