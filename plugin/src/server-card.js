@@ -52,10 +52,24 @@ export function createServerCard({ React, client, uiKit }) {
           null,
           `Host ${info.hello.host} · runtimes: ${info.hello.runtimes
             .map((r) => `${r.title}${r.available ? "" : " (missing)"}`)
-            .join(", ")}\n` +
+            .join(", ")}` +
+            (Array.isArray(info.hello.runners)
+              ? `\nRunners: ${info.hello.runners
+                  .map((r) => `${r.title}${r.available ? "" : " (unavailable)"}`)
+                  .join(", ")}`
+              : "") +
+            "\n" +
             (info.list.agents.length
               ? info.list.agents
-                  .map((a) => `• ${a.name} — ${a.runtime}${a.model ? `/${a.model}` : ""} — ${a.status}`)
+                  .map((a) => {
+                    const extra = [
+                      a.runner && a.runner !== "host" ? a.runner : "",
+                      a.respondTo && a.respondTo !== "owner-only" ? a.respondTo : "",
+                    ]
+                      .filter(Boolean)
+                      .join(" · ");
+                    return `• ${a.name} — ${a.runtime}${a.model ? `/${a.model}` : ""}${extra ? ` [${extra}]` : ""} — ${a.status}`;
+                  })
                   .join("\n")
               : "No agents yet."),
         ),

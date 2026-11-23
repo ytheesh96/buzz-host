@@ -1,0 +1,2 @@
+#!/bin/sh
+exec node /opt/buzz-host/sandbox/container-mcp.mjs

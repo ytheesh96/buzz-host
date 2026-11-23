@@ -21,6 +21,27 @@ const RUNTIMES = [
 		title: "Antigravity"
 	}
 ];
+const RUNNERS = [{
+	id: "host",
+	title: "Host (owner-only)"
+}, {
+	id: "docker",
+	title: "Docker sandbox"
+}];
+const RESPOND_TO_OPTIONS = [
+	{
+		value: "owner-only",
+		label: "Owner only"
+	},
+	{
+		value: "allowlist",
+		label: "Allowlist (specific pubkeys)"
+	},
+	{
+		value: "anyone",
+		label: "Anyone in shared channels"
+	}
+];
 const DEFAULT_CONCURRENCY = 4;
 const CONCURRENCY_VALUES = [
 	1,
@@ -40,13 +61,63 @@ const EMPTY = {
 	model: "",
 	instructions: "",
 	profile: "",
-	concurrency: 4
+	concurrency: 4,
+	runner: "host",
+	respondTo: "owner-only",
+	respondToAllowlist: []
 };
 const PROFILE_HINT = "Which Hermes home runs this agent: its config, memory, skills and provider.";
-const asConfig = (value) => ({
-	...EMPTY,
-	...value && typeof value === "object" ? value : {}
-});
+function parseAllowlistText(value) {
+	const items = Array.isArray(value) ? value : String(value ?? "").split(/[\s,]+/);
+	const seen = /* @__PURE__ */ new Set();
+	const out = [];
+	for (const raw of items) {
+		const clean = String(raw ?? "").trim().toLowerCase();
+		if (!clean || seen.has(clean)) continue;
+		seen.add(clean);
+		out.push(clean);
+	}
+	return out;
+}
+function formatAllowlistText(list) {
+	return Array.isArray(list) ? list.join("\n") : String(list ?? "");
+}
+/** Update respondTo while enforcing the sandbox invariant in the UI draft. */
+function applyRespondToChange(draft, respondTo) {
+	const next = {
+		...draft,
+		respondTo
+	};
+	if (respondTo !== "owner-only" && next.runner === "host") {
+		next.runner = "docker";
+		next.profile = "";
+	}
+	if (respondTo !== "allowlist") next.respondToAllowlist = [];
+	return next;
+}
+/** Update runner while keeping respondTo/profile consistent in the UI draft. */
+function applyRunnerChange(draft, runner) {
+	const next = {
+		...draft,
+		runner
+	};
+	if (runner !== "host") next.profile = "";
+	else if (next.respondTo !== "owner-only") {
+		next.respondTo = "owner-only";
+		next.respondToAllowlist = [];
+	}
+	return next;
+}
+const asConfig = (value) => {
+	const merged = {
+		...EMPTY,
+		...value && typeof value === "object" ? value : {}
+	};
+	merged.runner = merged.runner || (merged.respondTo && merged.respondTo !== "owner-only" ? "docker" : "host");
+	merged.respondTo = merged.respondTo || "owner-only";
+	merged.respondToAllowlist = parseAllowlistText(merged.respondToAllowlist);
+	return merged;
+};
 function storedUrl() {
 	try {
 		return localStorage.getItem("local.buzz-host.url") || "wss://omarchy.tail65c5a9.ts.net:8447";
@@ -1025,12 +1096,21 @@ function createType({ React, client, ctx, uiKit, invalidateCatalog, ActivityTab,
 		label: "",
 		options
 	}];
-	/** Runtime, Hermes profile and Model rows, for a SettingsGroup. */
+	/** Runtime, Hermes profile, Model, Concurrency, Access and Runner rows, for a SettingsGroup. */
 	function RuntimeRows({ ui, draft, onChange, disabled }) {
-		const { models, error } = useModels(React, client, draft.runtime, draft.profile);
-		const hermes = draft.runtime === "hermes";
+		const sandboxed = (draft.runner || "host") !== "host";
+		const { models, error } = useModels(React, client, draft.runtime, sandboxed ? "" : draft.profile);
+		const hermes = draft.runtime === "hermes" && !sandboxed;
 		const { profiles, error: profileError } = useProfiles(React, client, hermes);
 		const choice = modelChoices(models);
+		const respondTo = draft.respondTo || "owner-only";
+		const runnerChoices = respondTo === "owner-only" ? RUNNERS.map((r) => ({
+			value: r.id,
+			label: r.title
+		})) : RUNNERS.filter((r) => r.id !== "host").map((r) => ({
+			value: r.id,
+			label: r.title
+		}));
 		return h(React.Fragment, null, h(ui.Select, {
 			label: "Runtime",
 			variant: "preference",
@@ -1082,6 +1162,42 @@ function createType({ React, client, ctx, uiKit, invalidateCatalog, ActivityTab,
 				...draft,
 				concurrency: Number(v) || 4
 			})
+		}), h(ui.Select, {
+			label: "Who can talk to this agent",
+			variant: "preference",
+			value: respondTo,
+			disabled,
+			groups: one(RESPOND_TO_OPTIONS),
+			onValueChange: (nextMode) => onChange({
+				...applyRespondToChange(draft, nextMode),
+				allowlistText: nextMode === "allowlist" ? draft.allowlistText ?? formatAllowlistText(draft.respondToAllowlist) : ""
+			})
+		}), h(ui.Select, {
+			label: "Sandbox runner",
+			variant: "preference",
+			value: draft.runner || "host",
+			disabled,
+			...respondTo !== "owner-only" ? { description: "Shared agents always run in an isolated sandbox container." } : {},
+			groups: one(runnerChoices),
+			onValueChange: (nextRunner) => onChange(applyRunnerChange(draft, nextRunner))
+		}));
+	}
+	function AllowlistField({ draft, onChange, disabled }) {
+		if ((draft.respondTo || "owner-only") !== "allowlist") return null;
+		const text = draft.allowlistText ?? formatAllowlistText(draft.respondToAllowlist);
+		return h(Row, {
+			label: "Allowed pubkeys",
+			hint: "64-character hex pubkeys (one per line or comma-separated). Owner is always included."
+		}, h(Area, {
+			rows: 4,
+			value: text,
+			disabled,
+			placeholder: "b9085cc5...\n...",
+			onChange: (e) => onChange({
+				...draft,
+				allowlistText: e.target.value,
+				respondToAllowlist: parseAllowlistText(e.target.value)
+			})
 		}));
 	}
 	/** What an agent runs with, read from buzz-host. */
@@ -1093,6 +1209,8 @@ function createType({ React, client, ctx, uiKit, invalidateCatalog, ActivityTab,
 				if (controller.signal.aborted) return;
 				const text = [
 					RUNTIMES.find((r) => r.id === s.runtime)?.title ?? s.runtime,
+					s.runner && s.runner !== "host" && s.runner,
+					s.respondTo && s.respondTo !== "owner-only" && s.respondTo,
 					s.profile && `profile ${s.profile}`,
 					s.model || "runtime default"
 				].filter(Boolean).join(" · ");
@@ -1125,7 +1243,11 @@ function createType({ React, client, ctx, uiKit, invalidateCatalog, ActivityTab,
 			draft,
 			onChange,
 			disabled
-		})), h("p", { className: "m-0 text-body-sm text-secondary" }, "Runs on your server with buzz-acp and uses that machine's sign-ins."));
+		})), h(AllowlistField, {
+			draft,
+			onChange,
+			disabled
+		}), h("p", { className: "m-0 text-body-sm text-secondary" }, "Runs on your server with buzz-acp and uses that machine's sign-ins."));
 	}
 	function RunsWith({ ui, agent, harnessControl }) {
 		const text = useRunsWith(agent.pubkey);
@@ -1211,7 +1333,7 @@ function createType({ React, client, ctx, uiKit, invalidateCatalog, ActivityTab,
 				model: "",
 				profile: ""
 			})
-		})), draft.runtime === "hermes" && h(Row, {
+		})), draft.runtime === "hermes" && (draft.runner || "host") === "host" && h(Row, {
 			label: "Hermes profile",
 			hint: "Which Hermes home runs this agent: its config, memory, skills and provider."
 		}, h(ProfileField, {
@@ -1224,7 +1346,7 @@ function createType({ React, client, ctx, uiKit, invalidateCatalog, ActivityTab,
 			React,
 			client,
 			runtime: draft.runtime,
-			profile: draft.profile,
+			profile: (draft.runner || "host") === "host" ? draft.profile : "",
 			value: draft.model,
 			disabled,
 			onChange: (model) => change({ model })
@@ -1236,6 +1358,35 @@ function createType({ React, client, ctx, uiKit, invalidateCatalog, ActivityTab,
 			disabled,
 			options: CONCURRENCY_OPTIONS,
 			onChange: (v) => change({ concurrency: Number(v) || 4 })
+		})), h(Row, {
+			label: "Who can talk to this agent",
+			hint: "Shared agents automatically run inside a Docker sandbox."
+		}, h(Select, {
+			value: draft.respondTo || "owner-only",
+			disabled,
+			options: RESPOND_TO_OPTIONS,
+			onChange: (nextMode) => onChange({
+				...applyRespondToChange(draft, nextMode),
+				allowlistText: nextMode === "allowlist" ? draft.allowlistText ?? formatAllowlistText(draft.respondToAllowlist) : ""
+			})
+		})), h(AllowlistField, {
+			draft,
+			onChange,
+			disabled
+		}), h(Row, {
+			label: "Sandbox runner",
+			hint: (draft.respondTo || "owner-only") !== "owner-only" ? "Shared agents always run in an isolated sandbox container." : "Choose Docker sandbox to isolate this agent from host files and keys."
+		}, h(Select, {
+			value: draft.runner || "host",
+			disabled,
+			options: (draft.respondTo || "owner-only") === "owner-only" ? RUNNERS.map((r) => ({
+				value: r.id,
+				label: r.title
+			})) : RUNNERS.filter((r) => r.id !== "host").map((r) => ({
+				value: r.id,
+				label: r.title
+			})),
+			onChange: (nextRunner) => onChange(applyRunnerChange(draft, nextRunner))
 		})));
 	}
 	function SettingsTab(props) {
@@ -1259,6 +1410,10 @@ function createType({ React, client, ctx, uiKit, invalidateCatalog, ActivityTab,
 				model: s.model ?? "",
 				profile: s.profile ?? "",
 				concurrency: Number(s.concurrency) || 4,
+				runner: s.runner || "host",
+				respondTo: s.respondTo || "owner-only",
+				respondToAllowlist: parseAllowlistText(s.respondToAllowlist),
+				allowlistText: formatAllowlistText(s.respondToAllowlist),
 				instructions: i.instructions,
 				status: s.status
 			}), (e) => !signal.aborted && setError(String(e.message ?? e)));
@@ -1312,6 +1467,9 @@ function createType({ React, client, ctx, uiKit, invalidateCatalog, ActivityTab,
 				subtitle: `buzz-host on ${host}`,
 				trailing: h("span", { className: "text-body-sm text-secondary" }, `Service ${loaded.status}`)
 			}), h(ui.PreferenceRow, {
+				title: "Isolation & access",
+				subtitle: `${RUNNERS.find((r) => r.id === loaded.runner)?.title ?? loaded.runner} · ${RESPOND_TO_OPTIONS.find((o) => o.value === loaded.respondTo)?.label ?? loaded.respondTo}`
+			}), h(ui.PreferenceRow, {
 				title: "Sessions",
 				subtitle: `One session per thread; Solo chats and DMs keep one. Runs up to ${loaded.concurrency} conversation${loaded.concurrency === 1 ? "" : "s"} in parallel.`
 			}), h(ui.PreferenceRow, {
@@ -1352,12 +1510,14 @@ function createType({ React, client, ctx, uiKit, invalidateCatalog, ActivityTab,
 					background: "var(--surface-inset)",
 					border: "1px solid var(--border-standard)"
 				}
-			}, logs || "(no log lines)"), h(OrchestratorSettings, {
+			}, logs || "(no log lines)"), (loaded.runner || "host") === "host" && h(OrchestratorSettings, {
 				ui,
 				agent
 			}), settingsContent);
 		}
-		const runtimeChanged = draft.runtime !== loaded.runtime || draft.model.trim() !== loaded.model || draft.profile !== loaded.profile || (draft.concurrency ?? 4) !== loaded.concurrency;
+		const draftAllowlist = parseAllowlistText(draft.allowlistText ?? draft.respondToAllowlist);
+		const loadedAllowlist = parseAllowlistText(loaded.respondToAllowlist);
+		const runtimeChanged = draft.runtime !== loaded.runtime || draft.model.trim() !== loaded.model || draft.profile !== loaded.profile || (draft.concurrency ?? 4) !== loaded.concurrency || (draft.runner || "host") !== (loaded.runner || "host") || (draft.respondTo || "owner-only") !== (loaded.respondTo || "owner-only") || draftAllowlist.join(",") !== loadedAllowlist.join(",");
 		const instructionsChanged = draft.instructions !== loaded.instructions;
 		const dirty = runtimeChanged || instructionsChanged;
 		const save = () => act("save", async () => {
@@ -1372,14 +1532,19 @@ function createType({ React, client, ctx, uiKit, invalidateCatalog, ActivityTab,
 					pubkey,
 					runtime: draft.runtime,
 					model: draft.model.trim(),
-					profile: draft.profile,
-					concurrency: draft.concurrency ?? 4
+					profile: (draft.runner || "host") === "host" ? draft.profile : "",
+					concurrency: draft.concurrency ?? 4,
+					runner: draft.runner || "host",
+					respondTo: draft.respondTo || "owner-only",
+					respondToAllowlist: draftAllowlist
 				})).status;
 				invalidateCatalog(pubkey);
 			}
 			setLoaded({
 				...draft,
 				model: draft.model.trim(),
+				respondToAllowlist: draftAllowlist,
+				allowlistText: formatAllowlistText(draftAllowlist),
 				status
 			});
 			setNotice("Saved. The agent restarted with the new settings.");
@@ -1396,7 +1561,11 @@ function createType({ React, client, ctx, uiKit, invalidateCatalog, ActivityTab,
 			draft,
 			disabled: !!busy,
 			onChange: setDraft
-		})), h(ui.AgentInstructions, {
+		})), h(AllowlistField, {
+			draft,
+			disabled: !!busy,
+			onChange: setDraft
+		}), h(ui.AgentInstructions, {
 			value: draft.instructions,
 			disabled: !!busy,
 			description: "Saving restarts the agent; a turn in progress is cut short.",
@@ -1433,6 +1602,10 @@ function createType({ React, client, ctx, uiKit, invalidateCatalog, ActivityTab,
 					model: s.model ?? "",
 					profile: s.profile ?? "",
 					concurrency: Number(s.concurrency) || 4,
+					runner: s.runner || "host",
+					respondTo: s.respondTo || "owner-only",
+					respondToAllowlist: parseAllowlistText(s.respondToAllowlist),
+					allowlistText: formatAllowlistText(s.respondToAllowlist),
 					instructions: i.instructions,
 					status: s.status
 				};
@@ -1460,7 +1633,9 @@ function createType({ React, client, ctx, uiKit, invalidateCatalog, ActivityTab,
 			type: "button",
 			onClick: () => setRevision((r) => r + 1)
 		}, "Retry"), !settingsSection && settingsContent);
-		const runtimeChanged = draft.runtime !== loaded.runtime || draft.model.trim() !== loaded.model || draft.profile !== loaded.profile || (draft.concurrency ?? 4) !== loaded.concurrency;
+		const draftAllowlist = parseAllowlistText(draft.allowlistText ?? draft.respondToAllowlist);
+		const loadedAllowlist = parseAllowlistText(loaded.respondToAllowlist);
+		const runtimeChanged = draft.runtime !== loaded.runtime || draft.model.trim() !== loaded.model || draft.profile !== loaded.profile || (draft.concurrency ?? 4) !== loaded.concurrency || (draft.runner || "host") !== (loaded.runner || "host") || (draft.respondTo || "owner-only") !== (loaded.respondTo || "owner-only") || draftAllowlist.join(",") !== loadedAllowlist.join(",");
 		const instructionsChanged = draft.instructions !== loaded.instructions;
 		const dirty = runtimeChanged || instructionsChanged;
 		const save = () => act("save", async () => {
@@ -1475,14 +1650,19 @@ function createType({ React, client, ctx, uiKit, invalidateCatalog, ActivityTab,
 					pubkey,
 					runtime: draft.runtime,
 					model: draft.model.trim(),
-					profile: draft.profile,
-					concurrency: draft.concurrency ?? 4
+					profile: (draft.runner || "host") === "host" ? draft.profile : "",
+					concurrency: draft.concurrency ?? 4,
+					runner: draft.runner || "host",
+					respondTo: draft.respondTo || "owner-only",
+					respondToAllowlist: draftAllowlist
 				})).status;
 				invalidateCatalog(pubkey);
 			}
 			const value = {
 				...draft,
 				model: draft.model.trim(),
+				respondToAllowlist: draftAllowlist,
+				allowlistText: formatAllowlistText(draftAllowlist),
 				status
 			};
 			setLoaded(value);
@@ -1502,7 +1682,7 @@ function createType({ React, client, ctx, uiKit, invalidateCatalog, ActivityTab,
 				model: "",
 				profile: ""
 			})
-		})), draft.runtime === "hermes" && h(Row, {
+		})), draft.runtime === "hermes" && (draft.runner || "host") === "host" && h(Row, {
 			label: "Hermes profile",
 			hint: `${"Which Hermes home runs this agent: its config, memory, skills and provider."} Changing it restarts the agent with that profile's memory.`
 		}, h(ProfileField, {
@@ -1518,7 +1698,7 @@ function createType({ React, client, ctx, uiKit, invalidateCatalog, ActivityTab,
 			React,
 			client,
 			runtime: draft.runtime,
-			profile: draft.profile,
+			profile: (draft.runner || "host") === "host" ? draft.profile : "",
 			value: draft.model,
 			disabled: !!busy,
 			onChange: (model) => setDraft({
@@ -1536,6 +1716,35 @@ function createType({ React, client, ctx, uiKit, invalidateCatalog, ActivityTab,
 				...draft,
 				concurrency: Number(v) || 4
 			})
+		})), h(Row, {
+			label: "Who can talk to this agent",
+			hint: "Shared agents automatically run inside a Docker sandbox."
+		}, h(Select, {
+			value: draft.respondTo || "owner-only",
+			disabled: !!busy,
+			options: RESPOND_TO_OPTIONS,
+			onChange: (nextMode) => setDraft({
+				...applyRespondToChange(draft, nextMode),
+				allowlistText: nextMode === "allowlist" ? draft.allowlistText ?? formatAllowlistText(draft.respondToAllowlist) : ""
+			})
+		})), h(AllowlistField, {
+			draft,
+			disabled: !!busy,
+			onChange: setDraft
+		}), h(Row, {
+			label: "Sandbox runner",
+			hint: (draft.respondTo || "owner-only") !== "owner-only" ? "Shared agents always run in an isolated sandbox container." : "Choose Docker sandbox to isolate this agent from host files and keys."
+		}, h(Select, {
+			value: draft.runner || "host",
+			disabled: !!busy,
+			options: (draft.respondTo || "owner-only") === "owner-only" ? RUNNERS.map((r) => ({
+				value: r.id,
+				label: r.title
+			})) : RUNNERS.filter((r) => r.id !== "host").map((r) => ({
+				value: r.id,
+				label: r.title
+			})),
+			onChange: (nextRunner) => setDraft(applyRunnerChange(draft, nextRunner))
 		})), h(Row, {
 			label: "Instructions",
 			hint: "Saving restarts the agent; a turn in progress is cut short."
@@ -1585,7 +1794,7 @@ function createType({ React, client, ctx, uiKit, invalidateCatalog, ActivityTab,
 			fontSize: "var(--text-caption)",
 			whiteSpace: "pre-wrap",
 			wordBreak: "break-word"
-		} }, logs || "(no log lines)"), h(OrchestratorSettings, { agent }), !settingsSection && settingsContent);
+		} }, logs || "(no log lines)"), (loaded.runner || "host") === "host" && h(OrchestratorSettings, { agent }), !settingsSection && settingsContent);
 	}
 	const omarchyType = {
 		id: "omarchy",
@@ -1622,8 +1831,11 @@ function createType({ React, client, ctx, uiKit, invalidateCatalog, ActivityTab,
 					config: {
 						runtime: c.runtime,
 						model: c.model.trim(),
-						profile: c.runtime === "hermes" ? c.profile : "",
+						profile: c.runtime === "hermes" && c.runner === "host" ? c.profile : "",
 						concurrency: Number(c.concurrency) || 4,
+						runner: c.runner,
+						respondTo: c.respondTo,
+						respondToAllowlist: c.respondToAllowlist,
 						instructions: c.instructions
 					}
 				}, { signal });
@@ -1638,8 +1850,11 @@ function createType({ React, client, ctx, uiKit, invalidateCatalog, ActivityTab,
 					...c ? { config: {
 						runtime: c.runtime,
 						model: c.model.trim(),
-						profile: c.runtime === "hermes" ? c.profile : "",
+						profile: c.runtime === "hermes" && c.runner === "host" ? c.profile : "",
 						concurrency: Number(c.concurrency) || 4,
+						runner: c.runner,
+						respondTo: c.respondTo,
+						respondToAllowlist: c.respondToAllowlist,
 						instructions: c.instructions
 					} } : {}
 				}, {
@@ -1743,7 +1958,10 @@ function createServerCard({ React, client, uiKit }) {
 		} }, h("button", {
 			type: "button",
 			onClick: () => void check()
-		}, "Save and check")), h(Note, { tone: error ? "error" : void 0 }, error || `Connection: ${state.status}`), info && h(Note, null, `Host ${info.hello.host} · runtimes: ${info.hello.runtimes.map((r) => `${r.title}${r.available ? "" : " (missing)"}`).join(", ")}\n` + (info.list.agents.length ? info.list.agents.map((a) => `• ${a.name} — ${a.runtime}${a.model ? `/${a.model}` : ""} — ${a.status}`).join("\n") : "No agents yet.")));
+		}, "Save and check")), h(Note, { tone: error ? "error" : void 0 }, error || `Connection: ${state.status}`), info && h(Note, null, `Host ${info.hello.host} · runtimes: ${info.hello.runtimes.map((r) => `${r.title}${r.available ? "" : " (missing)"}`).join(", ")}` + (Array.isArray(info.hello.runners) ? `\nRunners: ${info.hello.runners.map((r) => `${r.title}${r.available ? "" : " (unavailable)"}`).join(", ")}` : "") + "\n" + (info.list.agents.length ? info.list.agents.map((a) => {
+			const extra = [a.runner && a.runner !== "host" ? a.runner : "", a.respondTo && a.respondTo !== "owner-only" ? a.respondTo : ""].filter(Boolean).join(" · ");
+			return `• ${a.name} — ${a.runtime}${a.model ? `/${a.model}` : ""}${extra ? ` [${extra}]` : ""} — ${a.status}`;
+		}).join("\n") : "No agents yet.")));
 	};
 }
 

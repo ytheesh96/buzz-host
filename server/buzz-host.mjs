@@ -28,6 +28,14 @@ import * as desktop from "./desktop/desktop.mjs";
 import { acquire as leaseAcquire, release as leaseRelease, publicView } from "./desktop/lease.mjs";
 import { acceptUpgrade, bridge as rfbBridge } from "./desktop/rfb-bridge.mjs";
 import { snapshot as desktopSnapshot } from "./desktop/snapshot.mjs";
+import {
+  assertSandboxRestrictions,
+  createRunnerManager,
+  isSandboxed,
+  normalizeAllowlist,
+  normalizeRespondTo,
+  normalizeRunner,
+} from "./sandbox/index.mjs";
 
 const run = promisify(execFile);
 const HOME = os.homedir();
@@ -217,13 +225,20 @@ function settingsFrom(input, previous = {}) {
   if (!Object.hasOwn(RUNTIMES, runtime)) throw new Error("Unknown runtime");
   const model = String(input?.model ?? previous.model ?? "").trim();
   if (!MODEL.test(model)) throw new Error("Invalid model id");
-  // Only Hermes has profiles; another runtime drops it.
+  const respondTo = normalizeRespondTo(input?.respondTo, previous.respondTo ?? "owner-only");
+  const respondToAllowlist =
+    respondTo === "allowlist"
+      ? normalizeAllowlist(input?.respondToAllowlist, previous.respondToAllowlist ?? [])
+      : [];
+  const runner = normalizeRunner(input?.runner, respondTo, previous.runner ?? "host");
+  // Only host-native Hermes agents use host Hermes profiles; sandboxed Hermes uses its own container home.
   const kept = runtime === previous.runtime ? previous.profile : "";
-  let profile = runtime === "hermes" ? String(input?.profile ?? kept ?? "").trim() : "";
+  let profile =
+    runtime === "hermes" && runner === "host" ? String(input?.profile ?? kept ?? "").trim() : "";
   if (profile === "default") profile = "";
   if (profile && !PROFILE.test(profile)) throw new Error("Invalid Hermes profile name");
   const concurrency = checkConcurrency(input?.concurrency, previous.concurrency ?? DEFAULT_CONCURRENCY);
-  return { runtime, model, profile, concurrency };
+  return { runtime, model, profile, concurrency, runner, respondTo, respondToAllowlist };
 }
 function checkInstructions(text) {
   if (typeof text !== "string") throw new Error("Instructions must be text");
@@ -237,15 +252,32 @@ const sq = (value) => `'${String(value).replaceAll("'", `'\\''`)}'`;
 
 async function writeRuntimeEnv(pubkey, m) {
   const runtime = RUNTIMES[m.runtime];
-  const profile = m.runtime === "hermes" ? m.profile || "" : "";
-  if (m.runtime === "hermes") await ensureSessionEnv(profile);
+  const sandboxed = isSandboxed(m);
+  const runner = m.runner || "host";
+  const respondTo = normalizeRespondTo(m.respondTo, "owner-only");
+  const allowlist = respondTo === "allowlist" ? normalizeAllowlist(m.respondToAllowlist, []) : [];
+  if (sandboxed) {
+    assertSandboxRestrictions(m);
+    await runnerManager.prepareAgent(pubkey, { ...m, runner, respondTo, respondToAllowlist: allowlist });
+  } else {
+    if (respondTo !== "owner-only") {
+      throw new Error('Shared agents (respondTo != "owner-only") must use a sandboxed runner (docker)');
+    }
+    await runnerManager.cleanupAgent(pubkey).catch(() => {});
+  }
+  const profile = m.runtime === "hermes" && !sandboxed ? m.profile || "" : "";
+  if (m.runtime === "hermes" && !sandboxed) await ensureSessionEnv(profile);
   const concurrency = checkConcurrency(m.concurrency, DEFAULT_CONCURRENCY);
   const lines = {
+    BUZZ_HOST_RUNNER: runner,
     BUZZ_RELAY_URL: m.community,
     BUZZ_ACP_AGENT_OWNER: m.owner,
     BUZZ_ACP_AGENT_COMMAND: runtime.command,
     BUZZ_ACP_AGENTS: String(concurrency),
     BUZZ_ACP_MODEL: m.model || undefined,
+    BUZZ_ACP_RESPOND_TO: respondTo,
+    BUZZ_ACP_RESPOND_TO_ALLOWLIST: allowlist.length ? allowlist.join(",") : undefined,
+    BUZZ_ACP_ALLOWED_RESPOND_TO: sandboxed ? undefined : "owner-only",
     // The Hermes profile: hermes-acp and its gateway session use this home.
     HERMES_HOME: profile ? hermesHome(profile) : undefined,
     BUZZ_HOST_HERMES_PROFILE: profile || undefined,
@@ -253,7 +285,7 @@ async function writeRuntimeEnv(pubkey, m) {
       ? path.join(dir(pubkey), "instructions.md")
       : undefined,
     // Buzz's tools: memory always, Attention while the owner has it on.
-    BUZZ_ACP_MCP_COMMAND: await writeBuzzMcp(pubkey),
+    BUZZ_ACP_MCP_COMMAND: sandboxed ? undefined : await writeBuzzMcp(pubkey),
   };
   const text = Object.entries(lines)
     .filter(([, value]) => value)
@@ -369,8 +401,11 @@ async function runtimeCatalog(runtime, profile = "", configured = "", { wait = t
 const installed = (command) => fs.access(command, fs.constants.X_OK).then(() => true, () => false);
 const RUNTIME_IDS = new Set(Object.keys(RUNTIMES));
 
-async function chatSettingsFor(pubkey, channelId, threadRootId, defaultRuntime, defaultProfile = "") {
-  const settings = await readJson(path.join(dir(pubkey), "chat-settings.json"), {});
+async function chatSettingsFor(pubkey, channelId, threadRootId, defaultRuntime, defaultProfile = "", sandboxed = false) {
+  const file = sandboxed
+    ? path.join(RUN_DIR, "sandbox", pubkey.slice(0, 16), "agent", "chat-settings.json")
+    : path.join(dir(pubkey), "chat-settings.json");
+  const settings = await readJson(file, {});
   return resolveChatSettings(settings, channelId, threadRootId, defaultRuntime, RUNTIME_IDS, defaultProfile);
 }
 
@@ -494,14 +529,17 @@ function sharedSnapshot(pubkey, socketPath, width) {
 
 const methods = {
   async hello() {
-    const runtimes = await Promise.all(
-      Object.entries(RUNTIMES).map(async ([id, r]) => ({
-        id,
-        title: r.title,
-        available: await installed(r.command),
-      })),
-    );
-    return { version: VERSION, host: os.hostname(), runtimes };
+    const [runtimes, runners] = await Promise.all([
+      Promise.all(
+        Object.entries(RUNTIMES).map(async ([id, r]) => ({
+          id,
+          title: r.title,
+          available: await installed(r.command),
+        })),
+      ),
+      runnerManager.availableRunners(),
+    ]);
+    return { version: VERSION, host: os.hostname(), runtimes, runners };
   },
 
   // A new key, not yet anyone's. Kept until activate or remove.
@@ -619,14 +657,24 @@ const methods = {
       model: m.model,
       profile: m.profile || "",
       concurrency: checkConcurrency(m.concurrency, DEFAULT_CONCURRENCY),
+      runner: m.runner || "host",
+      respondTo: normalizeRespondTo(m.respondTo, "owner-only"),
+      respondToAllowlist: Array.isArray(m.respondToAllowlist) ? m.respondToAllowlist : [],
       status: await active(pubkey),
     };
   },
 
-  async "settings.set"(config, { pubkey, runtime, model, profile, concurrency }) {
+  async "settings.set"(
+    config,
+    { pubkey, runtime, model, profile, concurrency, runner, respondTo, respondToAllowlist },
+  ) {
     checkPubkey(pubkey);
     const m = await meta(pubkey);
-    const next = { ...m, ...settingsFrom({ runtime, model, profile, concurrency }, m) };
+    const next = {
+      ...m,
+      ...settingsFrom({ runtime, model, profile, concurrency, runner, respondTo, respondToAllowlist }, m),
+    };
+    assertSandboxRestrictions(next);
     await checkProfile(next.profile);
     await saveMeta(pubkey, next);
     if (m.activated) {
@@ -725,6 +773,8 @@ const methods = {
           model: m.model,
           profile: m.profile || "",
           concurrency: checkConcurrency(m.concurrency, DEFAULT_CONCURRENCY),
+          runner: m.runner || "host",
+          respondTo: normalizeRespondTo(m.respondTo, "owner-only"),
           activated: m.activated,
           desktop: m.desktop === true,
           orchestrate: m.orchestrate === true,
@@ -760,7 +810,9 @@ const methods = {
       throw new Error("Invalid runtime");
     const m = await meta(pubkey);
     const { runtime, profile } = settingsFrom(m);
-    const chat = channelId ? await chatSettingsFor(pubkey, channelId, threadRootId, runtime, profile) : null;
+    const chat = channelId
+      ? await chatSettingsFor(pubkey, channelId, threadRootId, runtime, profile, isSandboxed(m))
+      : null;
     return chatCatalog(runtime, profile, m.model || "", chat, requestedRuntime || "");
   },
 
@@ -777,7 +829,7 @@ const methods = {
         5_000,
         { state: "unavailable" },
       ).catch(() => ({ state: "unavailable" })),
-      chatSettingsFor(pubkey, channelId, threadRootId, runtime, profile),
+      chatSettingsFor(pubkey, channelId, threadRootId, runtime, profile, isSandboxed(m)),
     ]);
     return { state: reply.state ?? "unavailable", chat };
   },
@@ -809,6 +861,7 @@ const methods = {
     checkPubkey(pubkey);
     const m = await meta(pubkey);
     const next = { ...m, desktop: enabled === true };
+    if (next.desktop) assertSandboxRestrictions(next);
     await saveMeta(pubkey, next);
     if (!next.desktop) await desktop.stop(pubkey);
     if (m.activated && next.desktop !== (m.desktop === true)) {
@@ -881,11 +934,12 @@ const methods = {
     checkPubkey(pubkey);
     const m = await meta(pubkey);
     const nextEnabled = enabled === true;
+    const next = { ...m, orchestrate: nextEnabled };
     if (nextEnabled) {
+      assertSandboxRestrictions(next);
       // Best-effort: prepare Hermes plugin so Hermes Solo-chat workers work.
       await ensureSessionEnv(m.profile || "").catch(() => {});
     }
-    const next = { ...m, orchestrate: nextEnabled };
     await saveMeta(pubkey, next);
     if (m.activated && next.orchestrate !== (m.orchestrate === true)) {
       await writeRuntimeEnv(pubkey, next);
@@ -924,6 +978,7 @@ const methods = {
   async remove(config, { pubkey }) {
     checkPubkey(pubkey);
     await systemctl("disable", "--now", unit(pubkey)).catch(() => {});
+    await runnerManager.cleanupAgent(pubkey).catch(() => {});
     await orchestrator.forget(pubkey).catch(() => {});
     await desktop.stop(pubkey).catch(() => {});
     await fs.rm(dir(pubkey), { recursive: true, force: true });
@@ -1032,6 +1087,15 @@ const attention = createAttention({
   runDir: RUN_DIR,
   extra: [memory, orchestrator, hermesHostExtra],
 });
+const runnerManager = createRunnerManager({
+  dataDir: DATA,
+  runDir: RUN_DIR,
+  workDir: WORK,
+  libDir: LIB,
+  homeDir: HOME,
+  callTool: (pubkey, name, args) => attention.callTool(pubkey, name, args),
+  isAttentionEnabled: async (pubkey) => (await attention.load(pubkey)).record.attentionEnabled,
+});
 // Event watches: one relay connection per agent that has any, fed to Attention.
 const watcher = createRelayWatcher({
   dataDir: DATA,
@@ -1044,11 +1108,17 @@ attention.relay = watcher;
 await attention.start();
 for (const pubkey of await attention.enabledAgents())
   watcher.sync(pubkey, (await attention.load(pubkey)).record);
-// Agents set up before the "buzz" MCP server (memory, 2026-11-17) still name
-// mcp/attention, or nothing: rewrite their runtime.env once and restart them.
+const allAgentMetas = [];
 for (const name of (await fs.readdir(DATA).catch(() => [])).filter((n) => HEX64.test(n))) {
   const m = await meta(name).catch(() => undefined);
-  if (!m?.activated) continue;
+  if (m) allAgentMetas.push(m);
+}
+await runnerManager.reconcileOnStartup(allAgentMetas);
+// Agents set up before the "buzz" MCP server (memory, 2026-11-17) still name
+// mcp/attention, or nothing: rewrite their runtime.env once and restart them.
+for (const m of allAgentMetas) {
+  const name = m.pubkey;
+  if (!m?.activated || isSandboxed(m)) continue;
   const env = await fs.readFile(path.join(dir(name), "runtime.env"), "utf8").catch(() => "");
   if (env.includes(path.join(dir(name), "mcp", "buzz"))) continue;
   try {
@@ -1142,6 +1212,7 @@ async function shutdown(signal) {
   closing = true;
   console.log(`buzz-host shutting down (${signal})`);
   server.close();
+  await runnerManager.close().catch(() => {});
   await orchestrator.close().catch(() => {});
   process.exit(0);
 }

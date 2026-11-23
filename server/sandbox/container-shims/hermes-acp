@@ -1,0 +1,4 @@
+#!/bin/sh
+# Sandboxed Hermes ACP shim (talks to OpenCode Go through the host-side credential proxy).
+export HERMES_ACP_SKIP_CONFIGURED_MCP="${HERMES_ACP_SKIP_CONFIGURED_MCP:-1}"
+exec /opt/buzz-host/bin/acp-proxy /usr/local/bin/hermes-acp

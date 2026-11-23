@@ -1,0 +1,3 @@
+#!/bin/sh
+# Sandboxed Claude Code ACP shim (named like the adapter so buzz-acp applies Claude defaults).
+exec /opt/buzz-host/bin/acp-proxy claude-agent-acp
