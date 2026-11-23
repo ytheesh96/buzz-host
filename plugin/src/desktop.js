@@ -718,10 +718,17 @@ export function createDesktop({ React, client, ctx, uiKit, Btn, Icon, navigation
           },
           h(
             "header",
-            { "data-buzz-ui": "", className: "panel-header" },
+            {
+              "data-buzz-ui": "",
+              className: "panel-header",
+              style: { flexWrap: "nowrap", gap: "var(--space-2)" },
+            },
             h(
               "div",
-              { className: "panel-header-title", style: { display: "flex", alignItems: "center", gap: "var(--space-2)", minWidth: 0 } },
+              {
+                className: "panel-header-title",
+                style: { display: "flex", alignItems: "center", gap: "var(--space-2)", minWidth: 0, flex: "1 1 0", overflow: "hidden" },
+              },
               h(
                 Btn,
                 {
@@ -731,6 +738,7 @@ export function createDesktop({ React, client, ctx, uiKit, Btn, Icon, navigation
                   title: sidebarOpen ? "Hide agent list" : "Show agent list",
                   "aria-label": sidebarOpen ? "Hide agent list" : "Show agent list",
                   "aria-pressed": sidebarOpen,
+                  style: { flexShrink: 0 },
                 },
                 Icon ? h(Icon, { name: "sidebar", size: 16 }) : sidebarOpen ? "Hide list" : "Show list",
               ),
@@ -777,6 +785,7 @@ export function createDesktop({ React, client, ctx, uiKit, Btn, Icon, navigation
                       padding: "2px 8px",
                       borderRadius: 999,
                       whiteSpace: "nowrap",
+                      flexShrink: 0,
                       fontWeight: 500,
                       background: view.mine
                         ? "var(--accent-subtle, rgba(34,197,94,.16))"
@@ -789,7 +798,10 @@ export function createDesktop({ React, client, ctx, uiKit, Btn, Icon, navigation
             ),
             h(
               "div",
-              { className: "panel-header-actions", style: { display: "flex", alignItems: "center", gap: "var(--space-2)" } },
+              {
+                className: "panel-header-actions",
+                style: { display: "flex", alignItems: "center", gap: "var(--space-1)", flexWrap: "nowrap", flexShrink: 0 },
+              },
               view.status === "live" &&
                 (view.mine
                   ? h(
@@ -821,8 +833,8 @@ export function createDesktop({ React, client, ctx, uiKit, Btn, Icon, navigation
                 desktopRunning &&
                 h(
                   Btn,
-                  { size: "sm", variant: "ghost", disabled: working, onClick: () => void handleStopDesktop() },
-                  actionBusy === "stop" ? "Stopping…" : "Stop desktop",
+                  { size: "sm", variant: "ghost", disabled: working, title: "Stop desktop", onClick: () => void handleStopDesktop() },
+                  actionBusy === "stop" ? "Stopping…" : "Stop",
                 ),
               canInspect &&
                 h(
@@ -834,6 +846,7 @@ export function createDesktop({ React, client, ctx, uiKit, Btn, Icon, navigation
                     title: showInspector ? `Hide ${activeName} sidebar` : `Show ${activeName} sidebar`,
                     "aria-label": showInspector ? `Hide ${activeName} sidebar` : `Show ${activeName} sidebar`,
                     "aria-pressed": showInspector,
+                    style: { flexShrink: 0 },
                   },
                   Icon ? h(Icon, { name: "sidebarRight", size: 16 }) : showInspector ? "Hide sidebar" : "Show sidebar",
                 ),
