@@ -2,7 +2,7 @@
 // CLI for managing buzz-host guest access tokens directly on the host.
 //
 // Usage:
-//   buzz-host-tokens create --label Alice [--owner <64-hex>] [--max-agents 2] [--max-concurrency 2] [--runtimes hermes,claude,antigravity]
+//   buzz-host-tokens create --label Alice [--owner <64-hex>] [--max-agents 2] [--max-concurrency 2] [--runtimes hermes,claude,antigravity] [--allow-host-desktop]
 //   buzz-host-tokens list
 //   buzz-host-tokens revoke <tok_...>
 
@@ -63,12 +63,14 @@ try {
             .map((s) => s.trim())
             .filter(Boolean)
         : undefined;
+    const allowHostDesktop = Boolean(flags["allow-host-desktop"] || flags.trusted);
     const { token, record } = await store.create({
       label: flags.label ?? rest[0],
       ownerPubkey: flags.owner,
       maxAgents: flags["max-agents"],
       maxConcurrency: flags["max-concurrency"],
       allowedRuntimes,
+      allowHostDesktop,
     });
     const baseUrl =
       typeof flags.url === "string" && flags.url.trim() ? flags.url.trim() : await publicGuestUrl();
@@ -77,7 +79,9 @@ try {
       console.log(JSON.stringify({ token, inviteUrl, record }, null, 2));
     } else {
       console.log(`Created guest token ${record.id} for "${record.label}"`);
-      console.log(`Limits: maxAgents=${record.maxAgents}, maxConcurrency=${record.maxConcurrency}, runtimes=${record.allowedRuntimes.join(",")}`);
+      console.log(
+        `Limits: maxAgents=${record.maxAgents}, maxConcurrency=${record.maxConcurrency}, runtimes=${record.allowedRuntimes.join(",")}, hostDesktop=${record.allowHostDesktop ? "yes (trusted)" : "no"}`,
+      );
       if (record.ownerPubkey) console.log(`Bound owner: ${record.ownerPubkey}`);
       else console.log("Bound owner: (will bind automatically on first agent activation)");
       console.log(`\nToken (shown once):      ${token}`);
@@ -93,7 +97,7 @@ try {
       for (const t of tokens) {
         const status = t.revokedAt ? `REVOKED (${t.revokedAt})` : "active";
         console.log(
-          `${t.id}  ${t.label}  [${status}]  owner=${t.ownerPubkey ? t.ownerPubkey.slice(0, 12) + "…" : "unbound"}  caps=${t.maxAgents}a/${t.maxConcurrency}c  runtimes=${t.allowedRuntimes.join(",")}`,
+          `${t.id}  ${t.label}  [${status}]  owner=${t.ownerPubkey ? t.ownerPubkey.slice(0, 12) + "…" : "unbound"}  caps=${t.maxAgents}a/${t.maxConcurrency}c  runtimes=${t.allowedRuntimes.join(",")}${t.allowHostDesktop ? "  hostDesktop=yes" : ""}`,
         );
       }
     }

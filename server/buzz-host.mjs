@@ -44,6 +44,8 @@ import {
   createAuthRateLimiter,
   createTokenStore,
   enforceGuestSettings,
+  findIdleGuestDesktops,
+  isValidDesktopTicket,
 } from "./auth.mjs";
 
 const run = promisify(execFile);
@@ -168,6 +170,11 @@ async function loadConfig() {
     // Ignores Tailscale-User-Login headers completely and requires a guest token.
     guestPort: raw.guestPort ?? 8467,
     publicGuestUrl: raw.publicGuestUrl ?? "wss://omarchy.tail65c5a9.ts.net/_buzz-host",
+    maxGuestDesktops: Number.isInteger(raw.maxGuestDesktops) && raw.maxGuestDesktops >= 0 ? raw.maxGuestDesktops : 1,
+    guestDesktopIdleMs:
+      Number.isFinite(raw.guestDesktopIdleMs) && raw.guestDesktopIdleMs >= 0
+        ? raw.guestDesktopIdleMs
+        : 15 * 60_000,
     allowLogins: new Set(raw.allowLogins),
     allowOrigins: new Set(
       raw.allowOrigins ?? [
@@ -547,7 +554,58 @@ const UNSERIALIZED = new Set([
 // plugin's full-screen view over /desktop. A view ticket is single-use and short-
 // lived; its viewer id is the lease capability for that viewing session.
 const VIEW_TICKET_MS = 60_000;
-const viewTickets = new Map(); // ticket -> { pubkey, viewer, expires }
+const viewTickets = new Map(); // ticket -> { pubkey, viewer, expires, role, tokenId }
+const activeDesktopViewers = new Map(); // pubkey -> live RFB viewer count
+const desktopLastActivity = new Map(); // pubkey -> timestamp ms
+function touchDesktop(pubkey) {
+  desktopLastActivity.set(pubkey, Date.now());
+}
+function trackViewer(pubkey, socket) {
+  activeDesktopViewers.set(pubkey, (activeDesktopViewers.get(pubkey) ?? 0) + 1);
+  touchDesktop(pubkey);
+  let closed = false;
+  socket.on("close", () => {
+    if (closed) return;
+    closed = true;
+    const next = (activeDesktopViewers.get(pubkey) ?? 1) - 1;
+    if (next <= 0) activeDesktopViewers.delete(pubkey);
+    else activeDesktopViewers.set(pubkey, next);
+    touchDesktop(pubkey);
+  });
+}
+async function assertGuestDesktopCapacity(cfg, pubkey, m) {
+  if (!m?.createdByTokenId) return;
+  if (desktop.status(pubkey).running) return;
+  const max = cfg.maxGuestDesktops ?? 1;
+  const metas = await listAllMetas();
+  let running = 0;
+  for (const item of metas) {
+    if (item.createdByTokenId && item.pubkey !== pubkey && desktop.status(item.pubkey).running) {
+      running++;
+    }
+  }
+  if (running >= max) {
+    throw new Error(
+      `The server is at its guest desktop limit (${running}/${max} running). Stop another desktop or try again later.`,
+    );
+  }
+}
+async function stopIdleGuestDesktops(cfg) {
+  if (!cfg.guestDesktopIdleMs) return;
+  const metas = await listAllMetas();
+  const idle = findIdleGuestDesktops({
+    metas,
+    isRunning: (pubkey) => desktop.status(pubkey).running,
+    activeViewers: (pubkey) => activeDesktopViewers.get(pubkey) ?? 0,
+    lastActivityAt: (pubkey) => Math.max(desktop.lastUse(pubkey)?.at ?? 0, desktopLastActivity.get(pubkey) ?? 0),
+    idleMs: cfg.guestDesktopIdleMs,
+  });
+  for (const pubkey of idle) {
+    console.log(`guest desktop idle stop: agent=${pubkey.slice(0, 8)}`);
+    desktopLastActivity.delete(pubkey);
+    await desktop.stop(pubkey).catch(() => {});
+  }
+}
 function desktopView(pubkey) {
   const st = desktop.status(pubkey);
   return { ...st, rfbSocket: undefined, cuaSocket: undefined, lastUse: desktop.lastUse(pubkey) };
@@ -608,6 +666,7 @@ const methods = {
       maxAgents: record.maxAgents,
       maxConcurrency: record.maxConcurrency,
       allowedRuntimes: record.allowedRuntimes,
+      allowHostDesktop: record.allowHostDesktop === true,
     };
     session.registerTokenSocket?.(record.id);
     console.log(`guest authenticated: ${record.label} (${record.id})`);
@@ -633,7 +692,11 @@ const methods = {
       runnerManager.availableRunners(),
     ]);
     const runtimes = allowedSet ? allRuntimes.filter((r) => allowedSet.has(r.id)) : allRuntimes;
-    const runners = isGuest ? allRunners.filter((r) => r.id === "docker") : allRunners;
+    const runners = isGuest
+      ? session.limits?.allowHostDesktop
+        ? allRunners.filter((r) => r.id === "host" || r.id === "docker")
+        : allRunners.filter((r) => r.id === "docker")
+      : allRunners;
     return {
       version: VERSION,
       host: os.hostname(),
@@ -664,10 +727,14 @@ const methods = {
         throw new Error(`Agent limit reached (${existing.length}/${maxAgents} agents for this guest token)`);
       }
     }
+    const defaultGuestRunner =
+      session?.limits?.allowHostDesktop && (settings?.respondTo ?? "owner-only") === "owner-only"
+        ? "host"
+        : "docker";
     const rawSettings = isGuest
       ? {
           ...settings,
-          runner: settings?.runner || "docker",
+          runner: settings?.runner || defaultGuestRunner,
           concurrency: settings?.concurrency ?? session.limits?.maxConcurrency ?? 2,
         }
       : settings;
@@ -990,33 +1057,36 @@ const methods = {
   // Stops it and deletes its key. Already gone counts as removed.
   // The agent's desktop. `enabled` is the owner's choice (computer tools in
   // the agent's sessions); the desktop itself starts on first use.
-  async "desktop.status"(config, { pubkey }) {
-    checkPubkey(pubkey);
-    const m = await meta(pubkey);
+  async "desktop.status"(config, { pubkey }, session) {
+    const m = await ownedMeta(pubkey, session);
     return { enabled: m.desktop === true, ...desktopView(pubkey) };
   },
-  async "desktop.set"(config, { pubkey, enabled }) {
-    checkPubkey(pubkey);
-    const m = await meta(pubkey);
+  async "desktop.set"(config, { pubkey, enabled }, session) {
+    const m = await ownedMeta(pubkey, session);
     const next = { ...m, desktop: enabled === true };
     if (next.desktop) assertSandboxRestrictions(next);
     await saveMeta(pubkey, next);
-    if (!next.desktop) await desktop.stop(pubkey);
+    if (!next.desktop) {
+      desktopLastActivity.delete(pubkey);
+      await desktop.stop(pubkey);
+    }
     if (m.activated && next.desktop !== (m.desktop === true)) {
       await writeRuntimeEnv(pubkey, next);
       await systemctl("restart", unit(pubkey));
     }
     return { enabled: next.desktop, ...desktopView(pubkey) };
   },
-  async "desktop.start"(config, { pubkey }) {
-    checkPubkey(pubkey);
-    if ((await meta(pubkey)).desktop !== true) throw new Error("This agent has no desktop; turn it on first");
+  async "desktop.start"(config, { pubkey }, session) {
+    const m = await ownedMeta(pubkey, session);
+    if (m.desktop !== true) throw new Error("This agent has no desktop; turn it on first");
+    await assertGuestDesktopCapacity(config, pubkey, m);
     await desktop.start(pubkey);
+    touchDesktop(pubkey);
     return { enabled: true, ...desktopView(pubkey) };
   },
-  async "desktop.stop"(config, { pubkey }) {
-    checkPubkey(pubkey);
-    await meta(pubkey);
+  async "desktop.stop"(config, { pubkey }, session) {
+    await ownedMeta(pubkey, session);
+    desktopLastActivity.delete(pubkey);
     await desktop.stop(pubkey);
     return desktopView(pubkey);
   },
@@ -1025,10 +1095,9 @@ const methods = {
   // Never starts the desktop.
   // `since` (ms): no picture unless a computer tool was used since then.
   // `etag`: no picture when it has not changed since that one.
-  async "desktop.snapshot"(config, { pubkey, width, since, etag, channelId, threadRootId }) {
-    checkPubkey(pubkey);
+  async "desktop.snapshot"(config, { pubkey, width, since, etag, channelId, threadRootId }, session) {
     if (channelId != null) checkPlace(channelId, threadRootId);
-    const m = await meta(pubkey);
+    const m = await ownedMeta(pubkey, session);
     if (m.desktop !== true) return { enabled: false };
     const st = desktop.status(pubkey);
     const place = channelId ? { channelId, threadRootId: threadRootId || undefined } : undefined;
@@ -1043,22 +1112,31 @@ const methods = {
   },
   // A ticket for one /desktop connection, and the viewer id that connection
   // takes over with. Starts the desktop if it is not running.
-  async "desktop.view"(config, { pubkey }) {
-    checkPubkey(pubkey);
-    if ((await meta(pubkey)).desktop !== true) throw new Error("This agent has no desktop; turn it on first");
+  async "desktop.view"(config, { pubkey }, session) {
+    const m = await ownedMeta(pubkey, session);
+    if (m.desktop !== true) throw new Error("This agent has no desktop; turn it on first");
+    await assertGuestDesktopCapacity(config, pubkey, m);
     await desktop.start(pubkey);
+    touchDesktop(pubkey);
     const now = Date.now();
     for (const [t, v] of viewTickets) if (v.expires < now) viewTickets.delete(t);
     const ticket = randomBytes(24).toString("base64url");
     const viewer = randomBytes(24).toString("base64url");
-    viewTickets.set(ticket, { pubkey, viewer, expires: now + VIEW_TICKET_MS });
+    viewTickets.set(ticket, {
+      pubkey,
+      viewer,
+      expires: now + VIEW_TICKET_MS,
+      role: session?.role ?? "admin",
+      tokenId: session?.tokenId ?? null,
+    });
     return { ticket, viewer, path: `/desktop?ticket=${ticket}`, ...desktopView(pubkey) };
   },
   // take: true = Take over (this viewer drives; the agent is refused),
   // false = Hand back. Only the viewer that holds it can hand it back.
-  async "desktop.lease"(config, { pubkey, viewer, take, reason }) {
-    checkPubkey(pubkey);
+  async "desktop.lease"(config, { pubkey, viewer, take, reason }, session) {
+    await ownedMeta(pubkey, session);
     if (typeof viewer !== "string" || viewer.length < 16) throw new Error("viewer is required");
+    touchDesktop(pubkey);
     const leaseDir = desktop.desktopDir(pubkey);
     const lease = take
       ? leaseAcquire(leaseDir, viewer, typeof reason === "string" ? reason.slice(0, 200) : "")
@@ -1114,13 +1192,14 @@ const methods = {
   },
 
   // Admin-only guest token management (multi-tenant hosting).
-  async "tokens.create"(config, { label, ownerPubkey, maxAgents, maxConcurrency, allowedRuntimes }) {
+  async "tokens.create"(config, { label, ownerPubkey, maxAgents, maxConcurrency, allowedRuntimes, allowHostDesktop }) {
     const { token, record } = await tokenStore.create({
       label,
       ownerPubkey,
       maxAgents,
       maxConcurrency,
       allowedRuntimes,
+      allowHostDesktop: allowHostDesktop === true,
     });
     return {
       token,
@@ -1149,6 +1228,16 @@ const methods = {
         } catch {}
       }
       guestSockets.delete(record.id);
+    }
+    for (const [t, v] of viewTickets) {
+      if (v.tokenId === record.id) viewTickets.delete(t);
+    }
+    const metas = await listAllMetas();
+    for (const m of metas) {
+      if (m.createdByTokenId === record.id || (record.ownerPubkey && m.owner === record.ownerPubkey)) {
+        desktopLastActivity.delete(m.pubkey);
+        await desktop.stop(m.pubkey).catch(() => {});
+      }
     }
     return { record };
   },
@@ -1390,10 +1479,11 @@ server.on("upgrade", (req, socket) => {
     const ticket = url.searchParams.get("ticket") ?? "";
     const view = viewTickets.get(ticket);
     viewTickets.delete(ticket);
-    if (!view || view.expires < Date.now()) return refuse("403 Forbidden", "desktop ticket");
+    if (!isValidDesktopTicket(view, "admin")) return refuse("403 Forbidden", "desktop ticket");
     const st = desktop.status(view.pubkey);
     if (!st.running) return refuse("409 Conflict", "desktop not running");
     acceptUpgrade(req, socket);
+    trackViewer(view.pubkey, socket);
     console.log(`desktop view: ${login} agent=${view.pubkey.slice(0, 8)}`);
     const leaseDir = desktop.desktopDir(view.pubkey);
     rfbBridge(socket, { rfbSocket: st.rfbSocket, leaseDir, viewerId: view.viewer });
@@ -1425,71 +1515,123 @@ server.listen(config.port, "127.0.0.1", () =>
 );
 
 // Dedicated guest-only listener (for Tailscale Funnel /_buzz-host).
-// NEVER trusts Tailscale-User-Login headers and NEVER serves /desktop.
+// NEVER trusts Tailscale-User-Login headers. Serves /desktop only for valid,
+// single-use guest tickets minted by an authenticated trusted token.
 let guestServer = null;
 if (Number.isInteger(config.guestPort) && config.guestPort > 0) {
   guestServer = createServer((req, res) => {
     res.writeHead(req.url === "/health" ? 200 : 404, { "content-type": "text/plain" });
     res.end(req.url === "/health" ? "ok\n" : "not found\n");
   });
-  guestServer.on("upgrade", (req, socket) => {
+  guestServer.on("upgrade", async (req, socket) => {
     const origin = req.headers.origin;
     const refuse = (code, why) => {
       console.warn(`guest refused ${code}: ${why} (origin=${origin ?? "-"})`);
       socket.end(`HTTP/1.1 ${code}\r\nConnection: close\r\n\r\n`);
     };
-    if (origin && !config.allowOrigins.has(origin)) return refuse("403 Forbidden", "origin");
-    const key = req.headers["sec-websocket-key"];
-    if (!key || req.headers.upgrade?.toLowerCase() !== "websocket")
-      return refuse("400 Bad Request", "not a websocket");
-    const accept = createHash("sha1").update(key + GUID).digest("base64");
-    socket.write(
-      "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" +
-        `Sec-WebSocket-Accept: ${accept}\r\n\r\n`,
-    );
-    const remoteAddress =
-      String(req.headers["x-forwarded-for"] || "").split(",")[0].trim() ||
-      req.socket.remoteAddress ||
-      "unknown";
-    let registeredTokenId = null;
-    const session = {
-      authenticated: false,
-      role: "guest",
-      tokenId: null,
-      label: null,
-      ownerPubkey: null,
-      limits: null,
-      remoteAddress,
-      registerTokenSocket(tokenId) {
-        registeredTokenId = tokenId;
-        let set = guestSockets.get(tokenId);
+    try {
+      if (origin && !config.allowOrigins.has(origin)) return refuse("403 Forbidden", "origin");
+      const key = req.headers["sec-websocket-key"];
+      if (!key || req.headers.upgrade?.toLowerCase() !== "websocket")
+        return refuse("400 Bad Request", "not a websocket");
+      const url = new URL(req.url ?? "/", "http://localhost");
+      if (url.pathname === "/desktop") {
+        const ticket = url.searchParams.get("ticket") ?? "";
+        const view = viewTickets.get(ticket);
+        viewTickets.delete(ticket);
+        if (!isValidDesktopTicket(view, "guest")) return refuse("403 Forbidden", "desktop ticket");
+        const tokenRecord = await tokenStore.getById(view.tokenId);
+        if (!tokenRecord || tokenRecord.revokedAt || !tokenRecord.allowHostDesktop) {
+          return refuse("403 Forbidden", "desktop not permitted");
+        }
+        const st = desktop.status(view.pubkey);
+        if (!st.running) return refuse("409 Conflict", "desktop not running");
+        acceptUpgrade(req, socket);
+        let set = guestSockets.get(view.tokenId);
         if (!set) {
           set = new Set();
-          guestSockets.set(tokenId, set);
+          guestSockets.set(view.tokenId, set);
         }
         set.add(socket);
-      },
-    };
-    socket.on("close", () => {
-      if (registeredTokenId) {
-        const set = guestSockets.get(registeredTokenId);
-        set?.delete(socket);
-        if (set && set.size === 0) guestSockets.delete(registeredTokenId);
+        trackViewer(view.pubkey, socket);
+        console.log(`guest desktop view: ${tokenRecord.label} (${view.tokenId}) agent=${view.pubkey.slice(0, 8)}`);
+        const leaseDir = desktop.desktopDir(view.pubkey);
+        rfbBridge(socket, { rfbSocket: st.rfbSocket, leaseDir, viewerId: view.viewer });
+        socket.on("close", () => {
+          const activeSet = guestSockets.get(view.tokenId);
+          activeSet?.delete(socket);
+          if (activeSet && activeSet.size === 0) guestSockets.delete(view.tokenId);
+          try {
+            leaseRelease(leaseDir, { viewerId: view.viewer });
+          } catch {}
+        });
+        return;
       }
-    });
-    console.log(`guest socket connected: remote=${remoteAddress} origin=${origin ?? "-"}`);
-    attachRpcSocket(socket, session);
+      const accept = createHash("sha1").update(key + GUID).digest("base64");
+      socket.write(
+        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" +
+          `Sec-WebSocket-Accept: ${accept}\r\n\r\n`,
+      );
+      const remoteAddress =
+        String(req.headers["x-forwarded-for"] || "").split(",")[0].trim() ||
+        req.socket.remoteAddress ||
+        "unknown";
+      let registeredTokenId = null;
+      const session = {
+        authenticated: false,
+        role: "guest",
+        tokenId: null,
+        label: null,
+        ownerPubkey: null,
+        limits: null,
+        remoteAddress,
+        registerTokenSocket(tokenId) {
+          registeredTokenId = tokenId;
+          let set = guestSockets.get(tokenId);
+          if (!set) {
+            set = new Set();
+            guestSockets.set(tokenId, set);
+          }
+          set.add(socket);
+        },
+      };
+      socket.on("close", () => {
+        if (registeredTokenId) {
+          const set = guestSockets.get(registeredTokenId);
+          set?.delete(socket);
+          if (set && set.size === 0) guestSockets.delete(registeredTokenId);
+        }
+      });
+      console.log(`guest socket connected: remote=${remoteAddress} origin=${origin ?? "-"}`);
+      attachRpcSocket(socket, session);
+    } catch (error) {
+      console.error(`guest upgrade error: ${error.message}`);
+      try {
+        refuse("500 Internal Server Error", "upgrade error");
+      } catch {}
+    }
   });
   guestServer.listen(config.guestPort, "127.0.0.1", () =>
     console.log(`buzz-host guest listening on 127.0.0.1:${config.guestPort}`),
   );
 }
 
+const idleSweepTimer =
+  config.guestDesktopIdleMs > 0
+    ? setInterval(() => {
+        void stopIdleGuestDesktops(config).catch((error) =>
+          console.error(`guest desktop idle sweep failed: ${error.message}`),
+        );
+      }, 60_000)
+    : null;
+idleSweepTimer?.unref();
+
 let closing = false;
 async function shutdown(signal) {
   if (closing) return;
   closing = true;
   console.log(`buzz-host shutting down (${signal})`);
+  if (idleSweepTimer) clearInterval(idleSweepTimer);
   server.close();
   guestServer?.close();
   await runnerManager.close().catch(() => {});

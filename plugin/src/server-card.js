@@ -18,6 +18,7 @@ export function createServerCard({ React, client, uiKit }) {
     const [ownerPubkey, setOwnerPubkey] = React.useState("");
     const [maxAgents, setMaxAgents] = React.useState("2");
     const [maxConcurrency, setMaxConcurrency] = React.useState("2");
+    const [allowHostDesktop, setAllowHostDesktop] = React.useState(false);
     const [busy, setBusy] = React.useState(false);
     const [error, setError] = React.useState("");
     const [created, setCreated] = React.useState(null);
@@ -55,10 +56,12 @@ export function createServerCard({ React, client, uiKit }) {
           ...(ownerPubkey.trim() ? { ownerPubkey: ownerPubkey.trim() } : {}),
           maxAgents: Number(maxAgents) || 2,
           maxConcurrency: Number(maxConcurrency) || 2,
+          allowHostDesktop,
         });
         setCreated(res);
         setLabel("");
         setOwnerPubkey("");
+        setAllowHostDesktop(false);
         await refresh();
       } catch (e) {
         setError(String(e.message ?? e));
@@ -164,6 +167,34 @@ export function createServerCard({ React, client, uiKit }) {
         ),
       ),
       h(
+        "label",
+        {
+          style: {
+            display: "flex",
+            gap: "var(--space-2)",
+            alignItems: "flex-start",
+            cursor: busy ? "default" : "pointer",
+          },
+        },
+        h("input", {
+          type: "checkbox",
+          checked: allowHostDesktop,
+          disabled: busy,
+          onChange: (e) => setAllowHostDesktop(e.target.checked),
+          style: { marginTop: "3px" },
+        }),
+        h(
+          "div",
+          { style: { display: "grid", gap: "2px" } },
+          h("span", { style: { fontWeight: 500 } }, "Allow remote desktop (trusted — runs on host)"),
+          h(
+            Note,
+            null,
+            "Only for people you trust on this machine. Lets them run owner-only agents on the host and open Viewport Remote Desktop.",
+          ),
+        ),
+      ),
+      h(
         "div",
         { style: { display: "flex", gap: "var(--space-2)" } },
         h(
@@ -244,7 +275,9 @@ export function createServerCard({ React, client, uiKit }) {
                     h(
                       Note,
                       null,
-                      `${t.agentCount ?? 0}/${t.maxAgents} agents · max ${t.maxConcurrency} parallel · ${t.allowedRuntimes.join(", ")} · ${
+                      `${t.agentCount ?? 0}/${t.maxAgents} agents · max ${t.maxConcurrency} parallel · ${t.allowedRuntimes.join(", ")}${
+                        t.allowHostDesktop ? " · host desktop (trusted)" : ""
+                      } · ${
                         t.ownerPubkey ? `bound ${t.ownerPubkey.slice(0, 10)}…` : "unbound (binds on first agent)"
                       }`,
                     ),
@@ -290,6 +323,10 @@ export function createServerCard({ React, client, uiKit }) {
       const parsed = parseInviteInput(rawUrl);
       const cleanUrl = (parsed.url || DEFAULT_URL).trim();
       const cleanToken = (parsed.token ?? overrideToken ?? token).trim();
+      if (!cleanUrl) {
+        setNotice("Paste your server URL or invite link above, then click Save and check.");
+        return;
+      }
       if (parsed.token) {
         setUrl(cleanUrl);
         setToken(cleanToken);
@@ -325,7 +362,11 @@ export function createServerCard({ React, client, uiKit }) {
           label: "Server (or paste invite link)",
           hint: "Admin: your wss:// tailscale serve address. Guest: paste the invite link from your host.",
         },
-        h(Text, { value: url, onChange: (e) => handleUrlChange(e.target.value) }),
+        h(Text, {
+          value: url,
+          placeholder: "wss://host.example/_buzz-host#token=bhg_…",
+          onChange: (e) => handleUrlChange(e.target.value),
+        }),
       ),
       h(
         Row,
@@ -375,7 +416,9 @@ export function createServerCard({ React, client, uiKit }) {
           Note,
           null,
           (isGuest
-            ? `Guest account: ${info.hello.label} · ${info.list.agents.length}/${info.hello.limits?.maxAgents ?? 2} agents · max ${info.hello.limits?.maxConcurrency ?? 2} parallel chats\n`
+            ? `Guest account: ${info.hello.label} · ${info.list.agents.length}/${info.hello.limits?.maxAgents ?? 2} agents · max ${info.hello.limits?.maxConcurrency ?? 2} parallel chats${
+                info.hello.limits?.allowHostDesktop ? " · remote desktop enabled" : ""
+              }\n`
             : "") +
             `Host ${info.hello.host}${info.hello.role ? ` (${info.hello.role})` : ""} · runtimes: ${info.hello.runtimes
               .map((r) => `${r.title}${r.available ? "" : " (missing)"}`)

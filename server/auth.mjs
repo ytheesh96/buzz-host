@@ -29,7 +29,7 @@ export const DEFAULT_GUEST_MAX_CONCURRENCY = 2;
 export const DEFAULT_GUEST_RUNTIMES = ["hermes", "claude", "antigravity"];
 const VALID_RUNTIMES = new Set(["claude", "codex", "hermes", "antigravity"]);
 
-export const ADMIN_ONLY_METHODS = new Set([
+export const DESKTOP_METHODS = new Set([
   "desktop.status",
   "desktop.set",
   "desktop.start",
@@ -37,6 +37,9 @@ export const ADMIN_ONLY_METHODS = new Set([
   "desktop.snapshot",
   "desktop.view",
   "desktop.lease",
+]);
+
+export const ADMIN_ONLY_METHODS = new Set([
   "orchestrator.set",
   "orchestrator.tasks",
   "orchestrator.cancel",
@@ -103,6 +106,7 @@ export function publicTokenView(record) {
     maxAgents: record.maxAgents,
     maxConcurrency: record.maxConcurrency,
     allowedRuntimes: [...record.allowedRuntimes],
+    allowHostDesktop: record.allowHostDesktop === true,
     createdAt: record.createdAt,
     lastUsedAt: record.lastUsedAt || null,
     revokedAt: record.revokedAt || null,
@@ -149,12 +153,14 @@ export function createTokenStore({ filePath }) {
     maxAgents,
     maxConcurrency,
     allowedRuntimes,
+    allowHostDesktop = false,
   } = {}) {
     const cleanLabel = checkLabel(label);
     const cleanOwner = checkOptionalPubkey(ownerPubkey);
     const cleanMaxAgents = checkCap(maxAgents, DEFAULT_GUEST_MAX_AGENTS, 1, 20, "maxAgents");
     const cleanMaxConc = checkCap(maxConcurrency, DEFAULT_GUEST_MAX_CONCURRENCY, 1, 8, "maxConcurrency");
     const cleanRuntimes = checkAllowedRuntimes(allowedRuntimes, DEFAULT_GUEST_RUNTIMES);
+    const cleanAllowHostDesktop = allowHostDesktop === true;
 
     const token = `${TOKEN_PREFIX}${randomBytes(24).toString("hex")}`;
     const record = {
@@ -166,6 +172,7 @@ export function createTokenStore({ filePath }) {
       maxAgents: cleanMaxAgents,
       maxConcurrency: cleanMaxConc,
       allowedRuntimes: cleanRuntimes,
+      allowHostDesktop: cleanAllowHostDesktop,
       createdAt: new Date().toISOString(),
       lastUsedAt: null,
       revokedAt: null,
@@ -262,8 +269,14 @@ export function assertMethodAllowed(session, methodName) {
   if (!session?.authenticated) {
     throw new Error("Authentication required");
   }
-  if (session.role === "guest" && ADMIN_ONLY_METHODS.has(methodName)) {
-    throw new Error(`Method "${methodName}" is not permitted for guest accounts`);
+  if (session.role === "guest") {
+    if (DESKTOP_METHODS.has(methodName)) {
+      if (session.limits?.allowHostDesktop === true) return;
+      throw new Error(`Method "${methodName}" is not permitted for guest accounts`);
+    }
+    if (ADMIN_ONLY_METHODS.has(methodName)) {
+      throw new Error(`Method "${methodName}" is not permitted for guest accounts`);
+    }
   }
 }
 
@@ -274,20 +287,57 @@ export function enforceGuestSettings(session, settings) {
     maxAgents: DEFAULT_GUEST_MAX_AGENTS,
     maxConcurrency: DEFAULT_GUEST_MAX_CONCURRENCY,
     allowedRuntimes: DEFAULT_GUEST_RUNTIMES,
+    allowHostDesktop: false,
   };
   if (!limits.allowedRuntimes.includes(settings.runtime)) {
     throw new Error(`Runtime "${settings.runtime}" is not enabled for this guest token`);
   }
-  if (settings.runner === "host") {
-    throw new Error("Guest agents must run in a sandboxed runner (docker)");
+  const allowHostDesktop = limits.allowHostDesktop === true;
+  const respondTo = settings.respondTo || "owner-only";
+  let runner;
+  if (allowHostDesktop) {
+    if (settings.runner === "host" && respondTo !== "owner-only") {
+      throw new Error('Shared agents (respondTo != "owner-only") must use a sandboxed runner (docker)');
+    }
+    runner = respondTo !== "owner-only" ? "docker" : settings.runner || "host";
+  } else {
+    if (settings.runner === "host") {
+      throw new Error("Guest agents must run in a sandboxed runner (docker)");
+    }
+    runner = "docker";
   }
   const concurrency = Math.min(settings.concurrency, limits.maxConcurrency);
   return {
     ...settings,
-    runner: "docker",
+    runner,
     profile: "",
     concurrency,
   };
+}
+
+/** Whether a guest desktop ticket is valid for the given listener role ("admin" | "guest"). */
+export function isValidDesktopTicket(view, listenerRole, now = Date.now()) {
+  if (!view || typeof view !== "object") return false;
+  if (!Number.isFinite(view.expires) || view.expires < now) return false;
+  if (listenerRole === "admin") return view.role === "admin";
+  if (listenerRole === "guest") return view.role === "guest" && typeof view.tokenId === "string" && view.tokenId.length > 0;
+  return false;
+}
+
+/** Select running guest desktops that have exceeded `idleMs` with no active viewers. */
+export function findIdleGuestDesktops({ metas, isRunning, activeViewers, lastActivityAt, now = Date.now(), idleMs }) {
+  if (!Number.isFinite(idleMs) || idleMs <= 0) return [];
+  const idle = [];
+  for (const m of metas) {
+    if (!m?.createdByTokenId || !m.pubkey) continue;
+    if (!isRunning(m.pubkey)) continue;
+    if ((activeViewers(m.pubkey) || 0) > 0) continue;
+    const lastAt = lastActivityAt(m.pubkey);
+    if (Number.isFinite(lastAt) && now - lastAt >= idleMs) {
+      idle.push(m.pubkey);
+    }
+  }
+  return idle;
 }
 
 /** Simple sliding-window auth failure rate limiter (per remote address). */

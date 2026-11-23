@@ -99,6 +99,16 @@ function createClient() {
 		if (opening) return opening;
 		const url = storedUrl();
 		const token = storedToken();
+		if (!url) {
+			const error = /* @__PURE__ */ new Error("No buzz-host server configured yet. Open Settings → Plugins → Remote Agents and paste your server URL or invite link.");
+			set({
+				status: "idle",
+				url: "",
+				error: error.message,
+				session: null
+			});
+			return Promise.reject(error);
+		}
 		set({
 			status: "connecting",
 			url,

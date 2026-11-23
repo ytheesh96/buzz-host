@@ -15,6 +15,8 @@ import {
   createAuthRateLimiter,
   createTokenStore,
   enforceGuestSettings,
+  findIdleGuestDesktops,
+  isValidDesktopTicket,
 } from "./auth.mjs";
 
 const OWNER_A = "a".repeat(64);
@@ -179,4 +181,138 @@ test("buzz-host-tokens CLI creates, lists, and revokes tokens via --file", async
     execFileSync(process.execPath, [cli, "revoke", "--file", file, created.record.id, "--json"], { encoding: "utf8" }),
   ).record;
   assert.ok(revoked.revokedAt);
+
+  // --allow-host-desktop (and --trusted) opt-in flag
+  const trusted = JSON.parse(
+    execFileSync(
+      process.execPath,
+      [cli, "create", "--file", file, "--label", "Partner", "--allow-host-desktop", "--json"],
+      { encoding: "utf8" },
+    ),
+  );
+  assert.equal(trusted.record.allowHostDesktop, true);
+  assert.equal(created.record.allowHostDesktop, false);
+});
+
+test("trusted guest tokens allow host runner (owner-only) and desktop.* methods, while keeping admin-only and shared-agent invariants", async (t) => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "buzz-auth-desktop-"));
+  t.after(() => fs.rm(tmp, { recursive: true, force: true }));
+  const store = createTokenStore({ filePath: path.join(tmp, "tokens.json") });
+
+  const std = await store.create({ label: "Standard" });
+  const trusted = await store.create({ label: "Trusted", allowHostDesktop: true });
+  assert.equal(std.record.allowHostDesktop, false);
+  assert.equal(trusted.record.allowHostDesktop, true);
+  assert.equal((await store.verify(trusted.token)).allowHostDesktop, true);
+
+  const trustedSession = {
+    authenticated: true,
+    role: "guest",
+    tokenId: trusted.record.id,
+    ownerPubkey: OWNER_A,
+    limits: {
+      maxAgents: 2,
+      maxConcurrency: 2,
+      allowedRuntimes: ["hermes", "claude"],
+      allowHostDesktop: true,
+    },
+  };
+  const stdSession = {
+    ...trustedSession,
+    tokenId: std.record.id,
+    limits: { ...trustedSession.limits, allowHostDesktop: false },
+  };
+
+  // Trusted guest can call desktop.* methods, still blocked from admin-only methods.
+  for (const m of ["desktop.status", "desktop.set", "desktop.start", "desktop.stop", "desktop.snapshot", "desktop.view", "desktop.lease"]) {
+    assert.doesNotThrow(() => assertMethodAllowed(trustedSession, m));
+    assert.throws(() => assertMethodAllowed(stdSession, m), /not permitted for guest/);
+  }
+  for (const m of ["orchestrator.set", "hermes.profiles", "tokens.create", "tokens.list", "tokens.revoke"]) {
+    assert.throws(() => assertMethodAllowed(trustedSession, m), /not permitted for guest/);
+  }
+
+  // Trusted guest: owner-only allows host or docker; shared forces docker; profile always cleared.
+  const hostOwnerOnly = enforceGuestSettings(trustedSession, {
+    runtime: "claude",
+    model: "",
+    profile: "work",
+    concurrency: 4,
+    runner: "host",
+    respondTo: "owner-only",
+    respondToAllowlist: [],
+  });
+  assert.equal(hostOwnerOnly.runner, "host");
+  assert.equal(hostOwnerOnly.profile, "");
+  assert.equal(hostOwnerOnly.concurrency, 2);
+
+  const dockerOwnerOnly = enforceGuestSettings(trustedSession, {
+    runtime: "claude",
+    model: "",
+    profile: "",
+    concurrency: 1,
+    runner: "docker",
+    respondTo: "owner-only",
+    respondToAllowlist: [],
+  });
+  assert.equal(dockerOwnerOnly.runner, "docker");
+
+  // Shared agent on host runner MUST still be rejected even for trusted guests.
+  assert.throws(
+    () =>
+      enforceGuestSettings(trustedSession, {
+        runtime: "claude",
+        runner: "host",
+        respondTo: "anyone",
+        concurrency: 2,
+      }),
+    /sandboxed runner/,
+  );
+  const sharedDocker = enforceGuestSettings(trustedSession, {
+    runtime: "claude",
+    runner: "docker",
+    respondTo: "anyone",
+    concurrency: 2,
+  });
+  assert.equal(sharedDocker.runner, "docker");
+});
+
+test("desktop ticket validation isolates admin and guest listeners, and idle sweep targets only idle guest desktops", () => {
+  const now = 1_000_000;
+  const adminTicket = { pubkey: OWNER_A, viewer: "v1", expires: now + 30_000, role: "admin", tokenId: null };
+  const guestTicket = { pubkey: OWNER_A, viewer: "v2", expires: now + 30_000, role: "guest", tokenId: "tok_123456789abc" };
+  const expiredGuest = { ...guestTicket, expires: now - 1 };
+
+  assert.equal(isValidDesktopTicket(adminTicket, "admin", now), true);
+  assert.equal(isValidDesktopTicket(adminTicket, "guest", now), false);
+  assert.equal(isValidDesktopTicket(guestTicket, "guest", now), true);
+  assert.equal(isValidDesktopTicket(guestTicket, "admin", now), false);
+  assert.equal(isValidDesktopTicket(expiredGuest, "guest", now), false);
+  assert.equal(isValidDesktopTicket(null, "guest", now), false);
+
+  const metas = [
+    { pubkey: "1".repeat(64) }, // admin agent — never auto-stopped
+    { pubkey: "2".repeat(64), createdByTokenId: "tok_a" }, // running guest, active viewer -> keep
+    { pubkey: "3".repeat(64), createdByTokenId: "tok_b" }, // running guest, recent activity -> keep
+    { pubkey: "4".repeat(64), createdByTokenId: "tok_c" }, // running guest, idle past threshold -> stop
+    { pubkey: "5".repeat(64), createdByTokenId: "tok_d" }, // stopped guest -> skip
+  ];
+  const running = new Set(["1".repeat(64), "2".repeat(64), "3".repeat(64), "4".repeat(64)]);
+  const viewers = new Map([["2".repeat(64), 1]]);
+  const lastAt = new Map([
+    ["1".repeat(64), now - 999_999],
+    ["2".repeat(64), now - 999_999],
+    ["3".repeat(64), now - 5 * 60_000],
+    ["4".repeat(64), now - 16 * 60_000],
+  ]);
+
+  const idle = findIdleGuestDesktops({
+    metas,
+    isRunning: (p) => running.has(p),
+    activeViewers: (p) => viewers.get(p) ?? 0,
+    lastActivityAt: (p) => lastAt.get(p) ?? 0,
+    now,
+    idleMs: 15 * 60_000,
+  });
+  assert.deepEqual(idle, ["4".repeat(64)]);
 });

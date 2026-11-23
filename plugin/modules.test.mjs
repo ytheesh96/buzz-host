@@ -103,6 +103,25 @@ test("config helpers normalize drafts, recognize self-hosted agents, and fall ba
   assert.equal(constrained.concurrency, 2);
   assert.equal(constrained.respondTo, "anyone");
 
+  // Trusted guest (allowHostDesktop) may use host runner for owner-only agents, still docker for shared
+  const trustedGuestInfo = {
+    role: "guest",
+    limits: { maxAgents: 2, maxConcurrency: 2, allowedRuntimes: ["hermes", "claude"], allowHostDesktop: true },
+  };
+  const trustedOwnerOnly = applyGuestConstraints(
+    { ...EMPTY, runtime: "claude", profile: "work", concurrency: 4, runner: "host", respondTo: "owner-only" },
+    trustedGuestInfo,
+  );
+  assert.equal(trustedOwnerOnly.runner, "host");
+  assert.equal(trustedOwnerOnly.profile, "");
+  assert.equal(trustedOwnerOnly.concurrency, 2);
+
+  const trustedShared = applyGuestConstraints(
+    { ...EMPTY, runtime: "claude", concurrency: 2, runner: "host", respondTo: "anyone" },
+    trustedGuestInfo,
+  );
+  assert.equal(trustedShared.runner, "docker");
+
   // Admin draft is unchanged by applyGuestConstraints
   const adminDraft = { ...EMPTY, runtime: "codex", runner: "host", concurrency: 8 };
   assert.deepEqual(applyGuestConstraints(adminDraft, { role: "admin" }), adminDraft);
@@ -345,4 +364,16 @@ test("Hive Watch: src and bundled plugin.js expose the same API surface", () => 
 
 test("all plugin bundles match their sources via plugin/build.mjs --check", { skip: !hasRolldown && "no buzz-app rolldown" }, () => {
   execFileSync(process.execPath, [path.join(here, "build.mjs"), "--check", app], { stdio: "pipe" });
+});
+
+test("public build mode scrubs private tailnet hostname from Remote Agents and Viewport bundles", { skip: !hasRolldown && "no buzz-app rolldown" }, (t) => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "buzz-public-plugins-"));
+  t.after(() => fs.rmSync(tmp, { recursive: true, force: true }));
+  execFileSync(process.execPath, [path.join(here, "build.mjs"), "--public", "--out-public", tmp, app], { stdio: "pipe" });
+  for (const dir of ["remote-agents", "viewport"]) {
+    const bundle = fs.readFileSync(path.join(tmp, dir, "plugin.js"), "utf8");
+    assert.ok(bundle.length > 1000, `${dir} bundle should be non-empty`);
+    assert.ok(!/tail65c5a9\.ts\.net/i.test(bundle), `${dir} public bundle must not contain private tailnet hostname`);
+    assert.ok(bundle.includes('const DEFAULT_URL = ""'), `${dir} public bundle should scrub DEFAULT_URL to empty string`);
+  }
 });

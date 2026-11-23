@@ -3,7 +3,7 @@
 // Uses buzz-app's Rolldown, matching attention/build-core.mjs, memory/build-nip44.mjs,
 // plugin/build-markdown.mjs, and plugin/build-novnc.mjs.
 //
-//   node plugin/build.mjs [--check] [path-to-buzz-app]
+//   node plugin/build.mjs [--check] [--public --out-public <dir>] [path-to-buzz-app]
 //
 // Targets:
 //   - Remote Agents: plugin/src/index.js -> plugin/plugin.js
@@ -11,6 +11,9 @@
 //   - Hive Watch: plugins/hive-watch/src/index.js -> plugins/hive-watch/plugin.js
 //
 // Pass --check to verify all bundles match source without writing.
+// Pass --public --out-public <dir> to emit scrubbed public bundles (empty
+// DEFAULT_URL, no private tailnet hostname) for Remote Agents and Viewport into
+// <dir>/remote-agents/plugin.js and <dir>/viewport/plugin.js.
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -20,7 +23,18 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, "..");
 const args = process.argv.slice(2);
 const check = args.includes("--check");
-const appArg = args.find((a) => !a.startsWith("-"));
+const isPublic = args.includes("--public");
+let outPublicDir = "";
+const positional = [];
+for (let i = 0; i < args.length; i++) {
+  if (args[i] === "--check" || args[i] === "--public") continue;
+  if (args[i] === "--out-public") {
+    outPublicDir = args[++i] ?? "";
+    continue;
+  }
+  if (!args[i].startsWith("-")) positional.push(args[i]);
+}
+const appArg = positional[0];
 const app = path.resolve(appArg ?? process.env.BUZZ_APP ?? path.join(os.homedir(), "Work/buzz-app"));
 
 const pnpm = path.join(app, "node_modules", ".pnpm");
@@ -33,9 +47,29 @@ const { build } = await import(
   pathToFileURL(path.join(pnpm, rolldownDir, "node_modules/rolldown/dist/index.mjs")).href
 );
 
-const targets = [
+const publicPlugins = isPublic
+  ? [
+      {
+        name: "scrub-private-default-url",
+        transform(code, id) {
+          if (!id.endsWith(path.join("plugin", "src", "config.js"))) return null;
+          const replaced = code.replace(
+            /export const DEFAULT_URL = "[^"]*";/,
+            'export const DEFAULT_URL = "";',
+          );
+          if (replaced === code) {
+            throw new Error("scrub-private-default-url: could not find DEFAULT_URL in plugin/src/config.js");
+          }
+          return { code: replaced };
+        },
+      },
+    ]
+  : [];
+
+const allTargets = [
   {
     name: "Remote Agents",
+    publicDir: "remote-agents",
     entry: path.join(here, "src", "index.js"),
     out: path.join(here, "plugin.js"),
     banner: [
@@ -45,6 +79,7 @@ const targets = [
   },
   {
     name: "Viewport",
+    publicDir: "viewport",
     entry: path.join(root, "plugins", "viewport", "src", "index.js"),
     out: path.join(root, "plugins", "viewport", "plugin.js"),
     banner: [
@@ -54,6 +89,7 @@ const targets = [
   },
   {
     name: "Hive Watch",
+    publicDir: null,
     entry: path.join(root, "plugins", "hive-watch", "src", "index.js"),
     out: path.join(root, "plugins", "hive-watch", "plugin.js"),
     banner: [
@@ -63,6 +99,16 @@ const targets = [
   },
 ];
 
+const targets = isPublic
+  ? allTargets
+      .filter((t) => t.publicDir)
+      .map((t) => ({
+        ...t,
+        out: outPublicDir ? path.join(path.resolve(outPublicDir), t.publicDir, "plugin.js") : t.out,
+        banner: "// GENERATED public bundle for buzz-host plugin mirror. Do not edit directly.",
+      }))
+  : allTargets;
+
 let outOfDate = false;
 
 for (const target of targets) {
@@ -71,6 +117,7 @@ for (const target of targets) {
     platform: "browser",
     treeshake: true,
     write: false,
+    plugins: publicPlugins,
     output: {
       format: "esm",
       codeSplitting: false,
@@ -82,6 +129,9 @@ for (const target of targets) {
   const code = result.output[0].code;
   if (/\bfrom\s*["']\.?\.\//.test(code)) {
     throw new Error(`bundled ${target.name} (${path.relative(root, target.out)}) still contains relative imports`);
+  }
+  if (isPublic && /tail65c5a9\.ts\.net/i.test(code)) {
+    throw new Error(`public bundle for ${target.name} still contains private tailnet hostname`);
   }
 
   if (check) {

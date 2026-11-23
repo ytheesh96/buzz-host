@@ -107,7 +107,7 @@ export function applyRunnerChange(draft, runner) {
   return next;
 }
 
-/** Enforce guest-mode constraints on an agent draft (sandboxed runner, allowed runtimes, concurrency cap). */
+/** Enforce guest-mode constraints on an agent draft (runner, allowed runtimes, concurrency cap). */
 export function applyGuestConstraints(draft, serverInfo) {
   if (serverInfo?.role !== "guest") return draft;
   const limits = serverInfo.limits ?? {};
@@ -115,8 +115,14 @@ export function applyGuestConstraints(draft, serverInfo) {
     ? limits.allowedRuntimes
     : RUNTIMES.map((r) => r.id);
   const maxConcurrency = Number(limits.maxConcurrency) > 0 ? Number(limits.maxConcurrency) : 2;
+  const allowHostDesktop = limits.allowHostDesktop === true;
   const next = { ...draft };
-  next.runner = "docker";
+  const respondTo = next.respondTo || "owner-only";
+  if (allowHostDesktop && respondTo === "owner-only") {
+    next.runner = next.runner === "docker" ? "docker" : "host";
+  } else {
+    next.runner = "docker";
+  }
   next.profile = "";
   if (!allowedRuntimes.includes(next.runtime)) {
     next.runtime = allowedRuntimes[0];
