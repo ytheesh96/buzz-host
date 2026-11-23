@@ -1,12 +1,14 @@
 // Self-hosted remote agent type: creation forms, Settings tab, and agent type registration.
 import {
   CONCURRENCY_OPTIONS,
+  CONCURRENCY_VALUES,
   DEFAULT_CONCURRENCY,
   EMPTY,
   PROFILE_HINT,
   RESPOND_TO_OPTIONS,
   RUNNERS,
   RUNTIMES,
+  applyGuestConstraints,
   applyRespondToChange,
   applyRunnerChange,
   asConfig,
@@ -20,6 +22,7 @@ import {
   profileOptions,
   useModels,
   useProfiles,
+  useServerInfo,
 } from "./ui.js";
 
 export function createType({
@@ -49,16 +52,34 @@ export function createType({
   };
   const one = (options) => [{ label: "", options }];
 
+  function runtimeOptionsFor(serverInfo) {
+    if (serverInfo?.role !== "guest") return runtimeOptions;
+    const allowed = new Set(serverInfo.limits?.allowedRuntimes ?? []);
+    const filtered = RUNTIMES.filter((r) => allowed.size === 0 || allowed.has(r.id));
+    return filtered.map((r) => ({ value: r.id, label: r.title }));
+  }
+
+  function concurrencyOptionsFor(serverInfo) {
+    if (serverInfo?.role !== "guest") return CONCURRENCY_OPTIONS;
+    const max = Number(serverInfo.limits?.maxConcurrency) || 2;
+    return CONCURRENCY_VALUES.filter((n) => n <= max).map((n) => ({
+      value: String(n),
+      label: n === 1 ? "1 (sequential)" : n === max ? `${n} (max)` : `${n} parallel`,
+    }));
+  }
+
   /** Runtime, Hermes profile, Model, Concurrency, Access and Runner rows, for a SettingsGroup. */
-  function RuntimeRows({ ui, draft, onChange, disabled }) {
-    const sandboxed = (draft.runner || "host") !== "host";
-    const { models, error } = useModels(React, client, draft.runtime, sandboxed ? "" : draft.profile);
-    const hermes = draft.runtime === "hermes" && !sandboxed;
+  function RuntimeRows({ ui, draft, onChange, disabled, serverInfo }) {
+    const isGuest = serverInfo?.role === "guest";
+    const effective = isGuest ? applyGuestConstraints(draft, serverInfo) : draft;
+    const sandboxed = isGuest || (effective.runner || "host") !== "host";
+    const { models, error } = useModels(React, client, effective.runtime, sandboxed ? "" : effective.profile);
+    const hermes = !isGuest && effective.runtime === "hermes" && !sandboxed;
     const { profiles, error: profileError } = useProfiles(React, client, hermes);
     const choice = modelChoices(models);
-    const respondTo = draft.respondTo || "owner-only";
+    const respondTo = effective.respondTo || "owner-only";
     const runnerChoices =
-      respondTo === "owner-only"
+      !isGuest && respondTo === "owner-only"
         ? RUNNERS.map((r) => ({ value: r.id, label: r.title }))
         : RUNNERS.filter((r) => r.id !== "host").map((r) => ({ value: r.id, label: r.title }));
     return h(
@@ -67,41 +88,41 @@ export function createType({
       h(ui.Select, {
         label: "Runtime",
         variant: "preference",
-        value: draft.runtime,
+        value: effective.runtime,
         disabled,
-        groups: one(RUNTIMES.map((r) => ({ value: r.id, label: r.title }))),
-        onValueChange: (runtime) => onChange({ ...draft, runtime, model: "", profile: "" }),
+        groups: one(runtimeOptionsFor(serverInfo)),
+        onValueChange: (runtime) => onChange({ ...effective, runtime, model: "", profile: "" }),
       }),
       hermes &&
         h(ui.Select, {
           label: "Hermes profile",
           variant: "preference",
-          value: draft.profile || "",
+          value: effective.profile || "",
           disabled: disabled || profiles === undefined,
           ...(profileError ? { description: `Profile list unavailable: ${profileError}` } : {}),
-          groups: one(profileOptions(profiles, draft.profile)),
-          onValueChange: (profile) => onChange({ ...draft, profile }),
+          groups: one(profileOptions(profiles, effective.profile)),
+          onValueChange: (profile) => onChange({ ...effective, profile }),
         }),
       h(ui.ModelPicker, {
         label: "Model",
         models: choice.models,
         groupByFamily: choice.byFamily,
-        value: draft.model,
+        value: effective.model,
         allowCustomModel: true,
         defaultLabel: "Runtime default",
         defaultDescription: "The model this runtime uses on the server",
         loading: models === undefined,
         disabled,
         ...(error ? { description: `Model list unavailable: ${error}` } : {}),
-        onChange: (model) => onChange({ ...draft, model }),
+        onChange: (model) => onChange({ ...effective, model }),
       }),
       h(ui.Select, {
         label: "Parallel conversations",
         variant: "preference",
-        value: String(draft.concurrency ?? DEFAULT_CONCURRENCY),
+        value: String(effective.concurrency ?? (isGuest ? (serverInfo?.limits?.maxConcurrency ?? 2) : DEFAULT_CONCURRENCY)),
         disabled,
-        groups: one(CONCURRENCY_OPTIONS),
-        onValueChange: (v) => onChange({ ...draft, concurrency: Number(v) || DEFAULT_CONCURRENCY }),
+        groups: one(concurrencyOptionsFor(serverInfo)),
+        onValueChange: (v) => onChange({ ...effective, concurrency: Number(v) || DEFAULT_CONCURRENCY }),
       }),
       h(ui.Select, {
         label: "Who can talk to this agent",
@@ -111,20 +132,23 @@ export function createType({
         groups: one(RESPOND_TO_OPTIONS),
         onValueChange: (nextMode) =>
           onChange({
-            ...applyRespondToChange(draft, nextMode),
-            allowlistText: nextMode === "allowlist" ? (draft.allowlistText ?? formatAllowlistText(draft.respondToAllowlist)) : "",
+            ...applyRespondToChange(effective, nextMode),
+            ...(isGuest ? { runner: "docker", profile: "" } : {}),
+            allowlistText: nextMode === "allowlist" ? (effective.allowlistText ?? formatAllowlistText(effective.respondToAllowlist)) : "",
           }),
       }),
       h(ui.Select, {
         label: "Sandbox runner",
         variant: "preference",
-        value: draft.runner || "host",
-        disabled,
-        ...(respondTo !== "owner-only"
-          ? { description: "Shared agents always run in an isolated sandbox container." }
-          : {}),
+        value: effective.runner || (isGuest ? "docker" : "host"),
+        disabled: disabled || isGuest,
+        ...(isGuest
+          ? { description: "Guest accounts always run agents in an isolated Docker sandbox." }
+          : respondTo !== "owner-only"
+            ? { description: "Shared agents always run in an isolated sandbox container." }
+            : {}),
         groups: one(runnerChoices),
-        onValueChange: (nextRunner) => onChange(applyRunnerChange(draft, nextRunner)),
+        onValueChange: (nextRunner) => onChange(applyRunnerChange(effective, nextRunner)),
       }),
     );
   }
@@ -189,21 +213,42 @@ export function createType({
   function CreateConfiguration({ agent, config, onChange, disabled, harnessControl, onReadyChange }) {
     React.useEffect(() => onReadyChange?.(true), [onReadyChange]);
     const ui = agentUi();
+    const { info: serverInfo } = useServerInfo(React, client);
+    const isGuest = serverInfo?.role === "guest";
+    const draft = isGuest ? applyGuestConstraints(asConfig(config), serverInfo) : asConfig(config);
+    React.useEffect(() => {
+      if (agent || !isGuest) return;
+      const raw = asConfig(config);
+      const constrained = applyGuestConstraints(raw, serverInfo);
+      if (
+        constrained.runner !== raw.runner ||
+        constrained.runtime !== raw.runtime ||
+        constrained.concurrency !== raw.concurrency ||
+        constrained.profile !== raw.profile
+      ) {
+        onChange(constrained);
+      }
+    }, [agent, isGuest, serverInfo]);
     if (agent) return h(RunsWith, { ui, agent, harnessControl });
-    const draft = asConfig(config);
     if (!ui)
       return h(
         "div",
         { style: { display: "grid", gap: "var(--space-3)" } },
         harnessControl,
-        h(CreateFields, { config, onChange, disabled, part: "runtime" }),
+        h(CreateFields, { config: draft, onChange, disabled, part: "runtime", serverInfo }),
       );
     return h(
       "div",
       { className: "grid gap-2" },
-      h(ui.SettingsGroup, null, harnessControl, h(RuntimeRows, { ui, draft, onChange, disabled })),
+      h(ui.SettingsGroup, null, harnessControl, h(RuntimeRows, { ui, draft, onChange, disabled, serverInfo })),
       h(AllowlistField, { draft, onChange, disabled }),
-      h("p", { className: "m-0 text-body-sm text-secondary" }, "Runs on your server with buzz-acp and uses that machine's sign-ins."),
+      h(
+        "p",
+        { className: "m-0 text-body-sm text-secondary" },
+        isGuest
+          ? "Runs in an isolated Docker sandbox on your host's server."
+          : "Runs on your server with buzz-acp and uses that machine's sign-ins.",
+      ),
     );
   }
 
@@ -253,9 +298,12 @@ export function createType({
   }
 
   /** This plugin's own fields, for a Buzz without agentUi. */
-  function CreateFields({ config, onChange, disabled, part }) {
-    const draft = asConfig(config);
-    const change = (patch) => onChange({ ...draft, ...patch });
+  function CreateFields({ config, onChange, disabled, part, serverInfo: passedServerInfo }) {
+    const { info: fetchedInfo } = useServerInfo(React, client);
+    const serverInfo = passedServerInfo ?? fetchedInfo;
+    const isGuest = serverInfo?.role === "guest";
+    const draft = isGuest ? applyGuestConstraints(asConfig(config), serverInfo) : asConfig(config);
+    const change = (patch) => onChange(isGuest ? applyGuestConstraints({ ...draft, ...patch }, serverInfo) : { ...draft, ...patch });
     if (part === "instructions")
       return h(
         Row,
@@ -276,11 +324,12 @@ export function createType({
         h(Select, {
           value: draft.runtime,
           disabled,
-          options: runtimeOptions,
+          options: runtimeOptionsFor(serverInfo),
           onChange: (runtime) => change({ runtime, model: "", profile: "" }),
         }),
       ),
-      draft.runtime === "hermes" &&
+      !isGuest &&
+        draft.runtime === "hermes" &&
         (draft.runner || "host") === "host" &&
         h(
           Row,
@@ -294,7 +343,7 @@ export function createType({
           React,
           client,
           runtime: draft.runtime,
-          profile: (draft.runner || "host") === "host" ? draft.profile : "",
+          profile: !isGuest && (draft.runner || "host") === "host" ? draft.profile : "",
           value: draft.model,
           disabled,
           onChange: (model) => change({ model }),
@@ -306,7 +355,7 @@ export function createType({
         h(Select, {
           value: String(draft.concurrency ?? DEFAULT_CONCURRENCY),
           disabled,
-          options: CONCURRENCY_OPTIONS,
+          options: concurrencyOptionsFor(serverInfo),
           onChange: (v) => change({ concurrency: Number(v) || DEFAULT_CONCURRENCY }),
         }),
       ),
@@ -320,6 +369,7 @@ export function createType({
           onChange: (nextMode) =>
             onChange({
               ...applyRespondToChange(draft, nextMode),
+              ...(isGuest ? { runner: "docker", profile: "" } : {}),
               allowlistText: nextMode === "allowlist" ? (draft.allowlistText ?? formatAllowlistText(draft.respondToAllowlist)) : "",
             }),
         }),
@@ -329,16 +379,17 @@ export function createType({
         Row,
         {
           label: "Sandbox runner",
-          hint:
-            (draft.respondTo || "owner-only") !== "owner-only"
+          hint: isGuest
+            ? "Guest accounts always run agents in an isolated Docker sandbox."
+            : (draft.respondTo || "owner-only") !== "owner-only"
               ? "Shared agents always run in an isolated sandbox container."
               : "Choose Docker sandbox to isolate this agent from host files and keys.",
         },
         h(Select, {
-          value: draft.runner || "host",
-          disabled,
+          value: draft.runner || (isGuest ? "docker" : "host"),
+          disabled: disabled || isGuest,
           options:
-            (draft.respondTo || "owner-only") === "owner-only"
+            !isGuest && (draft.respondTo || "owner-only") === "owner-only"
               ? RUNNERS.map((r) => ({ value: r.id, label: r.title }))
               : RUNNERS.filter((r) => r.id !== "host").map((r) => ({ value: r.id, label: r.title })),
           onChange: (nextRunner) => onChange(applyRunnerChange(draft, nextRunner)),
@@ -393,6 +444,8 @@ export function createType({
   function NativeSettings({ ui, agent, settingsSection, settingsContent, settingsHost }) {
     const pubkey = agent.pubkey;
     const form = React.useId();
+    const { info: serverInfo } = useServerInfo(React, client);
+    const isGuest = serverInfo?.role === "guest";
     const { loaded, setLoaded, error: loadError, retry } = useHosted(pubkey);
     const [draft, setDraft] = React.useState();
     const [busy, setBusy] = React.useState("");
@@ -503,7 +556,7 @@ export function createType({
             },
             logs || "(no log lines)",
           ),
-        (loaded.runner || "host") === "host" && h(OrchestratorSettings, { ui, agent }),
+        !isGuest && (loaded.runner || "host") === "host" && h(OrchestratorSettings, { ui, agent }),
         settingsContent,
       );
     }
@@ -563,7 +616,7 @@ export function createType({
         ui.SettingsGroup,
         null,
         settingsHost?.typeControl?.(dirty),
-        h(RuntimeRows, { ui, draft, disabled: !!busy, onChange: setDraft }),
+        h(RuntimeRows, { ui, draft, disabled: !!busy, onChange: setDraft, serverInfo }),
       ),
       h(AllowlistField, { draft, disabled: !!busy, onChange: setDraft }),
       h(ui.AgentInstructions, {
@@ -579,6 +632,8 @@ export function createType({
   /** This plugin's own settings form, for a Buzz without agentUi. */
   function OwnSettings({ agent, settingsSection, settingsContent }) {
     if (settingsSection === "runtime") return settingsContent ?? null;
+    const { info: serverInfo } = useServerInfo(React, client);
+    const isGuest = serverInfo?.role === "guest";
     const [loaded, setLoaded] = React.useState();
     const [draft, setDraft] = React.useState();
     const [busy, setBusy] = React.useState("");
@@ -697,11 +752,12 @@ export function createType({
         h(Select, {
           value: draft.runtime,
           disabled: !!busy,
-          options: runtimeOptions,
+          options: runtimeOptionsFor(serverInfo),
           onChange: (runtime) => setDraft({ ...draft, runtime, model: "", profile: "" }),
         }),
       ),
-      draft.runtime === "hermes" &&
+      !isGuest &&
+        draft.runtime === "hermes" &&
         (draft.runner || "host") === "host" &&
         h(
           Row,
@@ -721,7 +777,7 @@ export function createType({
           React,
           client,
           runtime: draft.runtime,
-          profile: (draft.runner || "host") === "host" ? draft.profile : "",
+          profile: !isGuest && (draft.runner || "host") === "host" ? draft.profile : "",
           value: draft.model,
           disabled: !!busy,
           onChange: (model) => setDraft({ ...draft, model }),
@@ -733,7 +789,7 @@ export function createType({
         h(Select, {
           value: String(draft.concurrency ?? DEFAULT_CONCURRENCY),
           disabled: !!busy,
-          options: CONCURRENCY_OPTIONS,
+          options: concurrencyOptionsFor(serverInfo),
           onChange: (v) => setDraft({ ...draft, concurrency: Number(v) || DEFAULT_CONCURRENCY }),
         }),
       ),
@@ -747,6 +803,7 @@ export function createType({
           onChange: (nextMode) =>
             setDraft({
               ...applyRespondToChange(draft, nextMode),
+              ...(isGuest ? { runner: "docker", profile: "" } : {}),
               allowlistText: nextMode === "allowlist" ? (draft.allowlistText ?? formatAllowlistText(draft.respondToAllowlist)) : "",
             }),
         }),
@@ -756,16 +813,17 @@ export function createType({
         Row,
         {
           label: "Sandbox runner",
-          hint:
-            (draft.respondTo || "owner-only") !== "owner-only"
+          hint: isGuest
+            ? "Guest accounts always run agents in an isolated Docker sandbox."
+            : (draft.respondTo || "owner-only") !== "owner-only"
               ? "Shared agents always run in an isolated sandbox container."
               : "Choose Docker sandbox to isolate this agent from host files and keys.",
         },
         h(Select, {
-          value: draft.runner || "host",
-          disabled: !!busy,
+          value: draft.runner || (isGuest ? "docker" : "host"),
+          disabled: !!busy || isGuest,
           options:
-            (draft.respondTo || "owner-only") === "owner-only"
+            !isGuest && (draft.respondTo || "owner-only") === "owner-only"
               ? RUNNERS.map((r) => ({ value: r.id, label: r.title }))
               : RUNNERS.filter((r) => r.id !== "host").map((r) => ({ value: r.id, label: r.title })),
           onChange: (nextRunner) => setDraft(applyRunnerChange(draft, nextRunner)),
@@ -835,7 +893,7 @@ export function createType({
           },
           logs || "(no log lines)",
         ),
-      (loaded.runner || "host") === "host" && h(OrchestratorSettings, { agent }),
+      !isGuest && (loaded.runner || "host") === "host" && h(OrchestratorSettings, { agent }),
       !settingsSection && settingsContent,
     );
   }
@@ -856,7 +914,8 @@ export function createType({
     ],
     remote: {
       async provision({ name, picture, community, config, signal }) {
-        const c = asConfig(config);
+        const session = client.snapshot().session;
+        const c = applyGuestConstraints(asConfig(config), session);
         return client.call(
           "provision",
           {
@@ -878,7 +937,8 @@ export function createType({
         );
       },
       async activate({ pubkey, name, community, auth, config, signal }) {
-        const c = config === undefined ? undefined : asConfig(config);
+        const session = client.snapshot().session;
+        const c = config === undefined ? undefined : applyGuestConstraints(asConfig(config), session);
         await client.call(
           "activate",
           {

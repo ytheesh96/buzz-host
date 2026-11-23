@@ -1,0 +1,112 @@
+#!/usr/bin/env node
+// CLI for managing buzz-host guest access tokens directly on the host.
+//
+// Usage:
+//   buzz-host-tokens create --label Alice [--owner <64-hex>] [--max-agents 2] [--max-concurrency 2] [--runtimes hermes,claude,antigravity]
+//   buzz-host-tokens list
+//   buzz-host-tokens revoke <tok_...>
+
+import fs from "node:fs/promises";
+import { existsSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
+
+const authModPath = existsSync(new URL("./auth.mjs", import.meta.url)) ? "./auth.mjs" : "../auth.mjs";
+const { buildInviteUrl, createTokenStore } = await import(authModPath);
+
+const HOME = os.homedir();
+const TOKENS_FILE = process.env.BUZZ_HOST_TOKENS_FILE || path.join(HOME, ".local/share/buzz-host/tokens.json");
+const CONFIG_FILE = process.env.BUZZ_HOST_CONFIG || path.join(HOME, ".config/buzz-host/config.json");
+
+function parseFlags(argv) {
+  const flags = {};
+  const rest = [];
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a.startsWith("--")) {
+      const key = a.slice(2);
+      const val = argv[i + 1];
+      if (val === undefined || val.startsWith("--")) flags[key] = true;
+      else {
+        flags[key] = val;
+        i++;
+      }
+    } else {
+      rest.push(a);
+    }
+  }
+  return { flags, rest };
+}
+
+async function publicGuestUrl() {
+  try {
+    const cfg = JSON.parse(await fs.readFile(CONFIG_FILE, "utf8"));
+    if (typeof cfg.publicGuestUrl === "string" && cfg.publicGuestUrl.trim()) {
+      return cfg.publicGuestUrl.trim();
+    }
+  } catch {}
+  return "wss://omarchy.tail65c5a9.ts.net/_buzz-host";
+}
+
+const [cmd, ...args] = process.argv.slice(2);
+const { flags, rest } = parseFlags(args);
+const tokensFile =
+  typeof flags.file === "string" && flags.file.trim() ? flags.file.trim() : TOKENS_FILE;
+const store = createTokenStore({ filePath: tokensFile });
+
+try {
+  if (cmd === "create") {
+    const allowedRuntimes =
+      typeof flags.runtimes === "string"
+        ? flags.runtimes
+            .split(",")
+            .map((s) => s.trim())
+            .filter(Boolean)
+        : undefined;
+    const { token, record } = await store.create({
+      label: flags.label ?? rest[0],
+      ownerPubkey: flags.owner,
+      maxAgents: flags["max-agents"],
+      maxConcurrency: flags["max-concurrency"],
+      allowedRuntimes,
+    });
+    const baseUrl =
+      typeof flags.url === "string" && flags.url.trim() ? flags.url.trim() : await publicGuestUrl();
+    const inviteUrl = buildInviteUrl(baseUrl, token);
+    if (flags.json) {
+      console.log(JSON.stringify({ token, inviteUrl, record }, null, 2));
+    } else {
+      console.log(`Created guest token ${record.id} for "${record.label}"`);
+      console.log(`Limits: maxAgents=${record.maxAgents}, maxConcurrency=${record.maxConcurrency}, runtimes=${record.allowedRuntimes.join(",")}`);
+      if (record.ownerPubkey) console.log(`Bound owner: ${record.ownerPubkey}`);
+      else console.log("Bound owner: (will bind automatically on first agent activation)");
+      console.log(`\nToken (shown once):      ${token}`);
+      console.log(`1-paste invite URL:      ${inviteUrl}`);
+    }
+  } else if (cmd === "list") {
+    const tokens = await store.list();
+    if (flags.json) {
+      console.log(JSON.stringify({ tokens }, null, 2));
+    } else if (!tokens.length) {
+      console.log("No guest tokens.");
+    } else {
+      for (const t of tokens) {
+        const status = t.revokedAt ? `REVOKED (${t.revokedAt})` : "active";
+        console.log(
+          `${t.id}  ${t.label}  [${status}]  owner=${t.ownerPubkey ? t.ownerPubkey.slice(0, 12) + "…" : "unbound"}  caps=${t.maxAgents}a/${t.maxConcurrency}c  runtimes=${t.allowedRuntimes.join(",")}`,
+        );
+      }
+    }
+  } else if (cmd === "revoke") {
+    const id = rest[0] || flags.id;
+    const record = await store.revoke(id);
+    if (flags.json) console.log(JSON.stringify({ record }, null, 2));
+    else console.log(`Revoked ${record.id} (${record.label}) at ${record.revokedAt}`);
+  } else {
+    console.error("Usage: buzz-host-tokens <create|list|revoke> [options]");
+    process.exit(2);
+  }
+} catch (error) {
+  console.error(`Error: ${error.message}`);
+  process.exit(1);
+}

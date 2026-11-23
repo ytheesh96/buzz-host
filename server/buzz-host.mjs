@@ -36,6 +36,15 @@ import {
   normalizeRespondTo,
   normalizeRunner,
 } from "./sandbox/index.mjs";
+import {
+  assertAgentAccess,
+  assertMethodAllowed,
+  buildInviteUrl,
+  canAccessAgent,
+  createAuthRateLimiter,
+  createTokenStore,
+  enforceGuestSettings,
+} from "./auth.mjs";
 
 const run = promisify(execFile);
 const HOME = os.homedir();
@@ -155,9 +164,17 @@ async function loadConfig() {
     throw new Error(`${CONFIG}: allowLogins must list Tailscale logins`);
   return {
     port: raw.port ?? 8457,
+    // Dedicated localhost listener for public Tailscale Funnel guest traffic.
+    // Ignores Tailscale-User-Login headers completely and requires a guest token.
+    guestPort: raw.guestPort ?? 8467,
+    publicGuestUrl: raw.publicGuestUrl ?? "wss://omarchy.tail65c5a9.ts.net/_buzz-host",
     allowLogins: new Set(raw.allowLogins),
     allowOrigins: new Set(
-      raw.allowOrigins ?? ["tauri://localhost", "http://tauri.localhost"],
+      raw.allowOrigins ?? [
+        "tauri://localhost",
+        "http://tauri.localhost",
+        "https://tauri.localhost",
+      ],
     ),
     // Communities agents may join; empty means any wss:// URL.
     allowCommunities: new Set(raw.allowCommunities ?? []),
@@ -415,26 +432,45 @@ async function chatSettingsFor(pubkey, channelId, threadRootId, defaultRuntime, 
  * probe in the background (so unsigned-in ones like Codex stay hidden), and
  * other Hermes profiles are listed immediately and probed lazily on demand when
  * selected. */
-async function chatCatalog(ownRuntime, ownProfile, configured, chat = null, requestedRuntime = "") {
-  const ownTarget = formatTarget(ownRuntime, ownProfile);
+async function chatCatalog(
+  ownRuntime,
+  ownProfile,
+  configured,
+  chat = null,
+  requestedRuntime = "",
+  { allowedRuntimes = null, allowHermesProfiles = true } = {},
+) {
+  const allowedSet = allowedRuntimes ? new Set(allowedRuntimes) : null;
+  const ownTarget = formatTarget(ownRuntime, allowHermesProfiles ? ownProfile : "");
   const currentTarget = chat?.target || ownTarget;
   let display = parseTarget(currentTarget, RUNTIME_IDS) ?? {
     runtime: ownRuntime,
-    profile: ownRuntime === "hermes" ? ownProfile : "",
+    profile: ownRuntime === "hermes" && allowHermesProfiles ? ownProfile : "",
     target: ownTarget,
   };
   if (requestedRuntime) {
     const parsed = parseTarget(requestedRuntime, RUNTIME_IDS);
     if (!parsed) throw new Error("Unknown runtime");
-    if (parsed.runtime === "hermes" && parsed.profile) await checkProfile(parsed.profile);
+    if (allowedSet && !allowedSet.has(parsed.runtime)) {
+      throw new Error(`Runtime "${parsed.runtime}" is not enabled for this guest token`);
+    }
+    if (parsed.runtime === "hermes" && parsed.profile) {
+      if (!allowHermesProfiles) throw new Error("Host Hermes profiles are not available for guest agents");
+      await checkProfile(parsed.profile);
+    }
     display = parsed;
   }
 
   let pending = false;
   const runtimes = [];
   for (const [id, r] of Object.entries(RUNTIMES)) {
+    if (allowedSet && !allowedSet.has(id)) continue;
     if (!(await installed(r.command))) continue;
     if (id === "hermes") {
+      if (!allowHermesProfiles) {
+        runtimes.push({ id: "hermes", label: "Hermes" });
+        continue;
+      }
       const rows = await hermesProfiles().catch(() => []);
       const names = [];
       const addName = (n) => {
@@ -487,6 +523,9 @@ function checkPlace(channelId, threadRootId) {
 // Calls that only read, or only reach the agent's runtime, and must not wait
 // behind a slow call for the same agent (a compaction runs for minutes).
 const UNSERIALIZED = new Set([
+  "auth",
+  "hello",
+  "tokens.list",
   "catalog",
   "models",
   "hermes.profiles",
@@ -527,9 +566,62 @@ function sharedSnapshot(pubkey, socketPath, width) {
   return promise;
 }
 
+async function listAllMetas() {
+  const names = await fs.readdir(DATA).catch(() => []);
+  const out = [];
+  for (const name of names.filter((n) => HEX64.test(n))) {
+    const m = await meta(name).catch(() => undefined);
+    if (m) out.push(m);
+  }
+  return out;
+}
+
+async function ownedMeta(pubkey, session) {
+  checkPubkey(pubkey);
+  const m = await meta(pubkey);
+  assertAgentAccess(session, m);
+  return m;
+}
+
 const methods = {
-  async hello() {
-    const [runtimes, runners] = await Promise.all([
+  async auth(config, { token }, session) {
+    if (session.role === "admin" && session.authenticated) {
+      return { role: "admin", login: session.login };
+    }
+    const key = session.remoteAddress || "unknown";
+    if (authRateLimiter.isLimited(key)) {
+      throw new Error("Too many failed authentication attempts; try again in a minute");
+    }
+    const record = await tokenStore.verify(token);
+    if (!record) {
+      authRateLimiter.recordFailure(key);
+      throw new Error("Invalid or revoked access token");
+    }
+    authRateLimiter.clear(key);
+    session.authenticated = true;
+    session.role = "guest";
+    session.tokenId = record.id;
+    session.label = record.label;
+    session.ownerPubkey = record.ownerPubkey;
+    session.limits = {
+      maxAgents: record.maxAgents,
+      maxConcurrency: record.maxConcurrency,
+      allowedRuntimes: record.allowedRuntimes,
+    };
+    session.registerTokenSocket?.(record.id);
+    console.log(`guest authenticated: ${record.label} (${record.id})`);
+    return {
+      role: "guest",
+      label: record.label,
+      ownerPubkey: record.ownerPubkey,
+      limits: session.limits,
+    };
+  },
+
+  async hello(config, _params, session) {
+    const isGuest = session?.role === "guest";
+    const allowedSet = isGuest ? new Set(session.limits?.allowedRuntimes ?? []) : null;
+    const [allRuntimes, allRunners] = await Promise.all([
       Promise.all(
         Object.entries(RUNTIMES).map(async ([id, r]) => ({
           id,
@@ -539,14 +631,46 @@ const methods = {
       ),
       runnerManager.availableRunners(),
     ]);
-    return { version: VERSION, host: os.hostname(), runtimes, runners };
+    const runtimes = allowedSet ? allRuntimes.filter((r) => allowedSet.has(r.id)) : allRuntimes;
+    const runners = isGuest ? allRunners.filter((r) => r.id === "docker") : allRunners;
+    return {
+      version: VERSION,
+      host: os.hostname(),
+      role: session?.role ?? "admin",
+      ...(isGuest
+        ? {
+            label: session.label,
+            ownerPubkey: session.ownerPubkey ?? null,
+            limits: session.limits,
+          }
+        : {
+            publicGuestUrl: config.publicGuestUrl,
+          }),
+      runtimes,
+      runners,
+    };
   },
 
   // A new key, not yet anyone's. Kept until activate or remove.
-  async provision(config, { name, picture, community, config: settings }) {
+  async provision(config, { name, picture, community, config: settings }, session) {
     checkName(name);
     checkCommunity(config, community);
-    const s = settingsFrom(settings);
+    const isGuest = session?.role === "guest";
+    if (isGuest) {
+      const existing = (await listAllMetas()).filter((m) => canAccessAgent(session, m));
+      const maxAgents = session.limits?.maxAgents ?? 2;
+      if (existing.length >= maxAgents) {
+        throw new Error(`Agent limit reached (${existing.length}/${maxAgents} agents for this guest token)`);
+      }
+    }
+    const rawSettings = isGuest
+      ? {
+          ...settings,
+          runner: settings?.runner || "docker",
+          concurrency: settings?.concurrency ?? session.limits?.maxConcurrency ?? 2,
+        }
+      : settings;
+    const s = enforceGuestSettings(session, settingsFrom(rawSettings));
     await checkProfile(s.profile);
     const { privateKey } = generateKeyPairSync("ec", { namedCurve: "secp256k1" });
     const jwk = privateKey.export({ format: "jwk" });
@@ -564,6 +688,13 @@ const methods = {
       picture: checkPicture(picture),
       community,
       ...s,
+      ...(isGuest
+        ? {
+            createdByTokenId: session.tokenId,
+            ...(session.ownerPubkey ? { owner: session.ownerPubkey } : {}),
+            lazyPool: true,
+          }
+        : {}),
       hasInstructions: instructions.trim().length > 0,
       createdAt: new Date().toISOString(),
       activated: false,
@@ -571,8 +702,7 @@ const methods = {
     return { pubkey, ...(picture ? { picture } : {}) };
   },
 
-  async activate(config, { pubkey, name, community, auth, config: settings }) {
-    checkPubkey(pubkey);
+  async activate(config, { pubkey, name, community, auth, config: settings }, session) {
     checkCommunity(config, community);
     if (
       !Array.isArray(auth) ||
@@ -583,16 +713,27 @@ const methods = {
       !/^[0-9a-f]{128}$/.test(auth[3])
     )
       throw new Error("Invalid owner attestation");
-    const m = await meta(pubkey);
+    const m = await ownedMeta(pubkey, session);
     if (m.owner && m.owner !== auth[1])
       throw new Error("This agent already belongs to another owner");
+    if (session?.role === "guest") {
+      if (session.ownerPubkey && session.ownerPubkey !== auth[1]) {
+        throw new Error("This access token is bound to another user");
+      }
+      const bound = await tokenStore.bindOwner(session.tokenId, auth[1]);
+      session.ownerPubkey = bound.ownerPubkey;
+    }
+    const mergedSettings = settings
+      ? enforceGuestSettings(session, settingsFrom(settings, m))
+      : enforceGuestSettings(session, settingsFrom(m, m));
     const next = {
       ...m,
       name: checkName(name ?? m.name),
       community,
       owner: auth[1],
-      ...(settings ? settingsFrom(settings, m) : {}),
+      ...mergedSettings,
     };
+    assertSandboxRestrictions(next);
     await checkProfile(next.profile);
     if (typeof settings?.instructions === "string") {
       checkInstructions(settings.instructions);
@@ -610,18 +751,16 @@ const methods = {
     return { status: await active(pubkey) };
   },
 
-  async profile(config, { pubkey, name, picture }) {
-    checkPubkey(pubkey);
-    const m = await meta(pubkey);
+  async profile(config, { pubkey, name, picture }, session) {
+    const m = await ownedMeta(pubkey, session);
     const next = { ...m, name: checkName(name), picture: checkPicture(picture) };
     if (m.activated) await publishProfile(pubkey, next.name, next.picture);
     await saveMeta(pubkey, next);
     return {};
   },
 
-  async "instructions.get"(config, { pubkey }) {
-    checkPubkey(pubkey);
-    await meta(pubkey);
+  async "instructions.get"(config, { pubkey }, session) {
+    await ownedMeta(pubkey, session);
     return {
       instructions: await fs
         .readFile(path.join(dir(pubkey), "instructions.md"), "utf8")
@@ -630,10 +769,9 @@ const methods = {
   },
 
   // `base` is the copy the editor last read: refuse when it changed since.
-  async "instructions.set"(config, { pubkey, instructions, base }) {
-    checkPubkey(pubkey);
+  async "instructions.set"(config, { pubkey, instructions, base }, session) {
     checkInstructions(instructions);
-    const m = await meta(pubkey);
+    const m = await ownedMeta(pubkey, session);
     const file = path.join(dir(pubkey), "instructions.md");
     if (typeof base === "string") {
       const current = await fs.readFile(file, "utf8").catch(() => "");
@@ -649,9 +787,8 @@ const methods = {
     return {};
   },
 
-  async "settings.get"(config, { pubkey }) {
-    checkPubkey(pubkey);
-    const m = await meta(pubkey);
+  async "settings.get"(config, { pubkey }, session) {
+    const m = await ownedMeta(pubkey, session);
     return {
       runtime: m.runtime,
       model: m.model,
@@ -667,13 +804,14 @@ const methods = {
   async "settings.set"(
     config,
     { pubkey, runtime, model, profile, concurrency, runner, respondTo, respondToAllowlist },
+    session,
   ) {
-    checkPubkey(pubkey);
-    const m = await meta(pubkey);
-    const next = {
-      ...m,
-      ...settingsFrom({ runtime, model, profile, concurrency, runner, respondTo, respondToAllowlist }, m),
-    };
+    const m = await ownedMeta(pubkey, session);
+    const updated = enforceGuestSettings(
+      session,
+      settingsFrom({ runtime, model, profile, concurrency, runner, respondTo, respondToAllowlist }, m),
+    );
+    const next = { ...m, ...updated };
     assertSandboxRestrictions(next);
     await checkProfile(next.profile);
     await saveMeta(pubkey, next);
@@ -685,30 +823,26 @@ const methods = {
   },
 
   // Attention (the agent's Interests, watches and timers) for the plugin's tab.
-  async "attention.get"(config, { pubkey }) {
-    checkPubkey(pubkey);
-    await meta(pubkey);
+  async "attention.get"(config, { pubkey }, session) {
+    await ownedMeta(pubkey, session);
     return attention.get(pubkey);
   },
 
   // Buzz's own Attention tab (Buzz patch 0005): the record in Buzz's shape,
   // and the owner's edits in Buzz's AgentChange shape.
-  async "attention.view"(config, { pubkey }) {
-    checkPubkey(pubkey);
-    await meta(pubkey);
+  async "attention.view"(config, { pubkey }, session) {
+    await ownedMeta(pubkey, session);
     return attention.view(pubkey);
   },
-  async "attention.change"(config, { pubkey, change }) {
-    checkPubkey(pubkey);
-    await meta(pubkey);
+  async "attention.change"(config, { pubkey, change }, session) {
+    await ownedMeta(pubkey, session);
     if (!change || typeof change !== "object") throw new Error("change is required");
     return attention.ownerChange(pubkey, change);
   },
 
   // On or off. The agent restarts so its sessions gain or lose the tools.
-  async "attention.set"(config, { pubkey, enabled }) {
-    checkPubkey(pubkey);
-    const m = await meta(pubkey);
+  async "attention.set"(config, { pubkey, enabled }, session) {
+    const m = await ownedMeta(pubkey, session);
     const result = await attention.setEnabled(pubkey, enabled === true);
     if (m.activated) {
       await writeRuntimeEnv(pubkey, m);
@@ -719,23 +853,20 @@ const methods = {
 
   // The owner's edits: pause/resume an Interest, remove it with its watches,
   // turn a watch on or off, remove a watch.
-  async "attention.edit"(config, { pubkey, op, id, paused, enabled }) {
-    checkPubkey(pubkey);
-    await meta(pubkey);
+  async "attention.edit"(config, { pubkey, op, id, paused, enabled }, session) {
+    await ownedMeta(pubkey, session);
     return attention.ownerEdit(pubkey, { op, id, paused, enabled });
   },
 
-  async restart(config, { pubkey }) {
-    checkPubkey(pubkey);
-    const m = await meta(pubkey);
+  async restart(config, { pubkey }, session) {
+    const m = await ownedMeta(pubkey, session);
     if (!m.activated) throw new Error("Agent is not activated yet");
     await systemctl("restart", unit(pubkey));
     return { status: await active(pubkey) };
   },
 
-  async logs(config, { pubkey, lines = 80 }) {
-    checkPubkey(pubkey);
-    await meta(pubkey);
+  async logs(config, { pubkey, lines = 80 }, session) {
+    await ownedMeta(pubkey, session);
     const n = Math.min(Math.max(Number(lines) || 80, 1), 500);
     const { stdout } = await run(
       "journalctl",
@@ -747,8 +878,14 @@ const methods = {
 
   // Model ids the runtime offers, from the cached ACP catalog probe.
   // For Hermes, the profile's: each profile has its own providers and sign-ins.
-  async models(config, { runtime, profile }) {
+  async models(config, { runtime, profile }, session) {
     if (!Object.hasOwn(RUNTIMES, runtime)) throw new Error("Unknown runtime");
+    if (session?.role === "guest") {
+      if (!session.limits?.allowedRuntimes?.includes(runtime)) {
+        throw new Error(`Runtime "${runtime}" is not enabled for this guest token`);
+      }
+      profile = "";
+    }
     const { profile: home } = settingsFrom({ runtime, profile });
     await checkProfile(home);
     const probed = await probeRuntime(runtime, home, { wait: true });
@@ -760,35 +897,33 @@ const methods = {
     return { profiles: await hermesProfiles(true) };
   },
 
-  async list() {
-    const names = await fs.readdir(DATA).catch(() => []);
+  async list(_config, _params, session) {
+    const metas = await listAllMetas();
     const agents = [];
-    for (const name of names.filter((n) => HEX64.test(n))) {
-      const m = await meta(name).catch(() => undefined);
-      if (m)
-        agents.push({
-          pubkey: m.pubkey,
-          name: m.name,
-          runtime: m.runtime,
-          model: m.model,
-          profile: m.profile || "",
-          concurrency: checkConcurrency(m.concurrency, DEFAULT_CONCURRENCY),
-          runner: m.runner || "host",
-          respondTo: normalizeRespondTo(m.respondTo, "owner-only"),
-          activated: m.activated,
-          desktop: m.desktop === true,
-          orchestrate: m.orchestrate === true,
-          status: m.activated ? await active(name) : "provisioned",
-        });
+    for (const m of metas) {
+      if (!canAccessAgent(session, m)) continue;
+      agents.push({
+        pubkey: m.pubkey,
+        name: m.name,
+        runtime: m.runtime,
+        model: m.model,
+        profile: m.profile || "",
+        concurrency: checkConcurrency(m.concurrency, DEFAULT_CONCURRENCY),
+        runner: m.runner || "host",
+        respondTo: normalizeRespondTo(m.respondTo, "owner-only"),
+        activated: m.activated,
+        desktop: m.desktop === true,
+        orchestrate: m.orchestrate === true,
+        status: m.activated ? await active(m.pubkey) : "provisioned",
+      });
     }
     return { agents };
   },
 
   // Buzz's Stop: cancel the turn running in one conversation (channel, and the
   // thread root Buzz names it by). False when nothing there was running.
-  async interrupt(config, { pubkey, channelId, threadRootId }) {
-    checkPubkey(pubkey);
-    await meta(pubkey);
+  async interrupt(config, { pubkey, channelId, threadRootId }, session) {
+    await ownedMeta(pubkey, session);
     if (typeof channelId !== "string" || !UUID.test(channelId)) throw new Error("Invalid channel id");
     if (threadRootId != null && (typeof threadRootId !== "string" || !HEX64.test(threadRootId)))
       throw new Error("Invalid thread root");
@@ -803,24 +938,27 @@ const methods = {
   // `current` reflects that conversation's active runtime/model/effort from
   // chat-settings.json. acp-proxy applies a pick from the message tags; one on
   // another runtime moves the chat there.
-  async catalog(config, { pubkey, channelId, threadRootId, runtime: requestedRuntime }) {
-    checkPubkey(pubkey);
+  async catalog(config, { pubkey, channelId, threadRootId, runtime: requestedRuntime }, session) {
     if (channelId != null) checkPlace(channelId, threadRootId);
     if (requestedRuntime != null && typeof requestedRuntime !== "string")
       throw new Error("Invalid runtime");
-    const m = await meta(pubkey);
+    const m = await ownedMeta(pubkey, session);
     const { runtime, profile } = settingsFrom(m);
+    const sandboxed = isSandboxed(m);
     const chat = channelId
-      ? await chatSettingsFor(pubkey, channelId, threadRootId, runtime, profile, isSandboxed(m))
+      ? await chatSettingsFor(pubkey, channelId, threadRootId, runtime, profile, sandboxed)
       : null;
-    return chatCatalog(runtime, profile, m.model || "", chat, requestedRuntime || "");
+    const isGuest = session?.role === "guest";
+    return chatCatalog(runtime, profile, m.model || "", chat, requestedRuntime || "", {
+      allowedRuntimes: isGuest ? session.limits?.allowedRuntimes : null,
+      allowHermesProfiles: !isGuest && !sandboxed,
+    });
   },
 
   // Buzz's session controls for one conversation (channel + thread root).
-  async "session.state"(config, { pubkey, channelId, threadRootId }) {
-    checkPubkey(pubkey);
+  async "session.state"(config, { pubkey, channelId, threadRootId }, session) {
     checkPlace(channelId, threadRootId);
-    const m = await meta(pubkey);
+    const m = await ownedMeta(pubkey, session);
     const { runtime, profile } = settingsFrom(m);
     const [reply, chat] = await Promise.all([
       proxyControl(
@@ -833,10 +971,9 @@ const methods = {
     ]);
     return { state: reply.state ?? "unavailable", chat };
   },
-  async "session.control"(config, { pubkey, channelId, threadRootId, action }) {
-    checkPubkey(pubkey);
+  async "session.control"(config, { pubkey, channelId, threadRootId, action }, session) {
     checkPlace(channelId, threadRootId);
-    await meta(pubkey);
+    await ownedMeta(pubkey, session);
     const op = { interrupt: "cancel", new: "new", compact: "compact" }[action];
     if (!op) throw new Error("Unknown session action");
     const reply = await proxyControl(
@@ -975,8 +1112,51 @@ const methods = {
     return orchestrator.cancel({ pubkey, taskId });
   },
 
-  async remove(config, { pubkey }) {
+  // Admin-only guest token management (multi-tenant hosting).
+  async "tokens.create"(config, { label, ownerPubkey, maxAgents, maxConcurrency, allowedRuntimes }) {
+    const { token, record } = await tokenStore.create({
+      label,
+      ownerPubkey,
+      maxAgents,
+      maxConcurrency,
+      allowedRuntimes,
+    });
+    return {
+      token,
+      record,
+      inviteUrl: buildInviteUrl(config.publicGuestUrl, token),
+    };
+  },
+  async "tokens.list"() {
+    const [tokens, metas] = await Promise.all([tokenStore.list(), listAllMetas()]);
+    return {
+      tokens: tokens.map((t) => ({
+        ...t,
+        agentCount: metas.filter(
+          (m) => (t.ownerPubkey && m.owner === t.ownerPubkey) || (!m.activated && m.createdByTokenId === t.id),
+        ).length,
+      })),
+    };
+  },
+  async "tokens.revoke"(_config, { id }) {
+    const record = await tokenStore.revoke(id);
+    const sockets = guestSockets.get(record.id);
+    if (sockets) {
+      for (const sock of sockets) {
+        try {
+          sock.end(frame(8, Buffer.alloc(0)));
+        } catch {}
+      }
+      guestSockets.delete(record.id);
+    }
+    return { record };
+  },
+
+  async remove(config, { pubkey }, session) {
     checkPubkey(pubkey);
+    const existing = await meta(pubkey).catch(() => undefined);
+    if (!existing) return {};
+    assertAgentAccess(session, existing);
     await systemctl("disable", "--now", unit(pubkey)).catch(() => {});
     await runnerManager.cleanupAgent(pubkey).catch(() => {});
     await orchestrator.forget(pubkey).catch(() => {});
@@ -1062,6 +1242,10 @@ function serveSocket(socket, onText) {
 // ---------- server ----------
 
 const config = await loadConfig();
+const tokenStore = createTokenStore({ filePath: path.join(HOME, ".local/share/buzz-host/tokens.json") });
+const authRateLimiter = createAuthRateLimiter({ maxFailures: 10, windowMs: 60_000 });
+/** tokenId -> Set<Socket> for immediate disconnect on revoke. */
+const guestSockets = new Map();
 const memory = createMemory({ dataDir: DATA });
 const orchestrator = createOrchestrator({
   dataDir: DATA,
@@ -1138,6 +1322,30 @@ function serialized(key, task) {
   return next;
 }
 
+function attachRpcSocket(socket, session) {
+  serveSocket(socket, async (text, send) => {
+    let id;
+    try {
+      const message = JSON.parse(text);
+      id = message.id;
+      const methodName = message.method;
+      const method = methods[methodName];
+      if (!method) throw new Error(`Unknown method ${methodName}`);
+      if (methodName !== "auth") assertMethodAllowed(session, methodName);
+      const params = message.params ?? {};
+      const result = UNSERIALIZED.has(methodName)
+        ? await method(config, params, session)
+        : await serialized(params.pubkey ?? `${session.tokenId || "admin"}:${methodName}`, () =>
+            method(config, params, session),
+          );
+      send(JSON.stringify({ id, result }));
+    } catch (error) {
+      console.error(`error (${session.role}${session.tokenId ? `:${session.tokenId}` : ""}): ${error.message}`);
+      send(JSON.stringify({ id, error: String(error.message ?? error) }));
+    }
+  });
+}
+
 const server = createServer((req, res) => {
   res.writeHead(req.url === "/health" ? 200 : 404, { "content-type": "text/plain" });
   res.end(req.url === "/health" ? "ok\n" : "not found\n");
@@ -1182,29 +1390,79 @@ server.on("upgrade", (req, socket) => {
     "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" +
       `Sec-WebSocket-Accept: ${accept}\r\n\r\n`,
   );
-  console.log(`connected: ${login} origin=${origin ?? "-"}`);
-  serveSocket(socket, async (text, send) => {
-    let id;
-    try {
-      const message = JSON.parse(text);
-      id = message.id;
-      const method = methods[message.method];
-      if (!method) throw new Error(`Unknown method ${message.method}`);
-      const params = message.params ?? {};
-      const result = UNSERIALIZED.has(message.method)
-        ? await method(config, params)
-        : await serialized(params.pubkey ?? message.method, () => method(config, params));
-      send(JSON.stringify({ id, result }));
-    } catch (error) {
-      console.error(`error: ${error.message}`);
-      send(JSON.stringify({ id, error: String(error.message ?? error) }));
-    }
+  console.log(`connected (admin): ${login} origin=${origin ?? "-"}`);
+  attachRpcSocket(socket, {
+    authenticated: true,
+    role: "admin",
+    login,
+    remoteAddress: req.socket.remoteAddress || "127.0.0.1",
   });
 });
 
 server.listen(config.port, "127.0.0.1", () =>
-  console.log(`buzz-host listening on 127.0.0.1:${config.port}`),
+  console.log(`buzz-host admin listening on 127.0.0.1:${config.port}`),
 );
+
+// Dedicated guest-only listener (for Tailscale Funnel /_buzz-host).
+// NEVER trusts Tailscale-User-Login headers and NEVER serves /desktop.
+let guestServer = null;
+if (Number.isInteger(config.guestPort) && config.guestPort > 0) {
+  guestServer = createServer((req, res) => {
+    res.writeHead(req.url === "/health" ? 200 : 404, { "content-type": "text/plain" });
+    res.end(req.url === "/health" ? "ok\n" : "not found\n");
+  });
+  guestServer.on("upgrade", (req, socket) => {
+    const origin = req.headers.origin;
+    const refuse = (code, why) => {
+      console.warn(`guest refused ${code}: ${why} (origin=${origin ?? "-"})`);
+      socket.end(`HTTP/1.1 ${code}\r\nConnection: close\r\n\r\n`);
+    };
+    if (origin && !config.allowOrigins.has(origin)) return refuse("403 Forbidden", "origin");
+    const key = req.headers["sec-websocket-key"];
+    if (!key || req.headers.upgrade?.toLowerCase() !== "websocket")
+      return refuse("400 Bad Request", "not a websocket");
+    const accept = createHash("sha1").update(key + GUID).digest("base64");
+    socket.write(
+      "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" +
+        `Sec-WebSocket-Accept: ${accept}\r\n\r\n`,
+    );
+    const remoteAddress =
+      String(req.headers["x-forwarded-for"] || "").split(",")[0].trim() ||
+      req.socket.remoteAddress ||
+      "unknown";
+    let registeredTokenId = null;
+    const session = {
+      authenticated: false,
+      role: "guest",
+      tokenId: null,
+      label: null,
+      ownerPubkey: null,
+      limits: null,
+      remoteAddress,
+      registerTokenSocket(tokenId) {
+        registeredTokenId = tokenId;
+        let set = guestSockets.get(tokenId);
+        if (!set) {
+          set = new Set();
+          guestSockets.set(tokenId, set);
+        }
+        set.add(socket);
+      },
+    };
+    socket.on("close", () => {
+      if (registeredTokenId) {
+        const set = guestSockets.get(registeredTokenId);
+        set?.delete(socket);
+        if (set && set.size === 0) guestSockets.delete(registeredTokenId);
+      }
+    });
+    console.log(`guest socket connected: remote=${remoteAddress} origin=${origin ?? "-"}`);
+    attachRpcSocket(socket, session);
+  });
+  guestServer.listen(config.guestPort, "127.0.0.1", () =>
+    console.log(`buzz-host guest listening on 127.0.0.1:${config.guestPort}`),
+  );
+}
 
 let closing = false;
 async function shutdown(signal) {
@@ -1212,6 +1470,7 @@ async function shutdown(signal) {
   closing = true;
   console.log(`buzz-host shutting down (${signal})`);
   server.close();
+  guestServer?.close();
   await runnerManager.close().catch(() => {});
   await orchestrator.close().catch(() => {});
   process.exit(0);
