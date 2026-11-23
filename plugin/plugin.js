@@ -1270,8 +1270,26 @@ function createType({ React, client, ctx, uiKit, invalidateCatalog, ActivityTab,
 			label: n === 1 ? "1 (sequential)" : n === max ? `${n} (max)` : `${n} parallel`
 		}));
 	}
-	/** Runtime, Hermes profile, Model, Concurrency, Access and Runner rows, for a SettingsGroup. */
-	function RuntimeRows({ ui, draft, onChange, disabled, serverInfo }) {
+	/** One line naming the "More options" choices, for the collapsed row. */
+	function moreSummary(effective, { hermes, isGuest }) {
+		const respondTo = effective.respondTo || "owner-only";
+		const runner = effective.runner || (isGuest ? "docker" : "host");
+		const concurrency = Number(effective.concurrency) || 4;
+		return [
+			hermes && `Profile ${effective.profile || "default"}`,
+			RESPOND_TO_OPTIONS.find((o) => o.value === respondTo)?.label ?? respondTo,
+			runner === "host" ? "Runs on host" : RUNNERS.find((r) => r.id === runner)?.title ?? runner,
+			`${concurrency} parallel`
+		].filter(Boolean).join(" · ");
+	}
+	/**
+	* Runtime, Hermes profile, Model, Concurrency, Access and Runner rows, for a
+	* SettingsGroup. With `collapsible` (the Create popup), only Runtime and
+	* Model show; the rest sit behind a "More options" row whose subtitle names
+	* their current values, so the defaults stay visible without crowding.
+	*/
+	function RuntimeRows({ ui, draft, onChange, disabled, serverInfo, collapsible = false }) {
+		const [expanded, setExpanded] = React.useState(false);
 		const isGuest = serverInfo?.role === "guest";
 		const effective = isGuest ? applyGuestConstraints(draft, serverInfo) : draft;
 		const sandboxed = isGuest || (effective.runner || "host") !== "host";
@@ -1280,6 +1298,7 @@ function createType({ React, client, ctx, uiKit, invalidateCatalog, ActivityTab,
 		const { profiles, error: profileError } = useProfiles(React, client, hermes);
 		const choice = modelChoices(models);
 		const respondTo = effective.respondTo || "owner-only";
+		const showMore = !collapsible || expanded;
 		const runnerChoices = !isGuest && respondTo === "owner-only" ? RUNNERS.map((r) => ({
 			value: r.id,
 			label: r.title
@@ -1287,6 +1306,18 @@ function createType({ React, client, ctx, uiKit, invalidateCatalog, ActivityTab,
 			value: r.id,
 			label: r.title
 		}));
+		const profileRow = hermes && h(ui.Select, {
+			label: "Hermes profile",
+			variant: "preference",
+			value: effective.profile || "",
+			disabled: disabled || profiles === void 0,
+			...profileError ? { description: `Profile list unavailable: ${profileError}` } : {},
+			groups: one(profileOptions(profiles, effective.profile)),
+			onValueChange: (profile) => onChange({
+				...effective,
+				profile
+			})
+		});
 		return h(React.Fragment, null, h(ui.Select, {
 			label: "Runtime",
 			variant: "preference",
@@ -1299,18 +1330,7 @@ function createType({ React, client, ctx, uiKit, invalidateCatalog, ActivityTab,
 				model: "",
 				profile: ""
 			})
-		}), hermes && h(ui.Select, {
-			label: "Hermes profile",
-			variant: "preference",
-			value: effective.profile || "",
-			disabled: disabled || profiles === void 0,
-			...profileError ? { description: `Profile list unavailable: ${profileError}` } : {},
-			groups: one(profileOptions(profiles, effective.profile)),
-			onValueChange: (profile) => onChange({
-				...effective,
-				profile
-			})
-		}), h(ui.ModelPicker, {
+		}), !collapsible && profileRow, h(ui.ModelPicker, {
 			label: "Model",
 			models: choice.models,
 			groupByFamily: choice.byFamily,
@@ -1325,7 +1345,19 @@ function createType({ React, client, ctx, uiKit, invalidateCatalog, ActivityTab,
 				...effective,
 				model
 			})
-		}), h(ui.Select, {
+		}), collapsible && h(ui.PreferenceRow, {
+			title: "More options",
+			subtitle: moreSummary(effective, {
+				hermes,
+				isGuest
+			}),
+			trailing: h(ui.Button, {
+				size: "sm",
+				disabled,
+				"aria-expanded": showMore,
+				onClick: () => setExpanded((v) => !v)
+			}, showMore ? "Hide" : "Change")
+		}), collapsible && showMore && profileRow, showMore && h(ui.Select, {
 			label: "Parallel conversations",
 			variant: "preference",
 			value: String(effective.concurrency ?? (isGuest ? serverInfo?.limits?.maxConcurrency ?? 2 : 4)),
@@ -1335,7 +1367,7 @@ function createType({ React, client, ctx, uiKit, invalidateCatalog, ActivityTab,
 				...effective,
 				concurrency: Number(v) || 4
 			})
-		}), h(ui.Select, {
+		}), showMore && h(ui.Select, {
 			label: "Who can talk to this agent",
 			variant: "preference",
 			value: respondTo,
@@ -1349,7 +1381,7 @@ function createType({ React, client, ctx, uiKit, invalidateCatalog, ActivityTab,
 				} : {},
 				allowlistText: nextMode === "allowlist" ? effective.allowlistText ?? formatAllowlistText(effective.respondToAllowlist) : ""
 			})
-		}), h(ui.Select, {
+		}), showMore && h(ui.Select, {
 			label: "Sandbox runner",
 			variant: "preference",
 			value: effective.runner || (isGuest ? "docker" : "host"),
@@ -1433,12 +1465,13 @@ function createType({ React, client, ctx, uiKit, invalidateCatalog, ActivityTab,
 			draft,
 			onChange,
 			disabled,
-			serverInfo
+			serverInfo,
+			collapsible: true
 		})), h(AllowlistField, {
 			draft,
 			onChange,
 			disabled
-		}), h("p", { className: "m-0 text-body-sm text-secondary" }, isGuest ? "Runs in an isolated Docker sandbox on your host's server." : "Runs on your server with buzz-acp and uses that machine's sign-ins."));
+		}));
 	}
 	function RunsWith({ ui, agent, harnessControl }) {
 		const text = useRunsWith(agent.pubkey);

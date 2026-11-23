@@ -68,8 +68,29 @@ export function createType({
     }));
   }
 
-  /** Runtime, Hermes profile, Model, Concurrency, Access and Runner rows, for a SettingsGroup. */
-  function RuntimeRows({ ui, draft, onChange, disabled, serverInfo }) {
+  /** One line naming the "More options" choices, for the collapsed row. */
+  function moreSummary(effective, { hermes, isGuest }) {
+    const respondTo = effective.respondTo || "owner-only";
+    const runner = effective.runner || (isGuest ? "docker" : "host");
+    const concurrency = Number(effective.concurrency) || DEFAULT_CONCURRENCY;
+    return [
+      hermes && `Profile ${effective.profile || "default"}`,
+      RESPOND_TO_OPTIONS.find((o) => o.value === respondTo)?.label ?? respondTo,
+      runner === "host" ? "Runs on host" : (RUNNERS.find((r) => r.id === runner)?.title ?? runner),
+      `${concurrency} parallel`,
+    ]
+      .filter(Boolean)
+      .join(" · ");
+  }
+
+  /**
+   * Runtime, Hermes profile, Model, Concurrency, Access and Runner rows, for a
+   * SettingsGroup. With `collapsible` (the Create popup), only Runtime and
+   * Model show; the rest sit behind a "More options" row whose subtitle names
+   * their current values, so the defaults stay visible without crowding.
+   */
+  function RuntimeRows({ ui, draft, onChange, disabled, serverInfo, collapsible = false }) {
+    const [expanded, setExpanded] = React.useState(false);
     const isGuest = serverInfo?.role === "guest";
     const effective = isGuest ? applyGuestConstraints(draft, serverInfo) : draft;
     const sandboxed = isGuest || (effective.runner || "host") !== "host";
@@ -78,10 +99,22 @@ export function createType({
     const { profiles, error: profileError } = useProfiles(React, client, hermes);
     const choice = modelChoices(models);
     const respondTo = effective.respondTo || "owner-only";
+    const showMore = !collapsible || expanded;
     const runnerChoices =
       !isGuest && respondTo === "owner-only"
         ? RUNNERS.map((r) => ({ value: r.id, label: r.title }))
         : RUNNERS.filter((r) => r.id !== "host").map((r) => ({ value: r.id, label: r.title }));
+    const profileRow =
+      hermes &&
+      h(ui.Select, {
+        label: "Hermes profile",
+        variant: "preference",
+        value: effective.profile || "",
+        disabled: disabled || profiles === undefined,
+        ...(profileError ? { description: `Profile list unavailable: ${profileError}` } : {}),
+        groups: one(profileOptions(profiles, effective.profile)),
+        onValueChange: (profile) => onChange({ ...effective, profile }),
+      });
     return h(
       React.Fragment,
       null,
@@ -93,16 +126,7 @@ export function createType({
         groups: one(runtimeOptionsFor(serverInfo)),
         onValueChange: (runtime) => onChange({ ...effective, runtime, model: "", profile: "" }),
       }),
-      hermes &&
-        h(ui.Select, {
-          label: "Hermes profile",
-          variant: "preference",
-          value: effective.profile || "",
-          disabled: disabled || profiles === undefined,
-          ...(profileError ? { description: `Profile list unavailable: ${profileError}` } : {}),
-          groups: one(profileOptions(profiles, effective.profile)),
-          onValueChange: (profile) => onChange({ ...effective, profile }),
-        }),
+      !collapsible && profileRow,
       h(ui.ModelPicker, {
         label: "Model",
         models: choice.models,
@@ -116,40 +140,54 @@ export function createType({
         ...(error ? { description: `Model list unavailable: ${error}` } : {}),
         onChange: (model) => onChange({ ...effective, model }),
       }),
-      h(ui.Select, {
-        label: "Parallel conversations",
-        variant: "preference",
-        value: String(effective.concurrency ?? (isGuest ? (serverInfo?.limits?.maxConcurrency ?? 2) : DEFAULT_CONCURRENCY)),
-        disabled,
-        groups: one(concurrencyOptionsFor(serverInfo)),
-        onValueChange: (v) => onChange({ ...effective, concurrency: Number(v) || DEFAULT_CONCURRENCY }),
-      }),
-      h(ui.Select, {
-        label: "Who can talk to this agent",
-        variant: "preference",
-        value: respondTo,
-        disabled,
-        groups: one(RESPOND_TO_OPTIONS),
-        onValueChange: (nextMode) =>
-          onChange({
-            ...applyRespondToChange(effective, nextMode),
-            ...(isGuest ? { runner: "docker", profile: "" } : {}),
-            allowlistText: nextMode === "allowlist" ? (effective.allowlistText ?? formatAllowlistText(effective.respondToAllowlist)) : "",
-          }),
-      }),
-      h(ui.Select, {
-        label: "Sandbox runner",
-        variant: "preference",
-        value: effective.runner || (isGuest ? "docker" : "host"),
-        disabled: disabled || isGuest,
-        ...(isGuest
-          ? { description: "Guest accounts always run agents in an isolated Docker sandbox." }
-          : respondTo !== "owner-only"
-            ? { description: "Shared agents always run in an isolated sandbox container." }
-            : {}),
-        groups: one(runnerChoices),
-        onValueChange: (nextRunner) => onChange(applyRunnerChange(effective, nextRunner)),
-      }),
+      collapsible &&
+        h(ui.PreferenceRow, {
+          title: "More options",
+          subtitle: moreSummary(effective, { hermes, isGuest }),
+          trailing: h(
+            ui.Button,
+            { size: "sm", disabled, "aria-expanded": showMore, onClick: () => setExpanded((v) => !v) },
+            showMore ? "Hide" : "Change",
+          ),
+        }),
+      collapsible && showMore && profileRow,
+      showMore &&
+        h(ui.Select, {
+          label: "Parallel conversations",
+          variant: "preference",
+          value: String(effective.concurrency ?? (isGuest ? (serverInfo?.limits?.maxConcurrency ?? 2) : DEFAULT_CONCURRENCY)),
+          disabled,
+          groups: one(concurrencyOptionsFor(serverInfo)),
+          onValueChange: (v) => onChange({ ...effective, concurrency: Number(v) || DEFAULT_CONCURRENCY }),
+        }),
+      showMore &&
+        h(ui.Select, {
+          label: "Who can talk to this agent",
+          variant: "preference",
+          value: respondTo,
+          disabled,
+          groups: one(RESPOND_TO_OPTIONS),
+          onValueChange: (nextMode) =>
+            onChange({
+              ...applyRespondToChange(effective, nextMode),
+              ...(isGuest ? { runner: "docker", profile: "" } : {}),
+              allowlistText: nextMode === "allowlist" ? (effective.allowlistText ?? formatAllowlistText(effective.respondToAllowlist)) : "",
+            }),
+        }),
+      showMore &&
+        h(ui.Select, {
+          label: "Sandbox runner",
+          variant: "preference",
+          value: effective.runner || (isGuest ? "docker" : "host"),
+          disabled: disabled || isGuest,
+          ...(isGuest
+            ? { description: "Guest accounts always run agents in an isolated Docker sandbox." }
+            : respondTo !== "owner-only"
+              ? { description: "Shared agents always run in an isolated sandbox container." }
+              : {}),
+          groups: one(runnerChoices),
+          onValueChange: (nextRunner) => onChange(applyRunnerChange(effective, nextRunner)),
+        }),
     );
   }
 
@@ -240,15 +278,13 @@ export function createType({
     return h(
       "div",
       { className: "grid gap-2" },
-      h(ui.SettingsGroup, null, harnessControl, h(RuntimeRows, { ui, draft, onChange, disabled, serverInfo })),
-      h(AllowlistField, { draft, onChange, disabled }),
       h(
-        "p",
-        { className: "m-0 text-body-sm text-secondary" },
-        isGuest
-          ? "Runs in an isolated Docker sandbox on your host's server."
-          : "Runs on your server with buzz-acp and uses that machine's sign-ins.",
+        ui.SettingsGroup,
+        null,
+        harnessControl,
+        h(RuntimeRows, { ui, draft, onChange, disabled, serverInfo, collapsible: true }),
       ),
+      h(AllowlistField, { draft, onChange, disabled }),
     );
   }
 
