@@ -15,7 +15,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 
 const HEX64 = /^[0-9a-f]{64}$/;
-const MEMORY_TOOL_NAMES = new Set(["mem_get", "mem_set", "mem_rm"]);
+const MEMORY_TOOL_NAMES = new Set(["mem_get", "mem_set", "mem_rm", "memory_core"]);
 const ATTENTION_TOOL_NAMES = new Set([
   "interest_list",
   "interest_show",

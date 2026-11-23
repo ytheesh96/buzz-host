@@ -1,7 +1,7 @@
 # Hardened sandbox image for buzz-host guest and shared agents.
-# Supports Hermes (OpenCode Go), Claude Code, and Antigravity (mounted ro at /opt/antigravity/agy).
-# Host binaries (buzz-acp, buzz, acp-proxy) and sandbox scripts are bind-mounted ro at /opt/buzz-host.
-FROM node:22-bookworm-slim
+# Uses Debian Trixie (glibc 2.41) so host-mounted Arch binaries (`buzz` requires GLIBC_2.38,
+# `buzz-acp`, and `antigravity`) run directly with zero compatibility issues.
+FROM node:22-trixie-slim
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
