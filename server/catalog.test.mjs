@@ -447,3 +447,44 @@ test("toModelList formats cached probe results for the models RPC", () => {
     efforts: [],
   });
 });
+
+test("probe closes child stdin cleanly on completion and handles early exit without EPIPE", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "catalog-eof-"));
+  tmpDirs.push(dir);
+  const eofMarker = path.join(dir, "saw-eof");
+  const script = path.join(dir, "adapter-eof.mjs");
+  await fs.writeFile(
+    script,
+    `
+import fs from "node:fs";
+let buf = "";
+process.on("SIGTERM", () => {});
+process.stdin.on("end", () => {
+  fs.writeFileSync(${JSON.stringify(eofMarker)}, "eof");
+  process.exit(0);
+});
+process.stdin.on("data", (d) => {
+  buf += d;
+  let i;
+  while ((i = buf.indexOf("\\n")) >= 0) {
+    const m = JSON.parse(buf.slice(0, i)); buf = buf.slice(i + 1);
+    if (m.method === "initialize") process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: m.id, result: { protocolVersion: 1 } }) + "\\n");
+    else if (m.method === "session/new") process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: m.id, result: { sessionId: "s", configOptions: [] } }) + "\\n");
+  }
+});
+`,
+  );
+  const res = await probe({ command: process.execPath, args: [script], cwd: dir, env: process.env, perModel: false });
+  assert.equal(res.model, null);
+  let saw = "";
+  for (let i = 0; i < 40 && !saw; i++) {
+    saw = await fs.readFile(eofMarker, "utf8").catch(() => "");
+    if (!saw) await new Promise((r) => setTimeout(r, 25));
+  }
+  assert.equal(saw, "eof");
+
+  // Early-exit adapter must reject cleanly without an unhandled EPIPE on child.stdin.
+  const crashScript = path.join(dir, "adapter-crash.mjs");
+  await fs.writeFile(crashScript, "process.exit(1);\n");
+  await assert.rejects(probe({ command: process.execPath, args: [crashScript], cwd: dir, env: process.env }), /exited/);
+});

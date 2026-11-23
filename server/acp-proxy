@@ -2778,8 +2778,36 @@ def handle_adapter_line(line, adapter_runtime=None):
     return line
 
 
+def _iter_stdin_lines():
+    """Read newline-delimited bytes from raw fd 0 without holding sys.stdin.buffer's lock.
+
+    Holding CPython's BufferedReader lock in a daemon thread while the main thread
+    exits triggers a fatal SIGABRT (_enter_buffered_busy) at interpreter shutdown.
+    """
+    fd = sys.stdin.fileno()
+    buf = b""
+    while True:
+        try:
+            chunk = os.read(fd, 65536)
+        except InterruptedError:
+            continue
+        except OSError:
+            break
+        if not chunk:
+            if buf:
+                yield buf
+            break
+        buf += chunk
+        while True:
+            nl = buf.find(b"\n")
+            if nl < 0:
+                break
+            yield buf[:nl + 1]
+            buf = buf[nl + 1:]
+
+
 def pump_client():
-    for line in sys.stdin.buffer:
+    for line in _iter_stdin_lines():
         target_rt, out = dispatch_client_line(line)
         if out is None:
             continue
@@ -2982,4 +3010,12 @@ if __name__ == "__main__":
             secondary = list(adapters.values())
         for ad in secondary:
             _reap_proc(ad["proc"])
-    sys.exit(code)
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.flush()
+        except Exception:
+            pass
+    # Exit without running Py_FinalizeEx against live daemon threads (e.g.
+    # pump_client blocked in read(0) when terminated before stdin closes).
+    exit_code = code if isinstance(code, int) and code >= 0 else (128 + abs(code) if isinstance(code, int) else 1)
+    os._exit(exit_code)

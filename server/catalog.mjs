@@ -58,6 +58,7 @@ const flat = (option) =>
  * get the levels the session started with. Never sends a prompt. */
 export async function probe({ command, args = [], env, cwd, perModel = true, budgetMs = 120_000, stepMs = 30_000 }) {
   const child = spawn(command, args, { env, cwd, stdio: ["pipe", "pipe", "ignore"] });
+  child.stdin.on("error", () => {});
   const waiting = new Map();
   let buffer = "";
   let next = 0;
@@ -151,6 +152,11 @@ export async function probe({ command, args = [], env, cwd, perModel = true, bud
     }
     return result;
   } finally {
+    if (!child.stdin.destroyed) {
+      try {
+        child.stdin.end();
+      } catch {}
+    }
     child.kill();
   }
 }

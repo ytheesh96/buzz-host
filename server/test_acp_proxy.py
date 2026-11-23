@@ -1241,5 +1241,42 @@ class RuntimeSchedulerGuards(Base):
             mod._state_db = orig_db
 
 
+class Shutdown(unittest.TestCase):
+    def test_sigterm_while_stdin_open_exits_cleanly_without_sigabrt(self):
+        import signal, subprocess
+        proxy = os.path.join(HERE, "acp-proxy")
+        dummy = (
+            "import signal, sys, time\n"
+            "signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))\n"
+            "sys.stdout.write('{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":1}}\\n')\n"
+            "sys.stdout.flush()\n"
+            "time.sleep(30)\n"
+        )
+        proc = subprocess.Popen(
+            [sys.executable, proxy, sys.executable, "-c", dummy],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            # Wait until child has started and emitted its readiness line,
+            # leaving proc.stdin open so pump_client is blocked reading fd 0.
+            first = proc.stdout.readline()
+            self.assertIn(b"protocolVersion", first)
+            time.sleep(0.05)
+            proc.send_signal(signal.SIGTERM)
+            rc = proc.wait(timeout=5)
+            err = proc.stderr.read().decode("utf-8", "replace")
+            self.assertEqual(rc, 0, f"expected clean exit, got rc={rc}, stderr={err!r}")
+            self.assertNotIn("Fatal Python error", err)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5)
+            for s in (proc.stdin, proc.stdout, proc.stderr):
+                if s:
+                    s.close()
+
+
 if __name__ == "__main__":
     unittest.main()
