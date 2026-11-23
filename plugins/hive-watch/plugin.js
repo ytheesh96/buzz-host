@@ -99,6 +99,16 @@ function createClient() {
 		if (opening) return opening;
 		const url = storedUrl();
 		const token = storedToken();
+		if (!url) {
+			const error = /* @__PURE__ */ new Error("No buzz-host server configured yet. Open Settings → Plugins → Remote Agents and paste your server URL or invite link.");
+			set({
+				status: "idle",
+				url: "",
+				error: error.message,
+				session: null
+			});
+			return Promise.reject(error);
+		}
 		set({
 			status: "connecting",
 			url,
@@ -261,7 +271,16 @@ const ICONS = {
 	caret: ["M9 6l6 6l-6 6"],
 	gear: ["M10.325 4.317c.426 -1.756 2.924 -1.756 3.35 0a1.724 1.724 0 0 0 2.573 1.066c1.543 -.94 3.31 .826 2.37 2.37a1.724 1.724 0 0 0 1.065 2.572c1.756 .426 1.756 2.924 0 3.35a1.724 1.724 0 0 0 -1.066 2.573c.94 1.543 -.826 3.31 -2.37 2.37a1.724 1.724 0 0 0 -2.572 1.065c-.426 1.756 -2.924 1.756 -3.35 0a1.724 1.724 0 0 0 -2.573 -1.066c-1.543 .94 -3.31 -.826 -2.37 -2.37a1.724 1.724 0 0 0 -1.065 -2.572c-1.756 -.426 -1.756 -2.924 0 -3.35a1.724 1.724 0 0 0 1.066 -2.573c-.94 -1.543 .826 -3.31 2.37 -2.37c1 .608 2.296 .07 2.572 -1.065", "M9 12a3 3 0 1 0 6 0a3 3 0 0 0 -6 0"],
 	circle: ["M3 12a9 9 0 1 0 18 0a9 9 0 1 0 -18 0"],
-	x: ["M18 6l-12 12", "M6 6l12 12"]
+	x: ["M18 6l-12 12", "M6 6l12 12"],
+	monitor: [
+		"M3 5a1 1 0 0 1 1 -1h16a1 1 0 0 1 1 1v10a1 1 0 0 1 -1 1h-16a1 1 0 0 1 -1 -1v-10",
+		"M7 20h10",
+		"M9 16v4",
+		"M15 16v4"
+	],
+	sidebar: ["M4 6a2 2 0 0 1 2 -2h12a2 2 0 0 1 2 2v12a2 2 0 0 1 -2 2h-12a2 2 0 0 1 -2 -2z", "M9 4l0 16"],
+	sidebarRight: ["M4 6a2 2 0 0 1 2 -2h12a2 2 0 0 1 2 2v12a2 2 0 0 1 -2 2h-12a2 2 0 0 1 -2 -2z", "M15 4l0 16"],
+	refresh: ["M20 11a8.1 8.1 0 0 0 -15.5 -2m-.5 -4v4h4", "M4 13a8.1 8.1 0 0 0 15.5 2m.5 4v-4h-4"]
 };
 function createBuzzPrimitives(React) {
 	const h = React.createElement;

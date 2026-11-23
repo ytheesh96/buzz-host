@@ -69,9 +69,9 @@ export function createType({
   }
 
   /** One line naming the "More options" choices, for the collapsed row. */
-  function moreSummary(effective, { hermes, isGuest }) {
+  function moreSummary(effective, { hermes, canUseHost }) {
     const respondTo = effective.respondTo || "owner-only";
-    const runner = effective.runner || (isGuest ? "docker" : "host");
+    const runner = effective.runner || (canUseHost ? "host" : "docker");
     const concurrency = Number(effective.concurrency) || DEFAULT_CONCURRENCY;
     return [
       hermes && `Profile ${effective.profile || "default"}`,
@@ -92,16 +92,17 @@ export function createType({
   function RuntimeRows({ ui, draft, onChange, disabled, serverInfo, collapsible = false }) {
     const [expanded, setExpanded] = React.useState(false);
     const isGuest = serverInfo?.role === "guest";
+    const canUseHost = !isGuest || serverInfo?.limits?.allowHostDesktop === true;
     const effective = isGuest ? applyGuestConstraints(draft, serverInfo) : draft;
-    const sandboxed = isGuest || (effective.runner || "host") !== "host";
-    const { models, error } = useModels(React, client, effective.runtime, sandboxed ? "" : effective.profile);
+    const sandboxed = (effective.runner || (canUseHost ? "host" : "docker")) !== "host";
+    const { models, error } = useModels(React, client, effective.runtime, !isGuest && !sandboxed ? effective.profile : "");
     const hermes = !isGuest && effective.runtime === "hermes" && !sandboxed;
     const { profiles, error: profileError } = useProfiles(React, client, hermes);
     const choice = modelChoices(models);
     const respondTo = effective.respondTo || "owner-only";
     const showMore = !collapsible || expanded;
     const runnerChoices =
-      !isGuest && respondTo === "owner-only"
+      canUseHost && respondTo === "owner-only"
         ? RUNNERS.map((r) => ({ value: r.id, label: r.title }))
         : RUNNERS.filter((r) => r.id !== "host").map((r) => ({ value: r.id, label: r.title }));
     const profileRow =
@@ -143,7 +144,7 @@ export function createType({
       collapsible &&
         h(ui.PreferenceRow, {
           title: "More options",
-          subtitle: moreSummary(effective, { hermes, isGuest }),
+          subtitle: moreSummary(effective, { hermes, canUseHost }),
           trailing: h(
             ui.Button,
             { size: "sm", disabled, "aria-expanded": showMore, onClick: () => setExpanded((v) => !v) },
@@ -170,7 +171,7 @@ export function createType({
           onValueChange: (nextMode) =>
             onChange({
               ...applyRespondToChange(effective, nextMode),
-              ...(isGuest ? { runner: "docker", profile: "" } : {}),
+              ...(!canUseHost ? { runner: "docker", profile: "" } : isGuest ? { profile: "" } : {}),
               allowlistText: nextMode === "allowlist" ? (effective.allowlistText ?? formatAllowlistText(effective.respondToAllowlist)) : "",
             }),
         }),
@@ -178,9 +179,9 @@ export function createType({
         h(ui.Select, {
           label: "Sandbox runner",
           variant: "preference",
-          value: effective.runner || (isGuest ? "docker" : "host"),
-          disabled: disabled || isGuest,
-          ...(isGuest
+          value: effective.runner || (canUseHost ? "host" : "docker"),
+          disabled: disabled || !canUseHost,
+          ...(!canUseHost
             ? { description: "Guest accounts always run agents in an isolated Docker sandbox." }
             : respondTo !== "owner-only"
               ? { description: "Shared agents always run in an isolated sandbox container." }
@@ -204,7 +205,7 @@ export function createType({
         rows: 4,
         value: text,
         disabled,
-        placeholder: "b9085cc5...\n...",
+        placeholder: "01234567...\n...",
         onChange: (e) =>
           onChange({
             ...draft,
@@ -338,6 +339,7 @@ export function createType({
     const { info: fetchedInfo } = useServerInfo(React, client);
     const serverInfo = passedServerInfo ?? fetchedInfo;
     const isGuest = serverInfo?.role === "guest";
+    const canUseHost = !isGuest || serverInfo?.limits?.allowHostDesktop === true;
     const draft = isGuest ? applyGuestConstraints(asConfig(config), serverInfo) : asConfig(config);
     const change = (patch) => onChange(isGuest ? applyGuestConstraints({ ...draft, ...patch }, serverInfo) : { ...draft, ...patch });
     if (part === "instructions")
@@ -405,7 +407,7 @@ export function createType({
           onChange: (nextMode) =>
             onChange({
               ...applyRespondToChange(draft, nextMode),
-              ...(isGuest ? { runner: "docker", profile: "" } : {}),
+              ...(!canUseHost ? { runner: "docker", profile: "" } : isGuest ? { profile: "" } : {}),
               allowlistText: nextMode === "allowlist" ? (draft.allowlistText ?? formatAllowlistText(draft.respondToAllowlist)) : "",
             }),
         }),
@@ -415,17 +417,17 @@ export function createType({
         Row,
         {
           label: "Sandbox runner",
-          hint: isGuest
+          hint: !canUseHost
             ? "Guest accounts always run agents in an isolated Docker sandbox."
             : (draft.respondTo || "owner-only") !== "owner-only"
               ? "Shared agents always run in an isolated sandbox container."
               : "Choose Docker sandbox to isolate this agent from host files and keys.",
         },
         h(Select, {
-          value: draft.runner || (isGuest ? "docker" : "host"),
-          disabled: disabled || isGuest,
+          value: draft.runner || (canUseHost ? "host" : "docker"),
+          disabled: disabled || !canUseHost,
           options:
-            !isGuest && (draft.respondTo || "owner-only") === "owner-only"
+            canUseHost && (draft.respondTo || "owner-only") === "owner-only"
               ? RUNNERS.map((r) => ({ value: r.id, label: r.title }))
               : RUNNERS.filter((r) => r.id !== "host").map((r) => ({ value: r.id, label: r.title })),
           onChange: (nextRunner) => onChange(applyRunnerChange(draft, nextRunner)),

@@ -99,6 +99,16 @@ function createClient() {
 		if (opening) return opening;
 		const url = storedUrl();
 		const token = storedToken();
+		if (!url) {
+			const error = /* @__PURE__ */ new Error("No buzz-host server configured yet. Open Settings → Plugins → Remote Agents and paste your server URL or invite link.");
+			set({
+				status: "idle",
+				url: "",
+				error: error.message,
+				session: null
+			});
+			return Promise.reject(error);
+		}
 		set({
 			status: "connecting",
 			url,
@@ -320,7 +330,16 @@ const ICONS = {
 	caret: ["M9 6l6 6l-6 6"],
 	gear: ["M10.325 4.317c.426 -1.756 2.924 -1.756 3.35 0a1.724 1.724 0 0 0 2.573 1.066c1.543 -.94 3.31 .826 2.37 2.37a1.724 1.724 0 0 0 1.065 2.572c1.756 .426 1.756 2.924 0 3.35a1.724 1.724 0 0 0 -1.066 2.573c.94 1.543 -.826 3.31 -2.37 2.37a1.724 1.724 0 0 0 -2.572 1.065c-.426 1.756 -2.924 1.756 -3.35 0a1.724 1.724 0 0 0 -2.573 -1.066c-1.543 .94 -3.31 -.826 -2.37 -2.37a1.724 1.724 0 0 0 -1.065 -2.572c-1.756 -.426 -1.756 -2.924 0 -3.35a1.724 1.724 0 0 0 1.066 -2.573c-.94 -1.543 .826 -3.31 2.37 -2.37c1 .608 2.296 .07 2.572 -1.065", "M9 12a3 3 0 1 0 6 0a3 3 0 0 0 -6 0"],
 	circle: ["M3 12a9 9 0 1 0 18 0a9 9 0 1 0 -18 0"],
-	x: ["M18 6l-12 12", "M6 6l12 12"]
+	x: ["M18 6l-12 12", "M6 6l12 12"],
+	monitor: [
+		"M3 5a1 1 0 0 1 1 -1h16a1 1 0 0 1 1 1v10a1 1 0 0 1 -1 1h-16a1 1 0 0 1 -1 -1v-10",
+		"M7 20h10",
+		"M9 16v4",
+		"M15 16v4"
+	],
+	sidebar: ["M4 6a2 2 0 0 1 2 -2h12a2 2 0 0 1 2 2v12a2 2 0 0 1 -2 2h-12a2 2 0 0 1 -2 -2z", "M9 4l0 16"],
+	sidebarRight: ["M4 6a2 2 0 0 1 2 -2h12a2 2 0 0 1 2 2v12a2 2 0 0 1 -2 2h-12a2 2 0 0 1 -2 -2z", "M15 4l0 16"],
+	refresh: ["M20 11a8.1 8.1 0 0 0 -15.5 -2m-.5 -4v4h4", "M4 13a8.1 8.1 0 0 0 15.5 2m.5 4v-4h-4"]
 };
 function createBuzzPrimitives(React) {
 	const h = React.createElement;
@@ -7396,7 +7415,51 @@ while (r === o[++i] && r === o[++i] && r === o[++i] && r === o[++i] && r === o[+
 
 //#endregion
 //#region plugin/src/desktop.js
-const XK_ESCAPE = 65307;
+const HEX_PUBKEY = /^[0-9a-f]{64}$/i;
+const VIEWPORT_PAGE_ID = "desktops";
+const VIEWPORT_PAGE_ICON = "data:image/svg+xml," + encodeURIComponent("<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><rect x=\"3\" y=\"4\" width=\"18\" height=\"12\" rx=\"1\"/><path d=\"M7 20h10M9 16v4M15 16v4\"/></svg>");
+/** Parse route params for the Viewport page (`{ pubkey?, take? }`). Returns null if invalid. */
+function parseViewportRoute(params) {
+	if (!params || typeof params !== "object" || Array.isArray(params)) return null;
+	if (Object.keys(params).some((k) => k !== "pubkey" && k !== "take")) return null;
+	const pubkey = typeof params.pubkey === "string" && HEX_PUBKEY.test(params.pubkey) ? params.pubkey.toLowerCase() : "";
+	if (params.pubkey !== void 0 && !pubkey) return null;
+	if (params.take !== void 0 && typeof params.take !== "boolean" && params.take !== "1" && params.take !== "true") return null;
+	const take = params.take === true || params.take === "1" || params.take === "true";
+	if (take && !pubkey) return null;
+	return {
+		pubkey,
+		take
+	};
+}
+function validateViewportRoute(params) {
+	return parseViewportRoute(params) !== null;
+}
+/** Target string for Buzz's native agent sidebar panel opened to its Activity tab. */
+function agentActivityPanelTarget(pubkey) {
+	return typeof pubkey === "string" && HEX_PUBKEY.test(pubkey) ? `buzz:profile?agent=${pubkey.toLowerCase()}&tab=activity` : "";
+}
+/** Build a Buzz navigation target that opens the Viewport page inside the app. */
+function viewportPageTarget(pluginId, pubkey, { take = false } = {}) {
+	const normalized = typeof pubkey === "string" && HEX_PUBKEY.test(pubkey) ? pubkey.toLowerCase() : "";
+	const base = {
+		version: 1,
+		kind: "page",
+		pluginId: pluginId || "local.buzz-host.viewport",
+		pageId: VIEWPORT_PAGE_ID
+	};
+	if (!normalized) return base;
+	return {
+		...base,
+		route: {
+			version: 1,
+			params: take ? {
+				pubkey: normalized,
+				take: true
+			} : { pubkey: normalized }
+		}
+	};
+}
 /** "<agent> <turn> <live|done> <threadRoot>" per desktop agent working on this request. */
 function previewKeys(snap, channelId, messageId, agents) {
 	if (!snap?.turns || !messageId || !agents.size) return "";
@@ -7408,8 +7471,23 @@ function previewKeys(snap, channelId, messageId, agents) {
 	}
 	return [...latest.values()].map((t) => `${t.agent} ${t.turnId} ${t.state === "working" ? "live" : "done"} ${t.threadRootId ?? ""}`).join("\n");
 }
-function createDesktop({ React, client, ctx, uiKit, Btn }) {
+function sortDesktopAgents(agents) {
+	return [...agents].sort((a, b) => {
+		const rank = (x) => x.desktopRunning ? 0 : x.desktop ? 1 : 2;
+		const diff = rank(a) - rank(b);
+		if (diff !== 0) return diff;
+		return String(a.name || a.pubkey).localeCompare(String(b.name || b.pubkey), "en");
+	});
+}
+function createDesktop({ React, client, ctx, uiKit, Btn, Icon, navigation, panels, pluginId }) {
 	const { h, Note } = uiKit;
+	const emptyPanels = () => [];
+	const useNoopSplit = () => ({
+		ref: React.useRef(null),
+		handle: null
+	});
+	const useSideSplit = panels?.ui?.useSplit ?? useNoopSplit;
+	const PanelWorkspace = panels?.ui?.Workspace;
 	const viewers = /* @__PURE__ */ new Map();
 	function desktopViewer(pubkey) {
 		let v = viewers.get(pubkey);
@@ -7423,19 +7501,20 @@ function createDesktop({ React, client, ctx, uiKit, Btn }) {
 		for (const v of viewers.values()) v.dispose();
 		viewers.clear();
 	});
+	function openDesktop(pubkey, { take = false } = {}) {
+		if (!navigation?.open) return;
+		navigation.open(viewportPageTarget(pluginId, pubkey, { take }));
+	}
 	function createViewer(pubkey) {
 		const screen = document.createElement("div");
-		screen.style.cssText = "width:100%;height:100%;min-width:0;min-height:0;overflow:hidden;background:#000";
+		screen.setAttribute("data-buzz-host-desktop-stage", "");
+		screen.style.cssText = "width:100%;height:100%;min-width:0;min-height:0;overflow:hidden;background:#000;outline:none";
 		let rfb = null;
 		let viewerId = "";
 		let connecting = null;
-		let overlay = null;
-		let bar = null;
-		let native = false;
 		let state = {
 			status: "off",
 			mine: false,
-			full: false,
 			error: "",
 			busy: ""
 		};
@@ -7446,8 +7525,13 @@ function createDesktop({ React, client, ctx, uiKit, Btn }) {
 				...patch
 			};
 			for (const l of listeners) l();
-			renderBar();
 		};
+		screen.addEventListener("keydown", (e) => {
+			if (state.mine && e.key === "Escape") e.stopPropagation();
+		});
+		screen.addEventListener("pointerdown", () => {
+			if (state.mine) rfb?.focus();
+		});
 		function repaint(r) {
 			try {
 				const d = r._display;
@@ -7468,7 +7552,7 @@ function createDesktop({ React, client, ctx, uiKit, Btn }) {
 			const r = rfb;
 			if (!r) return;
 			requestAnimationFrame(() => requestAnimationFrame(() => fit(r)));
-			setTimeout(() => fit(r), 450);
+			setTimeout(() => fit(r), 250);
 		}
 		function connect() {
 			if (rfb) return Promise.resolve();
@@ -7503,7 +7587,6 @@ function createDesktop({ React, client, ctx, uiKit, Btn }) {
 							mine: false,
 							error: e.detail?.clean ? "" : "The desktop view closed (the desktop stopped, another viewer took over, or the connection dropped)."
 						});
-						if (state.full) exitFull();
 					});
 					rfb = r;
 					viewerId = v.viewer;
@@ -7549,40 +7632,11 @@ function createDesktop({ React, client, ctx, uiKit, Btn }) {
 			});
 			return Promise.resolve().then(task).catch((e) => set({ error: String(e.message ?? e) })).finally(() => set({ busy: "" }));
 		};
-		function onFullscreenChange() {
-			if (!document.fullscreenElement && native) {
-				native = false;
-				exitFull();
-			}
-		}
-		/** Call from the click itself: monitor-wide full screen needs its user activation. */
-		function enterFull({ take = false } = {}) {
-			if (!state.full) {
-				overlay ??= buildOverlay();
-				document.body.appendChild(overlay);
-				document.addEventListener("fullscreenchange", onFullscreenChange);
-				set({ full: true });
-				overlay.firstChild.appendChild(screen);
-				refit();
-				if (overlay.requestFullscreen && !document.fullscreenElement) overlay.requestFullscreen().then(() => {
-					native = true;
-					refit();
-				}, () => native = false);
-			}
+		function open({ take = false } = {}) {
 			return act(take ? "take" : "watch", async () => {
 				await connect();
 				if (take && !state.mine) await lease(true);
 			});
-		}
-		function exitFull() {
-			if (!state.full) return;
-			document.removeEventListener("fullscreenchange", onFullscreenChange);
-			if (native && document.fullscreenElement) document.exitFullscreen().catch(() => {});
-			native = false;
-			overlay?.remove();
-			screen.remove();
-			set({ full: false });
-			disconnect();
 		}
 		const takeOver = () => act("take", async () => {
 			await connect();
@@ -7590,60 +7644,21 @@ function createDesktop({ React, client, ctx, uiKit, Btn }) {
 		});
 		const handBack = () => act("back", async () => {
 			await lease(false);
-			exitFull();
 		});
-		function buildOverlay() {
-			const el = document.createElement("div");
-			el.setAttribute("data-buzz-host-desktop", "");
-			el.style.cssText = "position:fixed;inset:0;z-index:2147483000;background:#000;display:flex;flex-direction:column";
-			const stage = document.createElement("div");
-			stage.style.cssText = "flex:1;min-width:0;min-height:0;position:relative";
-			bar = document.createElement("div");
-			bar.className = "ui-card";
-			bar.style.cssText = "position:absolute;top:8px;left:50%;transform:translateX(-50%);z-index:1;display:flex;gap:8px;align-items:center;padding:4px 8px;max-width:calc(100% - 16px);opacity:.35;transition:opacity 150ms;box-shadow:0 2px 12px rgba(0,0,0,.5)";
-			bar.addEventListener("mouseenter", () => bar.style.opacity = "1");
-			bar.addEventListener("mouseleave", () => bar.style.opacity = ".35");
-			el.append(stage, bar);
-			return el;
-		}
-		function barButton(label, variant, onClick, key, title) {
-			const b = document.createElement("button");
-			b.type = "button";
-			b.className = "buzz-button";
-			b.setAttribute("data-buzz-ui", "");
-			b.setAttribute("data-variant", variant);
-			b.setAttribute("data-size", "sm");
-			b.setAttribute("data-button-shape", "capsule");
-			if (title) b.title = title;
-			if (state.busy) {
-				b.disabled = true;
-				b.setAttribute("data-disabled", "");
+		function attach(host) {
+			if (!host) return () => {};
+			if (screen.parentNode !== host) host.replaceChildren(screen);
+			let observer = null;
+			if (typeof ResizeObserver === "function") {
+				observer = new ResizeObserver(() => refit());
+				observer.observe(host);
 			}
-			const text = document.createElement("span");
-			text.className = "buzz-button-label";
-			text.textContent = state.busy === key ? "…" : label;
-			b.append(text);
-			b.addEventListener("click", (e) => {
-				e.stopPropagation();
-				onClick();
-			});
-			return b;
-		}
-		function renderBar() {
-			if (!bar || !state.full) return;
-			const label = document.createElement("span");
-			label.className = state.error ? "text-body-sm text-danger" : "text-body-sm text-secondary";
-			label.style.cssText = "white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0";
-			label.textContent = state.error || (state.status !== "live" ? "Connecting…" : state.mine ? "You have control" : "Watching");
-			const parts = [label];
-			if (state.status === "live") {
-				if (state.mine) {
-					parts.push(barButton("Hand back", "outline", handBack, "back"));
-					parts.push(barButton("Esc", "ghost", () => rfb?.sendKey(XK_ESCAPE, "Escape"), "esc", "Send Esc to the agent's desktop (your Esc key leaves full screen)"));
-				} else parts.push(barButton("Take over", "prominent", takeOver, "take"));
-			}
-			parts.push(barButton("Exit full screen", "ghost", exitFull, "exit"));
-			bar.replaceChildren(...parts);
+			refit();
+			return () => {
+				observer?.disconnect();
+				if (screen.parentNode === host) screen.remove();
+				disconnect();
+			};
 		}
 		return {
 			subscribe(listener) {
@@ -7651,18 +7666,573 @@ function createDesktop({ React, client, ctx, uiKit, Btn }) {
 				return () => listeners.delete(listener);
 			},
 			snapshot: () => state,
-			connect: () => act("watch", connect),
+			attach,
+			refit,
+			open,
+			connect: () => open({ take: false }),
 			disconnect,
-			enterFull,
-			exitFull,
-			takeOver: () => enterFull({ take: true }),
+			takeOver,
 			handBack,
 			dispose() {
-				exitFull();
+				screen.remove();
 				disconnect();
 				listeners.clear();
 			}
 		};
+	}
+	function ViewportPage({ navigation: pageNav }) {
+		const rawParams = pageNav?.target?.kind === "page" ? pageNav.target.route?.params : void 0;
+		const route = React.useMemo(() => parseViewportRoute(rawParams), [rawParams]);
+		const entryId = pageNav?.entryId ?? "";
+		const traversal = pageNav?.traversal === true;
+		const [agents, setAgents] = React.useState([]);
+		const [loading, setLoading] = React.useState(true);
+		const [loadError, setLoadError] = React.useState("");
+		const [selectedPubkey, setSelectedPubkey] = React.useState(() => route?.pubkey ?? "");
+		const [sidebarOpen, setSidebarOpen] = React.useState(true);
+		const [inspectorOpen, setInspectorOpen] = React.useState(false);
+		const [actionBusy, setActionBusy] = React.useState("");
+		const [actionError, setActionError] = React.useState("");
+		const [autoOpen, setAutoOpen] = React.useState(() => route?.pubkey ? {
+			key: entryId || `init:${route.pubkey}`,
+			pubkey: route.pubkey,
+			take: !traversal && route.take
+		} : null);
+		const stageRef = React.useRef(null);
+		const initialSelectDone = React.useRef(Boolean(route?.pubkey));
+		React.useSyncExternalStore(panels?.subscribe ?? noSubscribe, panels?.snapshot ?? emptyPanels);
+		const relayScope = (() => {
+			try {
+				return ctx.reflect?.get?.("relay")?.snapshot?.()?.scope;
+			} catch {
+				return;
+			}
+		})();
+		const split = useSideSplit(relayScope, `${pluginId || "local.buzz-host.viewport"}:agent-sidebar`, 400, 300);
+		const loadAgents = React.useCallback(async (signal) => {
+			setLoading(true);
+			try {
+				const res = await client.call("list", {}, {
+					signal,
+					timeoutMs: 2e4
+				});
+				if (signal?.aborted) return [];
+				let list = Array.isArray(res?.agents) ? res.agents : [];
+				const needsProbe = list.filter((a) => a.desktop && a.desktopRunning === void 0);
+				if (needsProbe.length) {
+					const statuses = await Promise.all(needsProbe.map((a) => client.call("desktop.status", { pubkey: a.pubkey }, {
+						signal,
+						timeoutMs: 15e3
+					}).then((st) => [a.pubkey, st]).catch(() => [a.pubkey, null])));
+					if (signal?.aborted) return [];
+					const byKey = new Map(statuses);
+					list = list.map((a) => {
+						const st = byKey.get(a.pubkey);
+						return st ? {
+							...a,
+							desktopRunning: st.running === true,
+							desktopLease: st.lease ?? null
+						} : a;
+					});
+				}
+				const sorted = sortDesktopAgents(list);
+				setAgents(sorted);
+				setLoadError("");
+				return sorted;
+			} catch (e) {
+				if (!signal?.aborted) setLoadError(String(e.message ?? e));
+				return [];
+			} finally {
+				if (!signal?.aborted) setLoading(false);
+			}
+		}, []);
+		React.useEffect(() => {
+			const controller = new AbortController();
+			loadAgents(controller.signal).then((sorted) => {
+				if (controller.signal.aborted || !sorted.length) return;
+				if (!initialSelectDone.current) {
+					initialSelectDone.current = true;
+					const first = sorted[0];
+					setSelectedPubkey(first.pubkey);
+					if (first.desktopRunning) setAutoOpen({
+						key: `running:${first.pubkey}`,
+						pubkey: first.pubkey,
+						take: false
+					});
+				}
+			});
+			return () => controller.abort();
+		}, [loadAgents]);
+		React.useEffect(() => {
+			if (!route?.pubkey) return;
+			initialSelectDone.current = true;
+			setSelectedPubkey(route.pubkey);
+			setActionError("");
+			setAutoOpen({
+				key: entryId || `route:${route.pubkey}:${route.take ? 1 : 0}`,
+				pubkey: route.pubkey,
+				take: !traversal && route.take
+			});
+		}, [
+			entryId,
+			route?.pubkey,
+			route?.take,
+			traversal
+		]);
+		const selectedAgent = React.useMemo(() => agents.find((a) => a.pubkey === selectedPubkey) ?? null, [agents, selectedPubkey]);
+		const activePubkey = selectedPubkey || "";
+		const viewer = React.useMemo(() => activePubkey ? desktopViewer(activePubkey) : null, [activePubkey]);
+		const view = React.useSyncExternalStore(viewer ? viewer.subscribe : noSubscribe, viewer ? viewer.snapshot : () => OFF_VIEW);
+		React.useEffect(() => {
+			if (!viewer || !stageRef.current) return void 0;
+			return viewer.attach(stageRef.current);
+		}, [viewer]);
+		React.useEffect(() => {
+			if (!autoOpen || !viewer || autoOpen.pubkey !== activePubkey) return;
+			const intent = autoOpen;
+			setAutoOpen(null);
+			viewer.open({ take: intent.take }).then(() => {
+				setAgents((prev) => prev.map((a) => a.pubkey === intent.pubkey ? {
+					...a,
+					desktopRunning: true
+				} : a));
+			});
+		}, [
+			autoOpen,
+			viewer,
+			activePubkey
+		]);
+		React.useEffect(() => {
+			if (!activePubkey) return;
+			if (view.status === "live") setAgents((prev) => prev.map((a) => a.pubkey === activePubkey ? {
+				...a,
+				desktop: true,
+				desktopRunning: true,
+				desktopLease: view.mine ? { holder: "human" } : null
+			} : a));
+		}, [
+			activePubkey,
+			view.status,
+			view.mine
+		]);
+		React.useEffect(() => {
+			viewer?.refit();
+		}, [
+			sidebarOpen,
+			inspectorOpen,
+			viewer
+		]);
+		const inspectorTarget = activePubkey ? agentActivityPanelTarget(activePubkey) : "";
+		const inspectorPanel = inspectorTarget ? panels?.resolve?.(inspectorTarget) : void 0;
+		const canInspect = Boolean(inspectorPanel && inspectorTarget);
+		const showInspector = Boolean(inspectorOpen && canInspect);
+		const selectAgent = (agent) => {
+			setActionError("");
+			setSelectedPubkey(agent.pubkey);
+			if (agent.desktopRunning) setAutoOpen({
+				key: `pick:${agent.pubkey}:${Date.now()}`,
+				pubkey: agent.pubkey,
+				take: false
+			});
+		};
+		const handleEnableDesktop = async () => {
+			if (!activePubkey) return;
+			setActionBusy("enable");
+			setActionError("");
+			try {
+				await client.call("desktop.set", {
+					pubkey: activePubkey,
+					enabled: true
+				}, { timeoutMs: 9e4 });
+				setAgents((prev) => sortDesktopAgents(prev.map((a) => a.pubkey === activePubkey ? {
+					...a,
+					desktop: true
+				} : a)));
+			} catch (e) {
+				setActionError(String(e.message ?? e));
+			} finally {
+				setActionBusy("");
+			}
+		};
+		const handleStopDesktop = async () => {
+			if (!activePubkey) return;
+			setActionBusy("stop");
+			setActionError("");
+			try {
+				viewer?.disconnect();
+				await client.call("desktop.stop", { pubkey: activePubkey }, { timeoutMs: 3e4 });
+				setAgents((prev) => sortDesktopAgents(prev.map((a) => a.pubkey === activePubkey ? {
+					...a,
+					desktopRunning: false,
+					desktopLease: null
+				} : a)));
+			} catch (e) {
+				setActionError(String(e.message ?? e));
+			} finally {
+				setActionBusy("");
+			}
+		};
+		const handleOpen = (take = false) => {
+			if (!viewer) return;
+			setActionError("");
+			viewer.open({ take });
+		};
+		const openSettings = () => {
+			navigation?.open?.({
+				version: 1,
+				kind: "settings",
+				section: "plugins"
+			});
+		};
+		const showStage = Boolean(viewer && (view.status === "live" || view.status === "connecting"));
+		const working = Boolean(actionBusy || view.busy);
+		const activeName = selectedAgent?.name || (activePubkey ? activePubkey.slice(0, 8) : "Viewport");
+		const desktopEnabled = selectedAgent ? selectedAgent.desktop === true : Boolean(activePubkey);
+		const desktopRunning = view.status === "live" || selectedAgent?.desktopRunning === true;
+		const statusText = view.status === "live" ? view.mine ? "You have control" : "Watching" : view.status === "connecting" ? "Connecting…" : !selectedAgent ? "" : !desktopEnabled ? "Desktop off" : desktopRunning ? "Running" : "Stopped";
+		const enabledAgents = agents.filter((a) => a.desktop);
+		const disabledAgents = agents.filter((a) => !a.desktop);
+		const renderAgentRow = (agent) => {
+			const selected = agent.pubkey === activePubkey;
+			const isLiveHere = selected && view.status === "live";
+			const isMine = isLiveHere ? view.mine : agent.desktopLease?.holder === "human";
+			const isRunning = isLiveHere || agent.desktopRunning === true;
+			const dotColor = !agent.desktop ? "var(--text-subtle)" : isMine ? "var(--accent, #22c55e)" : isRunning ? "#22c55e" : "var(--text-subtle)";
+			const sub = !agent.desktop ? "Desktop off" : isMine ? "You have control" : isRunning ? "Running" : "Stopped";
+			return h("button", {
+				key: agent.pubkey,
+				type: "button",
+				"data-buzz-ui": "",
+				"data-variant": "row",
+				"data-selected": selected ? "" : void 0,
+				"aria-current": selected ? "page" : void 0,
+				className: "navigation-item",
+				onClick: () => selectAgent(agent),
+				style: {
+					width: "100%",
+					textAlign: "left"
+				}
+			}, h("span", {
+				"aria-hidden": "true",
+				style: {
+					width: 8,
+					height: 8,
+					borderRadius: 999,
+					background: dotColor,
+					flexShrink: 0,
+					opacity: isRunning || isMine ? 1 : .45
+				}
+			}), h("span", {
+				className: "navigation-item-label",
+				style: {
+					display: "grid",
+					gap: 1,
+					minWidth: 0
+				}
+			}, h("span", { style: {
+				overflow: "hidden",
+				textOverflow: "ellipsis",
+				whiteSpace: "nowrap"
+			} }, agent.name || agent.pubkey.slice(0, 8)), h("span", { className: "text-caption text-secondary" }, sub)));
+		};
+		return h("div", {
+			"data-buzz-viewport-page": "",
+			style: {
+				display: "flex",
+				height: "100%",
+				width: "100%",
+				minHeight: 0,
+				minWidth: 0,
+				overflow: "hidden"
+			}
+		}, sidebarOpen && h("aside", {
+			"aria-label": "Agent desktops",
+			style: {
+				width: "16rem",
+				flexShrink: 0,
+				display: "flex",
+				flexDirection: "column",
+				minHeight: 0,
+				borderInlineEnd: "1px solid var(--border-standard)",
+				background: "var(--surface-panel, transparent)"
+			}
+		}, h("header", {
+			"data-buzz-ui": "",
+			className: "panel-header"
+		}, h("div", { className: "panel-header-title" }, h("div", { className: "panel-header-label" }, Icon && h("span", {
+			className: "panel-header-label-icon",
+			"aria-hidden": "true"
+		}, h(Icon, {
+			name: "monitor",
+			size: 16
+		})), h("h2", null, "Viewport"))), h("div", { className: "panel-header-actions" }, h(Btn, {
+			size: "sm",
+			variant: "ghost",
+			disabled: loading,
+			onClick: () => void loadAgents(),
+			title: "Refresh agent desktops",
+			"aria-label": "Refresh agent desktops"
+		}, Icon ? h(Icon, {
+			name: "refresh",
+			size: 14
+		}) : "Refresh"))), h("div", { style: {
+			flex: 1,
+			minHeight: 0,
+			overflowY: "auto",
+			padding: "var(--space-2)",
+			display: "flex",
+			flexDirection: "column",
+			gap: "var(--space-1)"
+		} }, loadError && h("div", { style: {
+			padding: "var(--space-2)",
+			display: "grid",
+			gap: "var(--space-2)"
+		} }, h(Note, { tone: "error" }, loadError), h("div", { style: {
+			display: "flex",
+			gap: "var(--space-2)",
+			flexWrap: "wrap"
+		} }, h(Btn, {
+			size: "sm",
+			onClick: () => void loadAgents()
+		}, "Retry"), navigation?.open && h(Btn, {
+			size: "sm",
+			variant: "ghost",
+			onClick: openSettings
+		}, "Plugin settings"))), !loadError && loading && !agents.length && h("div", { style: { padding: "var(--space-3)" } }, h(Note, null, "Loading agents…")), !loadError && !loading && !agents.length && h("div", { style: {
+			padding: "var(--space-3)",
+			display: "grid",
+			gap: "var(--space-2)"
+		} }, h(Note, null, "No self-hosted agents yet."), navigation?.open && h(Btn, {
+			size: "sm",
+			onClick: openSettings
+		}, "Configure Remote Agents")), ...enabledAgents.map(renderAgentRow), disabledAgents.length > 0 && h("div", {
+			className: "text-caption text-secondary",
+			style: {
+				padding: "var(--space-3) var(--space-2) var(--space-1)",
+				fontWeight: 600,
+				letterSpacing: "0.02em"
+			}
+		}, "Desktop off"), ...disabledAgents.map(renderAgentRow))), h("div", {
+			ref: split.ref,
+			style: {
+				flex: 1,
+				minWidth: 0,
+				minHeight: 0,
+				display: "flex",
+				overflow: "hidden"
+			}
+		}, h("section", {
+			"aria-label": "Remote desktop",
+			style: {
+				flex: 1,
+				minWidth: 0,
+				minHeight: 0,
+				display: "flex",
+				flexDirection: "column",
+				overflow: "hidden"
+			}
+		}, h("header", {
+			"data-buzz-ui": "",
+			className: "panel-header",
+			style: {
+				flexWrap: "nowrap",
+				gap: "var(--space-2)"
+			}
+		}, h("div", {
+			className: "panel-header-title",
+			style: {
+				display: "flex",
+				alignItems: "center",
+				gap: "var(--space-2)",
+				minWidth: 0,
+				flex: "1 1 0",
+				overflow: "hidden"
+			}
+		}, h(Btn, {
+			size: "sm",
+			variant: "ghost",
+			onClick: () => setSidebarOpen((v) => !v),
+			title: sidebarOpen ? "Hide agent list" : "Show agent list",
+			"aria-label": sidebarOpen ? "Hide agent list" : "Show agent list",
+			"aria-pressed": sidebarOpen,
+			style: { flexShrink: 0 }
+		}, Icon ? h(Icon, {
+			name: "sidebar",
+			size: 16
+		}) : sidebarOpen ? "Hide list" : "Show list"), canInspect ? h("button", {
+			type: "button",
+			onClick: () => setInspectorOpen((v) => !v),
+			title: showInspector ? `Close ${activeName} sidebar` : `Open ${activeName} Activity sidebar`,
+			style: {
+				all: "unset",
+				cursor: "pointer",
+				minWidth: 0,
+				overflow: "hidden",
+				textOverflow: "ellipsis",
+				whiteSpace: "nowrap"
+			}
+		}, h("h2", {
+			className: "text-label text-primary",
+			style: {
+				margin: 0,
+				overflow: "hidden",
+				textOverflow: "ellipsis",
+				whiteSpace: "nowrap"
+			}
+		}, activeName)) : h("h2", {
+			className: "text-label text-primary",
+			style: {
+				margin: 0,
+				overflow: "hidden",
+				textOverflow: "ellipsis",
+				whiteSpace: "nowrap"
+			}
+		}, activeName), statusText && h("span", {
+			"data-buzz-viewport-status": view.mine ? "control" : view.status,
+			className: "text-caption",
+			style: {
+				padding: "2px 8px",
+				borderRadius: 999,
+				whiteSpace: "nowrap",
+				flexShrink: 0,
+				fontWeight: 500,
+				background: view.mine ? "var(--accent-subtle, rgba(34,197,94,.16))" : "var(--surface-inset, rgba(128,128,128,.14))",
+				color: view.mine ? "var(--text-primary)" : "var(--text-secondary)"
+			}
+		}, statusText)), h("div", {
+			className: "panel-header-actions",
+			style: {
+				display: "flex",
+				alignItems: "center",
+				gap: "var(--space-1)",
+				flexWrap: "nowrap",
+				flexShrink: 0
+			}
+		}, view.status === "live" && (view.mine ? h(Btn, {
+			size: "sm",
+			variant: "outline",
+			disabled: working,
+			onClick: () => void viewer.handBack()
+		}, view.busy === "back" ? "Handing back…" : "Hand back") : h(Btn, {
+			size: "sm",
+			variant: "prominent",
+			disabled: working,
+			onClick: () => void viewer.takeOver()
+		}, view.busy === "take" ? "Taking over…" : "Take over")), view.status === "off" && activePubkey && desktopEnabled && h(Btn, {
+			size: "sm",
+			variant: "prominent",
+			disabled: working,
+			onClick: () => handleOpen(false)
+		}, view.busy === "watch" ? "Opening…" : "Open desktop"), activePubkey && desktopEnabled && desktopRunning && h(Btn, {
+			size: "sm",
+			variant: "ghost",
+			disabled: working,
+			title: "Stop desktop",
+			onClick: () => void handleStopDesktop()
+		}, actionBusy === "stop" ? "Stopping…" : "Stop"), canInspect && h(Btn, {
+			size: "sm",
+			variant: showInspector ? "outline" : "ghost",
+			onClick: () => setInspectorOpen((v) => !v),
+			title: showInspector ? `Hide ${activeName} sidebar` : `Show ${activeName} sidebar`,
+			"aria-label": showInspector ? `Hide ${activeName} sidebar` : `Show ${activeName} sidebar`,
+			"aria-pressed": showInspector,
+			style: { flexShrink: 0 }
+		}, Icon ? h(Icon, {
+			name: "sidebarRight",
+			size: 16
+		}) : showInspector ? "Hide sidebar" : "Show sidebar"))), h("div", { style: {
+			flex: 1,
+			minWidth: 0,
+			minHeight: 0,
+			position: "relative",
+			display: "flex",
+			alignItems: "center",
+			justifyContent: "center",
+			background: showStage ? "#000" : "transparent",
+			overflow: "hidden"
+		} }, h("div", {
+			ref: stageRef,
+			style: {
+				position: "absolute",
+				inset: 0,
+				display: showStage ? "block" : "none"
+			}
+		}), view.status === "connecting" && h("div", {
+			className: "ui-card",
+			style: {
+				position: "relative",
+				zIndex: 1,
+				padding: "var(--space-3) var(--space-4)",
+				display: "flex",
+				alignItems: "center",
+				gap: "var(--space-2)"
+			}
+		}, h("span", { className: "text-body-sm text-secondary" }, `Connecting to ${activeName}’s desktop…`)), !showStage && h("div", { style: {
+			maxWidth: "28rem",
+			padding: "var(--space-6)",
+			display: "grid",
+			gap: "var(--space-3)",
+			textAlign: "center",
+			justifyItems: "center"
+		} }, Icon && h(Icon, {
+			name: "monitor",
+			size: 36,
+			style: { color: "var(--text-subtle)" }
+		}), !activePubkey ? h(React.Fragment, null, h("h3", { style: { margin: 0 } }, "No agent desktop selected"), h(Note, null, "Select a self-hosted agent from the list to watch or take over its remote desktop inside Buzz.")) : !desktopEnabled ? h(React.Fragment, null, h("h3", { style: { margin: 0 } }, `Desktop is off for ${activeName}`), h(Note, null, `Turn on Desktop to give ${activeName} its own Linux desktop (Xfce and a browser) on your server. Turning it on restarts ${activeName}.`), h(Btn, {
+			variant: "prominent",
+			disabled: working,
+			onClick: () => void handleEnableDesktop()
+		}, actionBusy === "enable" ? `Enabling for ${activeName}…` : "Turn on Desktop")) : h(React.Fragment, null, h("h3", { style: { margin: 0 } }, `${activeName}’s desktop`), h(Note, null, desktopRunning ? "Running on your server. Connect to watch or take over directly inside Buzz." : "Stopped. Opening it starts the desktop on your server."), h("div", { style: {
+			display: "flex",
+			gap: "var(--space-2)",
+			flexWrap: "wrap",
+			justifyContent: "center"
+		} }, h(Btn, {
+			variant: "prominent",
+			disabled: working,
+			onClick: () => handleOpen(false)
+		}, view.busy === "watch" ? "Opening…" : "Open desktop"), h(Btn, {
+			variant: "outline",
+			disabled: working,
+			onClick: () => handleOpen(true)
+		}, view.busy === "take" ? "Taking over…" : "Take over"))), (actionError || view.error) && h(Note, { tone: "error" }, actionError || view.error)))), showInspector && h("aside", {
+			"aria-label": `${activeName} details`,
+			"data-buzz-viewport-inspector": "",
+			style: {
+				position: "relative",
+				width: "var(--secondary-panel-width, 25rem)",
+				minWidth: "18rem",
+				maxWidth: "55%",
+				flexShrink: 0,
+				display: "flex",
+				flexDirection: "column",
+				minHeight: 0,
+				borderInlineStart: "1px solid var(--border-standard)",
+				overflow: "hidden"
+			}
+		}, split.handle, PanelWorkspace ? h(PanelWorkspace, {
+			label: `${activeName} details`,
+			value: inspectorTarget,
+			select: () => {},
+			items: [{
+				id: inspectorTarget,
+				label: `${activeName} · Activity`,
+				close: () => setInspectorOpen(false),
+				content: h(inspectorPanel.component, {
+					key: inspectorTarget,
+					target: inspectorTarget,
+					close: () => setInspectorOpen(false)
+				})
+			}]
+		}) : h("div", { style: {
+			flex: 1,
+			minHeight: 0,
+			overflow: "auto"
+		} }, h(inspectorPanel.component, {
+			key: inspectorTarget,
+			target: inspectorTarget,
+			close: () => setInspectorOpen(false)
+		})))));
 	}
 	function DesktopSettings({ ui, agent }) {
 		const pubkey = agent.pubkey;
@@ -7684,11 +8254,10 @@ function createDesktop({ React, client, ctx, uiKit, Btn }) {
 			}
 		}, [pubkey]);
 		React.useEffect(() => {
-			if (view.full) return void 0;
 			const controller = new AbortController();
 			refresh(controller.signal);
 			return () => controller.abort();
-		}, [refresh, view.full]);
+		}, [refresh]);
 		const act = async (label, task) => {
 			setBusy(label);
 			setError("");
@@ -7702,14 +8271,14 @@ function createDesktop({ React, client, ctx, uiKit, Btn }) {
 		};
 		const toggle = () => act("toggle", async () => {
 			const enabled = !info.enabled;
-			if (!enabled) viewer.exitFull();
+			if (!enabled) viewer.disconnect();
 			setInfo(await client.call("desktop.set", {
 				pubkey,
 				enabled
 			}, { timeoutMs: 9e4 }));
 		});
 		const stop = () => act("stop", async () => {
-			viewer.exitFull();
+			viewer.disconnect();
 			await client.call("desktop.stop", { pubkey }, { timeoutMs: 3e4 });
 			await refresh();
 		});
@@ -7745,10 +8314,10 @@ function createDesktop({ React, client, ctx, uiKit, Btn }) {
 			on && {
 				key: "open",
 				title: "Open desktop",
-				subtitle: "Full screen. Take over there to use it yourself, for example to sign in to a site for the agent.",
+				subtitle: "Opens in the Viewport page inside Buzz. Take over there to use it yourself, for example to sign in to a site for the agent.",
 				action: {
-					label: view.busy === "watch" || view.busy === "take" ? "Opening…" : "Open",
-					onClick: () => void viewer.enterFull()
+					label: "Open",
+					onClick: () => openDesktop(pubkey)
 				}
 			},
 			on && info.running && {
@@ -7820,6 +8389,12 @@ function createDesktop({ React, client, ctx, uiKit, Btn }) {
 	const stills = /* @__PURE__ */ new Map();
 	const turnStarts = /* @__PURE__ */ new Map();
 	const noSubscribe = () => () => {};
+	const OFF_VIEW = Object.freeze({
+		status: "off",
+		mine: false,
+		error: "",
+		busy: ""
+	});
 	let rowClasses;
 	let rowLookedAt = 0;
 	function messageRowClasses() {
@@ -7882,7 +8457,6 @@ function createDesktop({ React, client, ctx, uiKit, Btn }) {
 	function PreviewCard({ entry, session, channelId, layout }) {
 		const [pubkey, turnId, phase, threadRootId] = entry.split(" ");
 		const live = phase === "live";
-		const viewer = desktopViewer(pubkey);
 		const since = React.useMemo(() => {
 			if (!turnStarts.has(turnId)) {
 				let at;
@@ -7986,13 +8560,13 @@ function createDesktop({ React, client, ctx, uiKit, Btn }) {
 			}
 		}, h("button", {
 			type: "button",
-			onClick: () => viewer.enterFull(),
-			title: "Watch full screen",
-			"aria-label": live ? "Watch the agent's screen full screen" : "Open the agent's screen full screen",
+			onClick: () => openDesktop(pubkey),
+			title: "Open in Viewport",
+			"aria-label": live ? "Open the agent's live desktop in Viewport" : "Open the agent's desktop in Viewport",
 			style: {
 				all: "unset",
 				boxSizing: "border-box",
-				cursor: "zoom-in",
+				cursor: "pointer",
 				display: "block",
 				position: "relative",
 				width: live ? 320 : 200,
@@ -8046,11 +8620,11 @@ function createDesktop({ React, client, ctx, uiKit, Btn }) {
 		}, live ? humanHas ? "You have control" : "Using its computer" : `Last screen · ${time}`), live && !humanHas && h(Btn, {
 			size: "sm",
 			variant: "prominent",
-			onClick: () => viewer.takeOver()
+			onClick: () => openDesktop(pubkey, { take: true })
 		}, "Take over"), live && humanHas && h(Btn, {
 			size: "sm",
 			variant: "outline",
-			onClick: () => viewer.enterFull()
+			onClick: () => openDesktop(pubkey)
 		}, "Open"), live && h(Btn, {
 			size: "sm",
 			variant: "ghost",
@@ -8061,6 +8635,8 @@ function createDesktop({ React, client, ctx, uiKit, Btn }) {
 	}
 	return {
 		desktopViewer,
+		openDesktop,
+		ViewportPage,
 		DesktopSettings,
 		DesktopPreview
 	};
@@ -8071,20 +8647,28 @@ function createDesktop({ React, client, ctx, uiKit, Btn }) {
 const inject = [
 	"react",
 	"agents",
-	"conversation"
+	"conversation",
+	"pages",
+	"navigation",
+	"panels"
 ];
 function apply(ctx) {
 	const React = ctx.react;
 	const uiKit = ui(React);
-	const { Btn } = createBuzzPrimitives(React);
+	const { Btn, Icon } = createBuzzPrimitives(React);
 	const client = createClient();
 	ctx.effect(() => () => client.close());
-	const { DesktopSettings, DesktopPreview } = createDesktop({
+	const pluginId = ctx.pluginOwner?.id ?? "local.buzz-host.viewport";
+	const { ViewportPage, DesktopSettings, DesktopPreview } = createDesktop({
 		React,
 		client,
 		ctx,
 		uiKit,
-		Btn
+		Btn,
+		Icon,
+		navigation: ctx.navigation,
+		panels: ctx.panels,
+		pluginId
 	});
 	const agentUi = () => {
 		try {
@@ -8101,6 +8685,19 @@ function apply(ctx) {
 			agent
 		}));
 	}
+	ctx.pages.register({
+		id: VIEWPORT_PAGE_ID,
+		title: "Viewport",
+		layout: "workspace",
+		primary: true,
+		placement: "dock",
+		icon: VIEWPORT_PAGE_ICON,
+		route: {
+			version: 1,
+			validate: validateViewportRoute
+		},
+		component: ViewportPage
+	});
 	ctx.agents.registerTab({
 		id: "desktop",
 		title: "Desktop",
@@ -8117,4 +8714,4 @@ function apply(ctx) {
 }
 
 //#endregion
-export { apply, inject, previewKeys };
+export { VIEWPORT_PAGE_ICON, VIEWPORT_PAGE_ID, agentActivityPanelTarget, apply, inject, parseViewportRoute, previewKeys, validateViewportRoute, viewportPageTarget };

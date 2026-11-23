@@ -132,14 +132,17 @@ function applyRunnerChange(draft, runner) {
 	}
 	return next;
 }
-/** Enforce guest-mode constraints on an agent draft (sandboxed runner, allowed runtimes, concurrency cap). */
+/** Enforce guest-mode constraints on an agent draft (runner, allowed runtimes, concurrency cap). */
 function applyGuestConstraints(draft, serverInfo) {
 	if (serverInfo?.role !== "guest") return draft;
 	const limits = serverInfo.limits ?? {};
 	const allowedRuntimes = Array.isArray(limits.allowedRuntimes) && limits.allowedRuntimes.length ? limits.allowedRuntimes : RUNTIMES.map((r) => r.id);
 	const maxConcurrency = Number(limits.maxConcurrency) > 0 ? Number(limits.maxConcurrency) : 2;
+	const allowHostDesktop = limits.allowHostDesktop === true;
 	const next = { ...draft };
-	next.runner = "docker";
+	const respondTo = next.respondTo || "owner-only";
+	if (allowHostDesktop && respondTo === "owner-only") next.runner = next.runner === "docker" ? "docker" : "host";
+	else next.runner = "docker";
 	next.profile = "";
 	if (!allowedRuntimes.includes(next.runtime)) {
 		next.runtime = allowedRuntimes[0];
@@ -247,6 +250,16 @@ function createClient() {
 		if (opening) return opening;
 		const url = storedUrl();
 		const token = storedToken();
+		if (!url) {
+			const error = /* @__PURE__ */ new Error("No buzz-host server configured yet. Open Settings → Plugins → Remote Agents and paste your server URL or invite link.");
+			set({
+				status: "idle",
+				url: "",
+				error: error.message,
+				session: null
+			});
+			return Promise.reject(error);
+		}
 		set({
 			status: "connecting",
 			url,
@@ -1271,9 +1284,9 @@ function createType({ React, client, ctx, uiKit, invalidateCatalog, ActivityTab,
 		}));
 	}
 	/** One line naming the "More options" choices, for the collapsed row. */
-	function moreSummary(effective, { hermes, isGuest }) {
+	function moreSummary(effective, { hermes, canUseHost }) {
 		const respondTo = effective.respondTo || "owner-only";
-		const runner = effective.runner || (isGuest ? "docker" : "host");
+		const runner = effective.runner || (canUseHost ? "host" : "docker");
 		const concurrency = Number(effective.concurrency) || 4;
 		return [
 			hermes && `Profile ${effective.profile || "default"}`,
@@ -1291,15 +1304,16 @@ function createType({ React, client, ctx, uiKit, invalidateCatalog, ActivityTab,
 	function RuntimeRows({ ui, draft, onChange, disabled, serverInfo, collapsible = false }) {
 		const [expanded, setExpanded] = React.useState(false);
 		const isGuest = serverInfo?.role === "guest";
+		const canUseHost = !isGuest || serverInfo?.limits?.allowHostDesktop === true;
 		const effective = isGuest ? applyGuestConstraints(draft, serverInfo) : draft;
-		const sandboxed = isGuest || (effective.runner || "host") !== "host";
-		const { models, error } = useModels(React, client, effective.runtime, sandboxed ? "" : effective.profile);
+		const sandboxed = (effective.runner || (canUseHost ? "host" : "docker")) !== "host";
+		const { models, error } = useModels(React, client, effective.runtime, !isGuest && !sandboxed ? effective.profile : "");
 		const hermes = !isGuest && effective.runtime === "hermes" && !sandboxed;
 		const { profiles, error: profileError } = useProfiles(React, client, hermes);
 		const choice = modelChoices(models);
 		const respondTo = effective.respondTo || "owner-only";
 		const showMore = !collapsible || expanded;
-		const runnerChoices = !isGuest && respondTo === "owner-only" ? RUNNERS.map((r) => ({
+		const runnerChoices = canUseHost && respondTo === "owner-only" ? RUNNERS.map((r) => ({
 			value: r.id,
 			label: r.title
 		})) : RUNNERS.filter((r) => r.id !== "host").map((r) => ({
@@ -1349,7 +1363,7 @@ function createType({ React, client, ctx, uiKit, invalidateCatalog, ActivityTab,
 			title: "More options",
 			subtitle: moreSummary(effective, {
 				hermes,
-				isGuest
+				canUseHost
 			}),
 			trailing: h(ui.Button, {
 				size: "sm",
@@ -1375,18 +1389,18 @@ function createType({ React, client, ctx, uiKit, invalidateCatalog, ActivityTab,
 			groups: one(RESPOND_TO_OPTIONS),
 			onValueChange: (nextMode) => onChange({
 				...applyRespondToChange(effective, nextMode),
-				...isGuest ? {
+				...!canUseHost ? {
 					runner: "docker",
 					profile: ""
-				} : {},
+				} : isGuest ? { profile: "" } : {},
 				allowlistText: nextMode === "allowlist" ? effective.allowlistText ?? formatAllowlistText(effective.respondToAllowlist) : ""
 			})
 		}), showMore && h(ui.Select, {
 			label: "Sandbox runner",
 			variant: "preference",
-			value: effective.runner || (isGuest ? "docker" : "host"),
-			disabled: disabled || isGuest,
-			...isGuest ? { description: "Guest accounts always run agents in an isolated Docker sandbox." } : respondTo !== "owner-only" ? { description: "Shared agents always run in an isolated sandbox container." } : {},
+			value: effective.runner || (canUseHost ? "host" : "docker"),
+			disabled: disabled || !canUseHost,
+			...!canUseHost ? { description: "Guest accounts always run agents in an isolated Docker sandbox." } : respondTo !== "owner-only" ? { description: "Shared agents always run in an isolated sandbox container." } : {},
 			groups: one(runnerChoices),
 			onValueChange: (nextRunner) => onChange(applyRunnerChange(effective, nextRunner))
 		}));
@@ -1401,7 +1415,7 @@ function createType({ React, client, ctx, uiKit, invalidateCatalog, ActivityTab,
 			rows: 4,
 			value: text,
 			disabled,
-			placeholder: "b9085cc5...\n...",
+			placeholder: "01234567...\n...",
 			onChange: (e) => onChange({
 				...draft,
 				allowlistText: e.target.value,
@@ -1534,6 +1548,7 @@ function createType({ React, client, ctx, uiKit, invalidateCatalog, ActivityTab,
 		const { info: fetchedInfo } = useServerInfo(React, client);
 		const serverInfo = passedServerInfo ?? fetchedInfo;
 		const isGuest = serverInfo?.role === "guest";
+		const canUseHost = !isGuest || serverInfo?.limits?.allowHostDesktop === true;
 		const draft = isGuest ? applyGuestConstraints(asConfig(config), serverInfo) : asConfig(config);
 		const change = (patch) => onChange(isGuest ? applyGuestConstraints({
 			...draft,
@@ -1597,10 +1612,10 @@ function createType({ React, client, ctx, uiKit, invalidateCatalog, ActivityTab,
 			options: RESPOND_TO_OPTIONS,
 			onChange: (nextMode) => onChange({
 				...applyRespondToChange(draft, nextMode),
-				...isGuest ? {
+				...!canUseHost ? {
 					runner: "docker",
 					profile: ""
-				} : {},
+				} : isGuest ? { profile: "" } : {},
 				allowlistText: nextMode === "allowlist" ? draft.allowlistText ?? formatAllowlistText(draft.respondToAllowlist) : ""
 			})
 		})), h(AllowlistField, {
@@ -1609,11 +1624,11 @@ function createType({ React, client, ctx, uiKit, invalidateCatalog, ActivityTab,
 			disabled
 		}), h(Row, {
 			label: "Sandbox runner",
-			hint: isGuest ? "Guest accounts always run agents in an isolated Docker sandbox." : (draft.respondTo || "owner-only") !== "owner-only" ? "Shared agents always run in an isolated sandbox container." : "Choose Docker sandbox to isolate this agent from host files and keys."
+			hint: !canUseHost ? "Guest accounts always run agents in an isolated Docker sandbox." : (draft.respondTo || "owner-only") !== "owner-only" ? "Shared agents always run in an isolated sandbox container." : "Choose Docker sandbox to isolate this agent from host files and keys."
 		}, h(Select, {
-			value: draft.runner || (isGuest ? "docker" : "host"),
-			disabled: disabled || isGuest,
-			options: !isGuest && (draft.respondTo || "owner-only") === "owner-only" ? RUNNERS.map((r) => ({
+			value: draft.runner || (canUseHost ? "host" : "docker"),
+			disabled: disabled || !canUseHost,
+			options: canUseHost && (draft.respondTo || "owner-only") === "owner-only" ? RUNNERS.map((r) => ({
 				value: r.id,
 				label: r.title
 			})) : RUNNERS.filter((r) => r.id !== "host").map((r) => ({
@@ -2170,6 +2185,7 @@ function createServerCard({ React, client, uiKit }) {
 		const [ownerPubkey, setOwnerPubkey] = React.useState("");
 		const [maxAgents, setMaxAgents] = React.useState("2");
 		const [maxConcurrency, setMaxConcurrency] = React.useState("2");
+		const [allowHostDesktop, setAllowHostDesktop] = React.useState(false);
 		const [busy, setBusy] = React.useState(false);
 		const [error, setError] = React.useState("");
 		const [created, setCreated] = React.useState(null);
@@ -2203,11 +2219,13 @@ function createServerCard({ React, client, uiKit }) {
 					label: cleanLabel,
 					...ownerPubkey.trim() ? { ownerPubkey: ownerPubkey.trim() } : {},
 					maxAgents: Number(maxAgents) || 2,
-					maxConcurrency: Number(maxConcurrency) || 2
+					maxConcurrency: Number(maxConcurrency) || 2,
+					allowHostDesktop
 				});
 				setCreated(res);
 				setLabel("");
 				setOwnerPubkey("");
+				setAllowHostDesktop(false);
 				await refresh();
 			} catch (e) {
 				setError(String(e.message ?? e));
@@ -2281,7 +2299,21 @@ function createServerCard({ React, client, uiKit }) {
 			value: maxConcurrency,
 			disabled: busy,
 			onChange: (e) => setMaxConcurrency(e.target.value)
-		}))), h("div", { style: {
+		}))), h("label", { style: {
+			display: "flex",
+			gap: "var(--space-2)",
+			alignItems: "flex-start",
+			cursor: busy ? "default" : "pointer"
+		} }, h("input", {
+			type: "checkbox",
+			checked: allowHostDesktop,
+			disabled: busy,
+			onChange: (e) => setAllowHostDesktop(e.target.checked),
+			style: { marginTop: "3px" }
+		}), h("div", { style: {
+			display: "grid",
+			gap: "2px"
+		} }, h("span", { style: { fontWeight: 500 } }, "Allow remote desktop (trusted — runs on host)"), h(Note, null, "Only for people you trust on this machine. Lets them run owner-only agents on the host and open Viewport Remote Desktop."))), h("div", { style: {
 			display: "flex",
 			gap: "var(--space-2)"
 		} }, h("button", {
@@ -2327,7 +2359,7 @@ function createServerCard({ React, client, uiKit }) {
 			display: "grid",
 			gap: "2px",
 			minWidth: 0
-		} }, h("strong", null, `${t.label} (${t.id})`), h(Note, null, `${t.agentCount ?? 0}/${t.maxAgents} agents · max ${t.maxConcurrency} parallel · ${t.allowedRuntimes.join(", ")} · ${t.ownerPubkey ? `bound ${t.ownerPubkey.slice(0, 10)}…` : "unbound (binds on first agent)"}`)), h("button", {
+		} }, h("strong", null, `${t.label} (${t.id})`), h(Note, null, `${t.agentCount ?? 0}/${t.maxAgents} agents · max ${t.maxConcurrency} parallel · ${t.allowedRuntimes.join(", ")}${t.allowHostDesktop ? " · host desktop (trusted)" : ""} · ${t.ownerPubkey ? `bound ${t.ownerPubkey.slice(0, 10)}…` : "unbound (binds on first agent)"}`)), h("button", {
 			type: "button",
 			disabled: busy,
 			onClick: () => void revoke(t.id)
@@ -2358,6 +2390,10 @@ function createServerCard({ React, client, uiKit }) {
 			const parsed = parseInviteInput(overrideUrl ?? url);
 			const cleanUrl = (parsed.url || "wss://omarchy.tail65c5a9.ts.net:8447").trim();
 			const cleanToken = (parsed.token ?? overrideToken ?? token).trim();
+			if (!cleanUrl) {
+				setNotice("Paste your server URL or invite link above, then click Save and check.");
+				return;
+			}
 			if (parsed.token) {
 				setUrl(cleanUrl);
 				setToken(cleanToken);
@@ -2389,6 +2425,7 @@ function createServerCard({ React, client, uiKit }) {
 			hint: "Admin: your wss:// tailscale serve address. Guest: paste the invite link from your host."
 		}, h(Text, {
 			value: url,
+			placeholder: "wss://host.example/_buzz-host#token=bhg_…",
 			onChange: (e) => handleUrlChange(e.target.value)
 		})), h(Row, {
 			label: "Access token (guests only)",
@@ -2418,7 +2455,7 @@ function createServerCard({ React, client, uiKit }) {
 				setStoredToken("");
 				setNotice("Access token cleared. Click Save and check to reconnect.");
 			}
-		}, "Clear token")), notice && h(Note, null, notice), h(Note, { tone: error ? "error" : void 0 }, error || `Connection: ${state.status}`), info && h(Note, null, (isGuest ? `Guest account: ${info.hello.label} · ${info.list.agents.length}/${info.hello.limits?.maxAgents ?? 2} agents · max ${info.hello.limits?.maxConcurrency ?? 2} parallel chats\n` : "") + `Host ${info.hello.host}${info.hello.role ? ` (${info.hello.role})` : ""} · runtimes: ${info.hello.runtimes.map((r) => `${r.title}${r.available ? "" : " (missing)"}`).join(", ")}` + (Array.isArray(info.hello.runners) ? `\nRunners: ${info.hello.runners.map((r) => `${r.title}${r.available ? "" : " (unavailable)"}`).join(", ")}` : "") + "\n" + (info.list.agents.length ? info.list.agents.map((a) => {
+		}, "Clear token")), notice && h(Note, null, notice), h(Note, { tone: error ? "error" : void 0 }, error || `Connection: ${state.status}`), info && h(Note, null, (isGuest ? `Guest account: ${info.hello.label} · ${info.list.agents.length}/${info.hello.limits?.maxAgents ?? 2} agents · max ${info.hello.limits?.maxConcurrency ?? 2} parallel chats${info.hello.limits?.allowHostDesktop ? " · remote desktop enabled" : ""}\n` : "") + `Host ${info.hello.host}${info.hello.role ? ` (${info.hello.role})` : ""} · runtimes: ${info.hello.runtimes.map((r) => `${r.title}${r.available ? "" : " (missing)"}`).join(", ")}` + (Array.isArray(info.hello.runners) ? `\nRunners: ${info.hello.runners.map((r) => `${r.title}${r.available ? "" : " (unavailable)"}`).join(", ")}` : "") + "\n" + (info.list.agents.length ? info.list.agents.map((a) => {
 			const extra = [a.runner && a.runner !== "host" ? a.runner : "", a.respondTo && a.respondTo !== "owner-only" ? a.respondTo : ""].filter(Boolean).join(" · ");
 			return `• ${a.name} — ${a.runtime}${a.model ? `/${a.model}` : ""}${extra ? ` [${extra}]` : ""} — ${a.status}`;
 		}).join("\n") : "No agents yet.")), isAdmin && h(GuestInvites, { publicGuestUrl: info.hello.publicGuestUrl }));
