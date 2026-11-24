@@ -901,6 +901,8 @@ class RuntimeSwitch(Base):
         self.assertEqual(self.p.chat_runtime(CHANNEL), "hermes")
 
     def test_next_session_on_the_new_runtime_gets_the_history_once(self):
+        self.history.insert(0, {"id": "0" * 64, "kind": 9, "created_at": 1795218900,
+                                "pubkey": OWNER, "content": "old work we should not replay"})
         self.command("/runtime codex")
         rt, out = self.p.dispatch_client_line(session_new("n2", self.own))
         self.assertEqual(rt, "codex")
@@ -914,6 +916,9 @@ class RuntimeSwitch(Base):
         self.assertIn("moved from Claude Code to Codex", blocks[0]["text"])
         self.assertIn("owner: please fix the bug", blocks[0]["text"])
         self.assertIn("you: fixed in abc123", blocks[0]["text"])
+        self.assertNotIn("old work we should not replay", blocks[0]["text"], "only the tail is replayed")
+        self.assertIn("full conversation is not replayed", blocks[0]["text"])
+        self.assertIn(f"buzz messages get --channel {CHANNEL}", blocks[0]["text"])
         self.assertNotIn(": +", blocks[0]["text"], "reactions aren't history")
         self.assertEqual(blocks[1]["text"], "hello")
         self.assertNotIn("handoff", self.chat(), "handed over once")
@@ -926,12 +931,106 @@ class RuntimeSwitch(Base):
         lines = self.p.history_lines(rows, exclude={f"{39:064x}"})
         self.assertEqual(len(lines), self.p.HISTORY_MESSAGES)
         self.assertTrue(lines[-1].endswith("message 38"))
-        self.assertIn(f"{OTHER[:8]}…: message 9", lines[0])
+        self.assertIn(f"{OTHER[:8]}…: message 37", lines[0], "only the newest two are kept")
         big = [{"id": str(i), "kind": 9, "created_at": i, "pubkey": OWNER, "content": "x" * 5000} for i in range(30)]
         lines = self.p.history_lines(big)
         self.assertLessEqual(len("\n".join(lines).encode()), self.p.HISTORY_BYTES)
         self.assertTrue(all(len(l) < self.p.HISTORY_ITEM_CHARS + 60 for l in lines))
         self.assertTrue(lines)
+        note = self.p.history_note(f"{CHANNEL}_{'a' * 64}", "claude", "codex")
+        self.assertIn(f"buzz messages thread --channel {CHANNEL} --event {'a' * 64}", note)
+        self.assertIn("full conversation is not replayed", note)
+
+    def test_history_keeps_two_lines_within_the_byte_budget(self):
+        def rows(*contents):
+            return [{"id": f"{i:064x}", "kind": 9, "created_at": 1795219000 + i,
+                     "pubkey": OTHER, "content": c} for i, c in enumerate(contents)]
+
+        # Two messages near the per-item cap, and multi-byte ones: the prefix
+        # and the "…" must not push the second line out of the byte budget.
+        for contents in (("a" * 1000, "b" * 1000),
+                         ("→" * 1000, "→" * 1000),
+                         ("あ" * 700, "あ" * 700)):
+            lines = self.p.history_lines(rows(*contents))
+            self.assertEqual(len(lines), self.p.HISTORY_MESSAGES, f"both kept: {contents[0][:2]!r}")
+            self.assertTrue(all(l.endswith("…") for l in lines), "a cut line says so")
+            self.assertLessEqual(len("\n".join(lines).encode()), self.p.HISTORY_BYTES)
+            self.assertTrue(all(l.startswith("[") and ": " in l[:40] for l in lines))
+
+        # One long multi-byte message is cut to the budget, never dropped to [].
+        for content in ("→" * 1000, "あ" * 700):
+            lines = self.p.history_lines(rows(content))
+            self.assertEqual(len(lines), 1, f"kept, not dropped: {content[:1]!r}")
+            self.assertTrue(lines[0].endswith("…"))
+            self.assertGreater(len(lines[0].encode()), 900, "still worth reading")
+            self.assertLessEqual(len("\n".join(lines).encode()), self.p.HISTORY_BYTES)
+
+    def switch_then_handoff(self, history):
+        """Move the chat to codex and take the first turn there: the note it gets."""
+        self.history = history
+        self.command("/runtime codex")
+        self.p.dispatch_client_line(session_new("n2", self.own))
+        self.p.handle_adapter_line(line({"jsonrpc": "2.0", "id": "n2",
+                                         "result": {"sessionId": "c9", "configOptions": codex_options()}}),
+                                   adapter_runtime="codex")
+        _rt, out = self.dispatch(prompt_meta("p2", "rt:codex:c9", [ev("go on", eid="f" * 64)]))
+        return out["params"]["prompt"][0]["text"]
+
+    def test_a_switch_does_not_crowd_out_the_history(self):
+        real = [
+            {"id": "1" * 64, "kind": 9, "created_at": 1795219000, "pubkey": OWNER,
+             "content": "please fix the bug"},
+            {"id": "2" * 64, "kind": 9, "created_at": 1795219060, "pubkey": AGENT,
+             "content": "fixed in abc123"},
+        ]
+        switches = [
+            {"id": "3" * 64, "kind": 9, "created_at": 1795219100, "pubkey": OWNER,
+             "content": "@haiku /runtime codex"},
+            {"id": "4" * 64, "kind": 9, "created_at": 1795219110, "pubkey": AGENT,
+             "content": "Runtime for this chat: Codex. Applies from the next message."},
+            {"id": "5" * 64, "kind": 9, "created_at": 1795219120, "pubkey": OWNER,
+             "content": "/profile work"},
+            {"id": "6" * 64, "kind": 9, "created_at": 1795219130, "pubkey": AGENT,
+             "content": "Runtime for this chat: Hermes (work). Applies from the next message."},
+        ]
+        note = self.switch_then_handoff(real + switches)
+        self.assertIn("owner: please fix the bug", note)
+        self.assertIn("you: fixed in abc123", note)
+        self.assertNotIn("/runtime", note, "the switch command isn't orientation")
+        self.assertNotIn("/profile", note)
+        self.assertNotIn("Runtime for this chat", note, "nor is acp-proxy's confirmation")
+
+    def test_a_command_with_prose_is_still_conversation(self):
+        chatty = [
+            {"id": "7" * 64, "kind": 9, "created_at": 1795219000, "pubkey": OWNER,
+             "content": "/runtime codex\nand then check the logs"},
+            {"id": "8" * 64, "kind": 9, "created_at": 1795219060, "pubkey": OWNER,
+             "content": "the /runtime command is broken"},
+        ]
+        note = self.switch_then_handoff(chatty)
+        self.assertIn("and then check the logs", note)
+        self.assertIn("the /runtime command is broken", note)
+
+    def test_history_note_survives_an_empty_or_failed_fetch(self):
+        key = f"{CHANNEL}_{'a' * 64}"
+        self.p.fetch_history = lambda key: []
+        note = self.p.history_note(key, "claude", "codex")
+        self.assertTrue(note.startswith("<conversation-history>"))
+        self.assertIn("moved from Claude Code to Codex", note)
+        self.assertIn(f"buzz messages thread --channel {CHANNEL} --event {'a' * 64}", note)
+        self.assertIn("Continue from the current task state", note)
+        self.assertNotIn("Only the newest messages are included, for orientation.", note, "nothing to orient from")
+
+        def boom(key):
+            raise RuntimeError("relay down")
+        self.p.fetch_history = boom
+        note = self.p.history_note(key, "claude", "codex")
+        self.assertTrue(note.startswith("<conversation-history>"), "a fetch error still hands off")
+        self.assertIn("moved from Claude Code to Codex", note)
+        self.assertIn(f"buzz messages thread --channel {CHANNEL} --event {'a' * 64}", note)
+        self.assertNotIn("Only the newest messages are included, for orientation.", note)
+        self.assertIn(f"buzz messages get --channel {CHANNEL} --limit 20",
+                      self.p.history_note(CHANNEL, "claude", "codex"), "a chat fetches its channel")
 
     def test_a_pick_on_another_runtime_moves_this_very_turn(self):
         rt, out = self.dispatch(prompt_meta("p1", "s1", [ev(tags=[

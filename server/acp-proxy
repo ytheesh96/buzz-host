@@ -24,8 +24,9 @@
    /runtime saves the chat's runtime (claude, codex, hermes, antigravity) in
    chat-settings.json; the chat's model and effort, the old runtime's, go.
    The next message starts a fresh session there (the fresh marker), and
-   that session's first turn gets the chat's recent Buzz messages
-   (<conversation-history>, bounded by count and bytes). A turn that must
+   that session's first turn gets only the last couple of the chat's messages
+   plus a pointer to the full thread (<conversation-history>), never the whole
+   transcript. A turn that must
    run on the chat's new runtime while buzz-acp still holds the old session
    (a /runtime batched with other messages, or a composer pick on another
    runtime) runs in a session this proxy opens there (aliases). Worker chats
@@ -149,10 +150,16 @@ ATTENTION_OFF_FALLBACK = (
 # (catalog.mjs names other runtimes' models so).
 PICK_RUNTIME_SEP = "::"
 # Buzz history handed to a session that starts on a new runtime mid-chat.
-HISTORY_FETCH = 60        # messages asked of the relay
-HISTORY_MESSAGES = 30     # at most this many, newest kept
-HISTORY_BYTES = 24000     # and at most this many bytes of them
-HISTORY_ITEM_CHARS = 2000 # each message cut to this
+HISTORY_FETCH = 10        # messages asked of the relay
+HISTORY_MESSAGES = 2      # newest kept: orientation only, never the full thread
+HISTORY_BYTES = 2000      # and at most this many bytes of them
+HISTORY_ITEM_CHARS = 1000 # each message cut to this first, then by bytes
+HISTORY_ELLIPSIS = "…"
+# A switch and acp-proxy's confirmation of it are meta-chatter, not the
+# conversation: they land right before the handoff, so replaying them would
+# leave the new session with no prior task context at all.
+HISTORY_SKIP_COMMANDS = ("runtime", "profile")
+HISTORY_NOTICE_PREFIXES = ("Runtime for this chat:", "Runtime for this thread:")
 
 
 def hermes_home(profile=""):
@@ -1322,21 +1329,55 @@ def fetch_history(key):
     return sorted((e for e in items if isinstance(e, dict)), key=lambda e: e.get("created_at") or 0)
 
 
+def clip_utf8(text, limit, mark=HISTORY_ELLIPSIS):
+    """`text` in at most `limit` UTF-8 bytes, never splitting a character; a
+    cut text ends with `mark`."""
+    raw = text.encode()
+    if len(raw) <= limit:
+        return text
+    keep = max(0, limit - len(mark.encode()))
+    if not keep:
+        return ""
+    return raw[:keep].decode("utf-8", "ignore") + mark
+
+
+def switch_noise(event, text, author, me):
+    """True for an owner's standalone `/runtime` or `/profile` command and
+    acp-proxy's reply confirming it: meta-chatter that a handoff should not
+    spend its orientation lines on."""
+    if me and author == me:
+        return text.startswith(HISTORY_NOTICE_PREFIXES)
+    cmd = command_of((str(event.get("id") or ""), author, text))
+    return bool(cmd and cmd[0] in HISTORY_SKIP_COMMANDS
+                and len([l for l in text.splitlines() if l.strip()]) <= 1)
+
+
 def history_lines(rows, exclude=()):
-    """Bounded transcript lines: the newest HISTORY_MESSAGES, within HISTORY_BYTES."""
+    """Bounded transcript lines: the newest HISTORY_MESSAGES, within HISTORY_BYTES.
+
+    Each line is cut by UTF-8 bytes with its timestamp/author prefix already
+    accounted for, so HISTORY_MESSAGES lines always fit the budget: two long
+    messages both survive, and one long multi-byte message is cut, never
+    dropped to nothing."""
+    # What one line may take, leaving a newline for each other line kept.
+    room = max(1, (HISTORY_BYTES - (HISTORY_MESSAGES - 1)) // HISTORY_MESSAGES)
+    me = agent_pubkey.lower()
     lines = []
     for e in rows:
         text = str(e.get("content") or "").strip()
         if not text or e.get("id") in exclude or e.get("kind") not in (1, 9):  # messages, not reactions
             continue
-        if len(text) > HISTORY_ITEM_CHARS:
-            text = text[:HISTORY_ITEM_CHARS].rstrip() + "…"
         author = str(e.get("pubkey") or "").lower()
+        if switch_noise(e, text, author, me):
+            continue
         who = ("owner" if owner and author == owner
-               else "you" if agent_pubkey and author == agent_pubkey.lower()
+               else "you" if agent_pubkey and author == me
                else (author[:8] + "…") if author else "someone")
         at = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(e.get("created_at") or 0))
-        lines.append(f"[{at}] {who}: {text}")
+        head = f"[{at}] {who}: "
+        if len(text) > HISTORY_ITEM_CHARS:
+            text = text[:HISTORY_ITEM_CHARS]
+        lines.append(head + clip_utf8(text, room - len(head.encode())))
     lines = lines[-HISTORY_MESSAGES:]
     while lines and len("\n".join(lines).encode()) > HISTORY_BYTES:
         lines.pop(0)
@@ -1344,18 +1385,24 @@ def history_lines(rows, exclude=()):
 
 
 def history_note(key, from_rt, to_rt, exclude=()):
-    """The chat's recent messages for a session that starts on a new runtime."""
+    """A short handoff note: the last couple of messages, plus where to fetch the rest."""
     try:
         lines = history_lines(fetch_history(key), exclude)
     except Exception as e:  # never block a turn on history
         log(f"{key}: history for the runtime handoff failed: {e}")
-        return ""
-    if not lines:
-        return ""
+        lines = []
+    channel, _, root = key.partition("_")
+    fetch = (f"buzz messages thread --channel {channel} --event {root}" if root
+             else f"buzz messages get --channel {channel} --limit 20")
+    body = ("\n".join(lines) + "\n\n") if lines else ""
+    orientation = "Only the newest messages are included, for orientation. " if lines else ""
     return ("<conversation-history>\n"
-            f"This chat moved from {runtime_title(from_rt)} to {runtime_title(to_rt)}, so this session is new. "
-            "These are the chat's recent Buzz messages before this turn, oldest first (messages only, no tool "
-            "activity); carry on from them.\n\n" + "\n".join(lines) + "\n</conversation-history>")
+            f"This chat moved from {runtime_title(from_rt)} to {runtime_title(to_rt)}, so this session is new.\n"
+            + orientation +
+            f"The full conversation is not replayed; fetch it if you need it: `{fetch}`.\n\n"
+            + body +
+            "Continue from the current task state on disk and the user's latest message.\n"
+            "</conversation-history>")
 
 
 def open_runtime_session(client_sid, sid, key, runtime_id):
