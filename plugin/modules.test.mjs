@@ -108,6 +108,12 @@ test("config helpers normalize drafts, recognize self-hosted agents, and fall ba
     url: "wss://example.com/_buzz-host#foo=bar",
     token: undefined,
   });
+  // Admin pairing URL (bha_) for a token-only host behind any wss:// tunnel.
+  const adminToken = `bha_${"c".repeat(48)}`;
+  assert.deepEqual(parseInviteInput(`wss://my-host.share.zrok.io/#token=${adminToken}`), {
+    url: "wss://my-host.share.zrok.io/",
+    token: adminToken,
+  });
 
   // Guest UI constraints enforce docker runner, runtime allowlist, and concurrency cap
   const guestInfo = {
@@ -345,6 +351,15 @@ test("DM guest invite helpers format, parse, validate, persist decisions, send D
   const sender = "b".repeat(64);
   const token = `bhg_${"1".repeat(48)}`;
   const url = "wss://host.example/_buzz-host";
+
+  // DM guest invites stay strictly bhg_: an admin token is never formatted
+  // into, or accepted from, a guest invite message.
+  const adminSecret = `bha_${"1".repeat(48)}`;
+  assert.throws(() => formatInviteMessage({ url, token: adminSecret }), /valid access token/);
+  assert.equal(
+    parseInviteMessage(`\`\`\`buzz-host-invite\n${JSON.stringify({ v: 1, url, token: adminSecret })}\n\`\`\``),
+    null,
+  );
 
   assert.equal(extractHost(url), "host.example");
   assert.equal(extractHost("http://insecure.example"), "");
@@ -607,5 +622,107 @@ test("public build mode scrubs private tailnet hostname from Remote Agents and V
     assert.ok(bundle.length > 1000, `${dir} bundle should be non-empty`);
     assert.ok(!/tail65c5a9\.ts\.net/i.test(bundle), `${dir} public bundle must not contain private tailnet hostname`);
     assert.ok(bundle.includes('const DEFAULT_URL = ""'), `${dir} public bundle should scrub DEFAULT_URL to empty string`);
+  }
+});
+
+test("multi-machine client routes RPCs by machineId and agent pubkey, and fans out allMachines list", async () => {
+  const { createClient } = await import("./src/client.js");
+  const { MACHINES_KEY, AGENT_HOSTS_KEY } = await import("./src/config.js");
+
+  const mem = new Map();
+  const prevStorage = globalThis.localStorage;
+  const prevWs = globalThis.WebSocket;
+  globalThis.localStorage = {
+    getItem: (k) => (mem.has(k) ? mem.get(k) : null),
+    setItem: (k, v) => mem.set(k, String(v)),
+    removeItem: (k) => mem.delete(k),
+  };
+
+  const callsByUrl = new Map();
+  class MockWebSocket {
+    static OPEN = 1;
+    readyState = 1;
+    constructor(url) {
+      this.url = url;
+      if (!callsByUrl.has(url)) callsByUrl.set(url, []);
+      queueMicrotask(() => this.onopen?.());
+    }
+    send(raw) {
+      const msg = JSON.parse(raw);
+      callsByUrl.get(this.url).push(msg);
+      if (msg.method === "auth") {
+        this.onmessage?.({ data: JSON.stringify({ id: msg.id, result: { role: "admin" } }) });
+      } else if (msg.method === "list") {
+        const agents = this.url.includes("linux")
+          ? [{ pubkey: "11".repeat(32), name: "LinuxBot", desktop: true }]
+          : [{ pubkey: "22".repeat(32), name: "MacBot", desktop: false }];
+        this.onmessage?.({ data: JSON.stringify({ id: msg.id, result: { agents } }) });
+      } else if (msg.method === "settings.get") {
+        this.onmessage?.({ data: JSON.stringify({ id: msg.id, result: { hostUrl: this.url } }) });
+      } else if (msg.method === "provision") {
+        this.onmessage?.({ data: JSON.stringify({ id: msg.id, result: { pubkey: "33".repeat(32) } }) });
+      }
+    }
+    close() {
+      this.readyState = 3;
+      this.onclose?.();
+    }
+  }
+  globalThis.WebSocket = MockWebSocket;
+
+  try {
+    localStorage.setItem(
+      MACHINES_KEY,
+      JSON.stringify([
+        {
+          id: "linux-1",
+          name: "Omarchy",
+          url: "wss://linux.example.org:8447",
+          token: "bha_linux",
+          platform: "linux",
+          capabilities: { desktop: true },
+          routes: [{ type: "wss", url: "wss://linux.example.org:8447" }],
+        },
+        {
+          id: "mac-1",
+          name: "Mac Mini",
+          url: "wss://mac.example.org/_buzz-host",
+          token: "bha_mac",
+          platform: "darwin",
+          capabilities: { desktop: false },
+          routes: [{ type: "wss", url: "wss://mac.example.org/_buzz-host" }],
+        },
+      ]),
+    );
+
+    const client = createClient();
+    try {
+      // Fan-out list populates agent-host mapping and tags desktopSupported per machine.
+      const combined = await client.call("list", {}, { allMachines: true });
+      assert.equal(combined.agents.length, 2);
+      const linuxAgent = combined.agents.find((a) => a.name === "LinuxBot");
+      const macAgent = combined.agents.find((a) => a.name === "MacBot");
+      assert.equal(linuxAgent.desktopSupported, true);
+      assert.equal(macAgent.desktopSupported, false);
+      assert.equal(client.urlForAgent(macAgent.pubkey), "wss://mac.example.org/_buzz-host");
+      assert.equal(client.urlForAgent(linuxAgent.pubkey), "wss://linux.example.org:8447");
+
+      // Per-agent RPC automatically routes to the owning machine's WebSocket.
+      const macSettings = await client.call("settings.get", { pubkey: macAgent.pubkey });
+      assert.equal(macSettings.hostUrl, "wss://mac.example.org/_buzz-host");
+      const linuxSettings = await client.call("settings.get", { pubkey: linuxAgent.pubkey });
+      assert.equal(linuxSettings.hostUrl, "wss://linux.example.org:8447");
+
+      // Explicit machineId on provision records the new agent's owning machine.
+      const provisioned = await client.call("provision", { name: "NewMac" }, { machineId: "mac-1" });
+      assert.equal(provisioned.pubkey, "33".repeat(32));
+      const hostMap = JSON.parse(localStorage.getItem(AGENT_HOSTS_KEY));
+      assert.equal(hostMap["33".repeat(32)], "mac-1");
+    } finally {
+      client.close();
+    }
+  } finally {
+    globalThis.localStorage = prevStorage;
+    globalThis.WebSocket = prevWs;
   }
 });

@@ -3,6 +3,11 @@
 //#region plugin/src/config.js
 const URL_KEY = "local.buzz-host.url";
 const TOKEN_KEY = "local.buzz-host.token";
+const MACHINES_KEY = "local.buzz-host.machines.v1";
+const AGENT_HOSTS_KEY = "local.buzz-host.agent-hosts.v1";
+const ACTIVE_MACHINE_KEY = "local.buzz-host.active-machine.v1";
+const MACHINES_CHANGED_EVENT = "buzz-host:machines-changed";
+const AGENT_HOSTS_CHANGED_EVENT = "buzz-host:agent-hosts-changed";
 const DEFAULT_URL = "wss://omarchy.tail65c5a9.ts.net:8447";
 const RUNTIMES = [
 	{
@@ -190,28 +195,152 @@ function setStoredToken(token) {
 		else localStorage.removeItem(TOKEN_KEY);
 	} catch {}
 }
+/** First wss:// route URL on a machine record, falling back to `machine.url`. */
+function machineWssUrl(machine) {
+	if (!machine || typeof machine !== "object") return "";
+	if (Array.isArray(machine.routes)) {
+		for (const route of machine.routes) if (route?.type === "wss" && typeof route.url === "string" && route.url.trim()) return route.url.trim();
+	}
+	return typeof machine.url === "string" ? machine.url.trim() : "";
+}
+function normalizeStoredMachine(entry) {
+	if (!entry || typeof entry !== "object") return null;
+	const id = typeof entry.id === "string" ? entry.id.trim() : "";
+	const url = machineWssUrl(entry);
+	if (!id || !url && !(Array.isArray(entry.routes) && entry.routes.length)) return null;
+	return {
+		id,
+		name: typeof entry.name === "string" && entry.name.trim() ? entry.name.trim() : id,
+		url,
+		token: typeof entry.token === "string" ? entry.token.trim() : "",
+		routes: Array.isArray(entry.routes) ? entry.routes : url ? [{
+			type: "wss",
+			url
+		}] : [],
+		platform: typeof entry.platform === "string" ? entry.platform : void 0,
+		host: typeof entry.host === "string" ? entry.host : void 0,
+		role: entry.role === "admin" || entry.role === "guest" ? entry.role : void 0,
+		capabilities: entry.capabilities && typeof entry.capabilities === "object" ? entry.capabilities : void 0
+	};
+}
+/** Read configured machines from Buzz's multi-machine registry, falling back to legacy single-URL storage. */
+function storedMachines() {
+	try {
+		const raw = localStorage.getItem(MACHINES_KEY);
+		if (raw !== null) {
+			const parsed = JSON.parse(raw);
+			if (Array.isArray(parsed)) {
+				const list = [];
+				const seen = /* @__PURE__ */ new Set();
+				for (const item of parsed) {
+					const norm = normalizeStoredMachine(item);
+					if (!norm || seen.has(norm.id)) continue;
+					seen.add(norm.id);
+					list.push(norm);
+				}
+				if (list.length) return list;
+			}
+		}
+	} catch {}
+	const url = storedUrl();
+	if (!url) return [];
+	return [{
+		id: "default",
+		name: "Remote machine",
+		url,
+		token: storedToken(),
+		routes: [{
+			type: "wss",
+			url
+		}]
+	}];
+}
+function machineById(id) {
+	const clean = typeof id === "string" ? id.trim() : "";
+	if (!clean) return void 0;
+	return storedMachines().find((m) => m.id === clean);
+}
+function activeMachine() {
+	const machines = storedMachines();
+	if (!machines.length) return void 0;
+	try {
+		const activeId = localStorage.getItem(ACTIVE_MACHINE_KEY)?.trim();
+		if (activeId) {
+			const hit = machines.find((m) => m.id === activeId);
+			if (hit) return hit;
+		}
+	} catch {}
+	return machines[0];
+}
+function storedAgentHosts() {
+	try {
+		const raw = localStorage.getItem(AGENT_HOSTS_KEY);
+		if (!raw) return {};
+		const parsed = JSON.parse(raw);
+		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+		const out = {};
+		for (const [k, v] of Object.entries(parsed)) if (typeof k === "string" && typeof v === "string" && k.trim() && v.trim()) out[k.trim().toLowerCase()] = v.trim();
+		return out;
+	} catch {
+		return {};
+	}
+}
+function setStoredAgentHost(pubkey, machineId) {
+	const cleanPubkey = typeof pubkey === "string" ? pubkey.trim().toLowerCase() : "";
+	const cleanId = typeof machineId === "string" ? machineId.trim() : "";
+	if (!cleanPubkey || !cleanId) return;
+	try {
+		const current = storedAgentHosts();
+		if (current[cleanPubkey] === cleanId) return;
+		current[cleanPubkey] = cleanId;
+		localStorage.setItem(AGENT_HOSTS_KEY, JSON.stringify(current));
+		if (typeof window !== "undefined") window.dispatchEvent(new CustomEvent(AGENT_HOSTS_CHANGED_EVENT));
+	} catch {}
+}
+function mergeStoredAgentHosts(machineId, pubkeys) {
+	const cleanId = typeof machineId === "string" ? machineId.trim() : "";
+	if (!cleanId) return;
+	try {
+		const current = storedAgentHosts();
+		const owned = new Set((Array.isArray(pubkeys) ? pubkeys : []).map((p) => typeof p === "string" ? p.trim().toLowerCase() : "").filter(Boolean));
+		const next = {};
+		for (const [pubkey, existingId] of Object.entries(current)) {
+			if (existingId === cleanId && !owned.has(pubkey)) continue;
+			next[pubkey] = existingId;
+		}
+		for (const pubkey of owned) next[pubkey] = cleanId;
+		localStorage.setItem(AGENT_HOSTS_KEY, JSON.stringify(next));
+		if (typeof window !== "undefined") window.dispatchEvent(new CustomEvent(AGENT_HOSTS_CHANGED_EVENT));
+	} catch {}
+}
+function machineForAgent(pubkey) {
+	const clean = typeof pubkey === "string" ? pubkey.trim().toLowerCase() : "";
+	if (!clean) return void 0;
+	const machineId = storedAgentHosts()[clean];
+	return machineId ? machineById(machineId) : void 0;
+}
 
 //#endregion
 //#region plugin/src/client.js
-function createClient() {
+function createMachineSocket({ id, url, token, onState }) {
 	let socket;
 	let opening;
 	let next = 1;
 	const pending = /* @__PURE__ */ new Map();
-	const listeners = /* @__PURE__ */ new Set();
 	let state = {
+		id,
 		status: "idle",
-		url: storedUrl(),
+		url,
+		token,
 		error: "",
-		session: null,
-		epoch: 0
+		session: null
 	};
 	const set = (patch) => {
 		state = {
 			...state,
 			...patch
 		};
-		for (const listener of listeners) listener();
+		onState?.(state);
 	};
 	function fail(error) {
 		for (const [, p] of pending) {
@@ -222,24 +351,24 @@ function createClient() {
 	}
 	function sendRaw(ws, method, params = {}, { signal, timeoutMs = 12e4 } = {}) {
 		if (signal?.aborted) return Promise.reject(new DOMException("Aborted", "AbortError"));
-		const id = next++;
+		const reqId = next++;
 		return new Promise((resolve, reject) => {
 			const timer = setTimeout(() => {
-				pending.delete(id);
+				pending.delete(reqId);
 				reject(/* @__PURE__ */ new Error(`buzz-host did not answer ${method} in time`));
 			}, timeoutMs);
-			pending.set(id, {
+			pending.set(reqId, {
 				resolve,
 				reject,
 				timer
 			});
 			signal?.addEventListener("abort", () => {
-				if (!pending.delete(id)) return;
+				if (!pending.delete(reqId)) return;
 				clearTimeout(timer);
 				reject(new DOMException("Aborted", "AbortError"));
 			}, { once: true });
 			ws.send(JSON.stringify({
-				id,
+				id: reqId,
 				method,
 				params
 			}));
@@ -248,10 +377,8 @@ function createClient() {
 	function open() {
 		if (socket && socket.readyState === WebSocket.OPEN) return Promise.resolve(socket);
 		if (opening) return opening;
-		const url = storedUrl();
-		const token = storedToken();
 		if (!url) {
-			const error = /* @__PURE__ */ new Error("No buzz-host server configured yet. Open Settings → Plugins → Remote Agents and paste your server URL or invite link.");
+			const error = /* @__PURE__ */ new Error("No buzz-host server configured yet. Open Settings → Agent setup → Machines and paste your server URL or pairing link.");
 			set({
 				status: "idle",
 				url: "",
@@ -346,7 +473,7 @@ function createClient() {
 				if (!settled && opening && !wasOpen) {
 					opening = void 0;
 					settled = true;
-					const error = /* @__PURE__ */ new Error(token ? `Could not reach buzz-host at ${url}. Check that the server is up and the invite URL is correct.` : `Could not reach buzz-host at ${url}. Check that the server is up and this device is on the tailnet.`);
+					const error = /* @__PURE__ */ new Error(token ? `Could not reach buzz-host at ${url}. Check that the server is up and the pairing URL is correct.` : `Could not reach buzz-host at ${url}. Check that the server is up and this device is on the tailnet.`);
 					set({
 						status: "error",
 						error: error.message,
@@ -367,33 +494,253 @@ function createClient() {
 			label: result.label ?? null,
 			ownerPubkey: result.ownerPubkey ?? null,
 			limits: result.limits ?? null,
+			platform: result.platform ?? null,
+			capabilities: result.capabilities ?? null,
 			publicGuestUrl: result.publicGuestUrl ?? null
 		} });
+		return result;
+	}
+	function close() {
+		const old = socket;
+		socket = void 0;
+		opening = void 0;
+		try {
+			old?.close();
+		} catch {}
+		fail(/* @__PURE__ */ new Error("Connection to buzz-host closed"));
+	}
+	return {
+		id,
+		url,
+		token,
+		call,
+		open,
+		close,
+		snapshot: () => state
+	};
+}
+function createClient() {
+	const pool = /* @__PURE__ */ new Map();
+	const listeners = /* @__PURE__ */ new Set();
+	const fallbackTarget = () => {
+		const primary = activeMachine();
+		if (primary) return {
+			id: primary.id,
+			url: machineWssUrl(primary),
+			token: primary.token || ""
+		};
+		return {
+			id: "default",
+			url: storedUrl(),
+			token: storedToken()
+		};
+	};
+	let state = {
+		status: "idle",
+		url: fallbackTarget().url,
+		machineId: fallbackTarget().id,
+		error: "",
+		session: null,
+		epoch: 0
+	};
+	const emit = () => {
+		for (const listener of [...listeners]) listener();
+	};
+	const set = (patch) => {
+		state = {
+			...state,
+			...patch
+		};
+		emit();
+	};
+	function resolveTarget(params = {}, options = {}) {
+		if (options?.machineId) {
+			const hit = machineById(options.machineId);
+			if (hit) return {
+				id: hit.id,
+				url: machineWssUrl(hit),
+				token: hit.token || ""
+			};
+		}
+		if (params && typeof params.pubkey === "string" && params.pubkey) {
+			const owner = machineForAgent(params.pubkey);
+			if (owner) return {
+				id: owner.id,
+				url: machineWssUrl(owner),
+				token: owner.token || ""
+			};
+		}
+		return fallbackTarget();
+	}
+	function getSocket(target) {
+		const existing = pool.get(target.id);
+		if (existing && existing.url === target.url && existing.token === target.token) return existing;
+		if (existing) {
+			existing.close();
+			pool.delete(target.id);
+		}
+		const created = createMachineSocket({
+			id: target.id,
+			url: target.url,
+			token: target.token,
+			onState(nextState) {
+				const current = fallbackTarget();
+				if (nextState.id === current.id) set({
+					status: nextState.status,
+					url: nextState.url,
+					machineId: nextState.id,
+					error: nextState.error,
+					session: nextState.session
+				});
+			}
+		});
+		pool.set(target.id, created);
+		return created;
+	}
+	function syncPoolWithStorage() {
+		const machines = storedMachines();
+		const byId = new Map(machines.map((m) => [m.id, m]));
+		for (const [id, conn] of [...pool.entries()]) {
+			const fresh = byId.get(id);
+			if (!fresh || machineWssUrl(fresh) !== conn.url || (fresh.token || "") !== conn.token) {
+				conn.close();
+				pool.delete(id);
+			}
+		}
+		const primary = fallbackTarget();
+		const primaryConn = pool.get(primary.id);
+		set({
+			url: primary.url,
+			machineId: primary.id,
+			status: primaryConn?.snapshot().status ?? "idle",
+			error: primaryConn?.snapshot().error ?? "",
+			session: primaryConn?.snapshot().session ?? null,
+			epoch: state.epoch + 1
+		});
+	}
+	const onStorage = (event) => {
+		if (event.key === null || event.key === "local.buzz-host.machines.v1" || event.key === "local.buzz-host.active-machine.v1" || event.key === "local.buzz-host.url" || event.key === "local.buzz-host.token") syncPoolWithStorage();
+	};
+	const onMachinesChanged = () => syncPoolWithStorage();
+	if (typeof window !== "undefined") {
+		window.addEventListener("storage", onStorage);
+		window.addEventListener(MACHINES_CHANGED_EVENT, onMachinesChanged);
+	}
+	async function callAllList(params = {}, options = {}) {
+		const machines = storedMachines();
+		if (!machines.length) return {
+			agents: [],
+			errors: []
+		};
+		const settled = await Promise.allSettled(machines.map(async (machine) => {
+			const target = {
+				id: machine.id,
+				url: machineWssUrl(machine),
+				token: machine.token || ""
+			};
+			if (!target.url) return {
+				machine,
+				agents: []
+			};
+			const conn = getSocket(target);
+			const res = await conn.call("list", params, options);
+			const rawAgents = Array.isArray(res?.agents) ? res.agents : [];
+			mergeStoredAgentHosts(machine.id, rawAgents.map((a) => a.pubkey).filter(Boolean));
+			const sessionCaps = conn.snapshot().session?.capabilities;
+			const platform = machine.platform ?? conn.snapshot().session?.platform ?? void 0;
+			const desktopSupported = machine.capabilities?.desktop !== void 0 ? machine.capabilities.desktop !== false : sessionCaps?.desktop !== void 0 ? sessionCaps.desktop !== false : platform !== "darwin";
+			return {
+				machine,
+				agents: rawAgents.map((a) => ({
+					...a,
+					machineId: machine.id,
+					machineName: machine.name,
+					machinePlatform: platform,
+					desktopSupported
+				}))
+			};
+		}));
+		const agents = [];
+		const seen = /* @__PURE__ */ new Set();
+		const errors = [];
+		for (let i = 0; i < settled.length; i++) {
+			const outcome = settled[i];
+			const machine = machines[i];
+			if (outcome.status === "fulfilled") for (const agent of outcome.value.agents) {
+				const key = String(agent.pubkey || "").toLowerCase();
+				if (!key || seen.has(key)) continue;
+				seen.add(key);
+				agents.push(agent);
+			}
+			else errors.push({
+				machineId: machine.id,
+				machineName: machine.name,
+				error: outcome.reason instanceof Error ? outcome.reason.message : String(outcome.reason)
+			});
+		}
+		if (!agents.length && errors.length === machines.length) throw new Error(errors[0].error);
+		return {
+			agents,
+			errors
+		};
+	}
+	async function call(method, params = {}, options = {}) {
+		if (options.signal?.aborted) throw new DOMException("Aborted", "AbortError");
+		if (method === "list" && options.allMachines) return callAllList(params, options);
+		const target = resolveTarget(params, options);
+		const result = await getSocket(target).call(method, params, options);
+		if (method === "provision" && result?.pubkey) setStoredAgentHost(result.pubkey, target.id);
+		if (method === "list" && Array.isArray(result?.agents)) mergeStoredAgentHosts(target.id, result.agents.map((a) => a.pubkey).filter(Boolean));
 		return result;
 	}
 	return {
 		call,
 		snapshot: () => state,
+		sessionFor(machineId) {
+			const id = (machineId ? machineById(machineId) : activeMachine())?.id ?? "default";
+			return pool.get(id)?.snapshot().session ?? null;
+		},
+		machineFor(pubkeyOrId) {
+			return machineForAgent(pubkeyOrId) ?? machineById(pubkeyOrId) ?? activeMachine();
+		},
+		urlForAgent(pubkey) {
+			const machine = machineForAgent(pubkey) ?? activeMachine();
+			return machine && machineWssUrl(machine) || storedUrl();
+		},
+		listMachines: () => storedMachines(),
 		subscribe(listener) {
 			listeners.add(listener);
 			return () => listeners.delete(listener);
 		},
-		reconnect() {
-			const old = socket;
-			socket = void 0;
-			opening = void 0;
-			try {
-				old?.close();
-			} catch {}
+		reconnect(machineId) {
+			if (machineId) {
+				const target = resolveTarget({}, { machineId });
+				const existing = pool.get(target.id);
+				if (existing) {
+					existing.close();
+					pool.delete(target.id);
+				}
+				set({ epoch: state.epoch + 1 });
+				return getSocket(target).open();
+			}
+			for (const conn of pool.values()) conn.close();
+			pool.clear();
+			const target = fallbackTarget();
 			set({
-				url: storedUrl(),
+				url: target.url,
+				machineId: target.id,
 				session: null,
 				epoch: state.epoch + 1
 			});
-			return open();
+			return getSocket(target).open();
 		},
 		close() {
-			socket?.close();
+			if (typeof window !== "undefined") {
+				window.removeEventListener("storage", onStorage);
+				window.removeEventListener(MACHINES_CHANGED_EVENT, onMachinesChanged);
+			}
+			for (const conn of pool.values()) conn.close();
+			pool.clear();
 		}
 	};
 }
@@ -529,8 +876,8 @@ function createBuzzPrimitives(React) {
 		Btn
 	};
 }
-function useModels(React, client, runtime, profile = "") {
-	const key = `${runtime}\n${runtime === "hermes" ? profile : ""}`;
+function useModels(React, client, runtime, profile = "", machineId = "") {
+	const key = `${machineId}\n${runtime}\n${runtime === "hermes" ? profile : ""}`;
 	const [state, setState] = React.useState({
 		key,
 		models: void 0,
@@ -548,7 +895,8 @@ function useModels(React, client, runtime, profile = "") {
 			profile: runtime === "hermes" ? profile : ""
 		}, {
 			signal: controller.signal,
-			timeoutMs: 6e4
+			timeoutMs: 6e4,
+			...machineId ? { machineId } : {}
 		}).then((r) => !controller.signal.aborted && setState({
 			key,
 			models: r.models,
@@ -566,19 +914,21 @@ function useModels(React, client, runtime, profile = "") {
 		error: ""
 	};
 }
-function useServerInfo(React, client) {
+function useServerInfo(React, client, machineId = "") {
 	const snap = React.useSyncExternalStore(client.subscribe, client.snapshot);
-	const key = `${snap.url}#${snap.epoch ?? 0}`;
+	const key = `${machineId || snap.url}#${snap.epoch ?? 0}`;
+	const initialSession = (machineId ? client.sessionFor?.(machineId) : snap.session) ?? null;
 	const [state, setState] = React.useState(() => ({
 		key,
-		info: snap.session ? { ...snap.session } : void 0,
+		info: initialSession ? { ...initialSession } : void 0,
 		error: ""
 	}));
 	React.useEffect(() => {
 		const controller = new AbortController();
 		client.call("hello", {}, {
 			signal: controller.signal,
-			timeoutMs: 2e4
+			timeoutMs: 2e4,
+			...machineId ? { machineId } : {}
 		}).then((info) => !controller.signal.aborted && setState({
 			key,
 			info,
@@ -592,11 +942,11 @@ function useServerInfo(React, client) {
 	}, [client, key]);
 	return state.key === key ? state : {
 		key,
-		info: snap.session ? { ...snap.session } : void 0,
+		info: initialSession ? { ...initialSession } : void 0,
 		error: ""
 	};
 }
-function useProfiles(React, client, enabled) {
+function useProfiles(React, client, enabled, machineId = "") {
 	const [state, setState] = React.useState({
 		profiles: void 0,
 		error: ""
@@ -606,7 +956,8 @@ function useProfiles(React, client, enabled) {
 		const controller = new AbortController();
 		client.call("hermes.profiles", {}, {
 			signal: controller.signal,
-			timeoutMs: 6e4
+			timeoutMs: 6e4,
+			...machineId ? { machineId } : {}
 		}).then((r) => !controller.signal.aborted && setState({
 			profiles: r.profiles,
 			error: ""
@@ -615,7 +966,11 @@ function useProfiles(React, client, enabled) {
 			error: String(e.message ?? e)
 		}));
 		return () => controller.abort();
-	}, [client, enabled]);
+	}, [
+		client,
+		enabled,
+		machineId
+	]);
 	return state;
 }
 /** Buzz's Hermes plugin's profile field: the default profile, then the others. */
@@ -1371,15 +1726,15 @@ function createType({ React, client, ctx, uiKit, invalidateCatalog, ActivityTab,
 	* Model show; the rest sit behind a "More options" row whose subtitle names
 	* their current values, so the defaults stay visible without crowding.
 	*/
-	function RuntimeRows({ ui, draft, onChange, disabled, serverInfo, collapsible = false }) {
+	function RuntimeRows({ ui, draft, onChange, disabled, serverInfo, machineId = "", collapsible = false }) {
 		const [expanded, setExpanded] = React.useState(false);
 		const isGuest = serverInfo?.role === "guest";
 		const canUseHost = !isGuest || serverInfo?.limits?.allowHostDesktop === true;
 		const effective = isGuest ? applyGuestConstraints(draft, serverInfo) : draft;
 		const sandboxed = (effective.runner || (canUseHost ? "host" : "docker")) !== "host";
-		const { models, error } = useModels(React, client, effective.runtime, !isGuest && !sandboxed ? effective.profile : "");
+		const { models, error } = useModels(React, client, effective.runtime, !isGuest && !sandboxed ? effective.profile : "", machineId);
 		const hermes = !isGuest && effective.runtime === "hermes" && !sandboxed;
-		const { profiles, error: profileError } = useProfiles(React, client, hermes);
+		const { profiles, error: profileError } = useProfiles(React, client, hermes, machineId);
 		const choice = modelChoices(models);
 		const respondTo = effective.respondTo || "owner-only";
 		const showMore = !collapsible || expanded;
@@ -1516,7 +1871,8 @@ function createType({ React, client, ctx, uiKit, invalidateCatalog, ActivityTab,
 	function CreateConfiguration({ agent, config, onChange, disabled, harnessControl, onReadyChange }) {
 		React.useEffect(() => onReadyChange?.(true), [onReadyChange]);
 		const ui = agentUi();
-		const { info: serverInfo } = useServerInfo(React, client);
+		const machineId = typeof config?.machineId === "string" ? config.machineId : "";
+		const { info: serverInfo } = useServerInfo(React, client, machineId);
 		const isGuest = serverInfo?.role === "guest";
 		const draft = isGuest ? applyGuestConstraints(asConfig(config), serverInfo) : asConfig(config);
 		React.useEffect(() => {
@@ -1550,6 +1906,7 @@ function createType({ React, client, ctx, uiKit, invalidateCatalog, ActivityTab,
 			onChange,
 			disabled,
 			serverInfo,
+			machineId,
 			collapsible: true
 		})), h(AllowlistField, {
 			draft,
@@ -1996,7 +2353,11 @@ function createType({ React, client, ctx, uiKit, invalidateCatalog, ActivityTab,
 		return h("div", { style: {
 			display: "grid",
 			gap: "var(--space-4)"
-		} }, h(Note, null, `Runs on buzz-host (${client.snapshot().url.replace(/^wss:\/\//, "")})${loaded.runtime === "hermes" ? ` · Hermes profile ${loaded.profile || "default"}` : ""} · service ${loaded.status}. Up to ${loaded.concurrency} parallel conversations.`), h(Row, { label: "Runtime" }, h(Select, {
+		} }, h(Note, null, (() => {
+			const machine = client.machineFor?.(pubkey);
+			const hostDisplay = (machine?.url || client.snapshot().url || "").replace(/^wss:\/\//, "");
+			return `Runs on ${machine?.name && machine.name !== "Remote machine" ? `${machine.name} (${hostDisplay})` : `buzz-host (${hostDisplay})`}${loaded.runtime === "hermes" ? ` · Hermes profile ${loaded.profile || "default"}` : ""} · service ${loaded.status}. Up to ${loaded.concurrency} parallel conversations.`;
+		})()), h(Row, { label: "Runtime" }, h(Select, {
 			value: draft.runtime,
 			disabled: !!busy,
 			options: runtimeOptionsFor(serverInfo),
@@ -2151,7 +2512,8 @@ function createType({ React, client, ctx, uiKit, invalidateCatalog, ActivityTab,
 		}],
 		remote: {
 			async provision({ name, picture, community, config, signal }) {
-				const session = client.snapshot().session;
+				const machineId = typeof config?.machineId === "string" ? config.machineId : "";
+				const session = (machineId ? client.sessionFor?.(machineId) : client.snapshot().session) ?? null;
 				const c = applyGuestConstraints(asConfig(config), session);
 				return client.call("provision", {
 					name,
@@ -2167,10 +2529,14 @@ function createType({ React, client, ctx, uiKit, invalidateCatalog, ActivityTab,
 						respondToAllowlist: c.respondToAllowlist,
 						instructions: c.instructions
 					}
-				}, { signal });
+				}, {
+					signal,
+					...machineId ? { machineId } : {}
+				});
 			},
 			async activate({ pubkey, name, community, auth, config, signal }) {
-				const session = client.snapshot().session;
+				const machineId = typeof config?.machineId === "string" ? config.machineId : "";
+				const session = (machineId ? client.sessionFor?.(machineId) : client.snapshot().session) ?? null;
 				const c = config === void 0 ? void 0 : applyGuestConstraints(asConfig(config), session);
 				await client.call("activate", {
 					pubkey,
@@ -2189,7 +2555,8 @@ function createType({ React, client, ctx, uiKit, invalidateCatalog, ActivityTab,
 					} } : {}
 				}, {
 					signal,
-					timeoutMs: 18e4
+					timeoutMs: 18e4,
+					...machineId ? { machineId } : {}
 				});
 			},
 			async profile({ pubkey, community, name, picture, signal }) {
@@ -3139,7 +3506,7 @@ function createServerCard({ React, client, uiKit, Btn, relay }) {
 			display: "grid",
 			gap: "2px",
 			minWidth: 0
-		} }, h("strong", null, `${t.label} (${t.id})`), h(Note, null, `${t.agentCount ?? 0}/${t.maxAgents} agents · max ${t.maxConcurrency} parallel · ${t.allowedRuntimes.join(", ")}${t.allowHostDesktop ? " · host desktop (trusted)" : ""} · ${t.ownerPubkey ? `bound ${t.ownerPubkey.slice(0, 10)}…` : "unbound (binds on first agent)"}`)), h("button", {
+		} }, h("strong", null, `${t.label} (${t.id})`), h(Note, null, t.role === "admin" ? `Admin access token · full access to this host${t.ownerPubkey ? ` · owner ${t.ownerPubkey.slice(0, 10)}…` : ""}` : `${t.agentCount ?? 0}/${t.maxAgents} agents · max ${t.maxConcurrency} parallel · ${(t.allowedRuntimes ?? []).join(", ")}${t.allowHostDesktop ? " · host desktop (trusted)" : ""} · ${t.ownerPubkey ? `bound ${t.ownerPubkey.slice(0, 10)}…` : "unbound (binds on first agent)"}`)), h("button", {
 			type: "button",
 			disabled: busy,
 			onClick: () => void revoke(t.id)
@@ -3202,21 +3569,21 @@ function createServerCard({ React, client, uiKit, Btn, relay }) {
 			gap: "var(--space-3)"
 		} }, h(Note, null, "Agents of type Self-hosted run on a buzz-host server. Create them in Agents → New agent → Harness → Remote → Self-hosted. In a chat, tag the agent with /model, /effort, /runtime, /new, /stop, /status or /help to control that chat (or thread)."), h(Row, {
 			label: "Server (or paste invite link)",
-			hint: "Admin: your wss:// tailscale serve address. Guest: paste the invite link from your host."
+			hint: "Admin: your wss:// tailscale serve address, or an admin link (#token=bha_…) for any wss:// tunnel. Guest: paste the invite link from your host."
 		}, h(Text, {
 			value: url,
 			placeholder: "wss://host.example/_buzz-host#token=bhg_…",
 			onChange: (e) => handleUrlChange(e.target.value)
 		})), h(Row, {
-			label: "Access token (guests only)",
-			hint: "Leave blank on your own tailnet admin connection. Filled automatically when pasting an invite link."
+			label: "Access token",
+			hint: "Leave blank on your own tailnet admin connection. Guests use a bhg_ invite token; an admin access token (bha_, from buzz-host-tokens create-admin) connects without Tailscale. Filled automatically when pasting an invite link."
 		}, h("div", { style: {
 			display: "flex",
 			gap: "var(--space-2)"
 		} }, h(Text, {
 			type: showToken ? "text" : "password",
 			value: token,
-			placeholder: "bhg_… (optional)",
+			placeholder: "bhg_… or bha_… (optional)",
 			style: { flex: 1 },
 			onChange: (e) => setToken(e.target.value)
 		}), h("button", {

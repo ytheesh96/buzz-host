@@ -1,10 +1,16 @@
 #!/usr/bin/env node
-// CLI for managing buzz-host guest access tokens directly on the host.
+// CLI for managing buzz-host access tokens directly on the host.
 //
 // Usage:
 //   buzz-host-tokens create --label Alice [--owner <64-hex>] [--max-agents 2] [--max-concurrency 2] [--runtimes hermes,claude,antigravity] [--allow-host-desktop]
-//   buzz-host-tokens list
+//   buzz-host-tokens create-admin --label "My laptop" [--owner <64-hex>] [--url wss://...] [--json]
+//                    (same as: create --role admin ...)
+//   buzz-host-tokens list [--json]
 //   buzz-host-tokens revoke <tok_...>
+//
+// Guest tokens (bhg_) are scoped, sandboxed friend accounts. Admin tokens (bha_)
+// give full access to this host over the token listener, for the owner's own
+// devices that are not on the tailnet (server-only Funnel, zrok, any wss://).
 
 import fs from "node:fs/promises";
 import { existsSync } from "node:fs";
@@ -54,8 +60,31 @@ const tokensFile =
   typeof flags.file === "string" && flags.file.trim() ? flags.file.trim() : TOKENS_FILE;
 const store = createTokenStore({ filePath: tokensFile });
 
+const USAGE = "Usage: buzz-host-tokens <create|create-admin|list|revoke> [options]";
+const role = cmd === "create-admin" ? "admin" : typeof flags.role === "string" ? flags.role.trim().toLowerCase() : "guest";
+
 try {
-  if (cmd === "create") {
+  if ((cmd === "create" || cmd === "create-admin") && role !== "guest" && role !== "admin") {
+    throw new Error(`--role must be "guest" or "admin", not "${flags.role}"`);
+  }
+  if ((cmd === "create" || cmd === "create-admin") && role === "admin") {
+    const guestOnly = ["max-agents", "max-concurrency", "runtimes", "allow-host-desktop", "trusted"].filter((f) => f in flags);
+    if (guestOnly.length) throw new Error(`Admin tokens have no guest caps; drop --${guestOnly.join(", --")}`);
+    const { token, record } = await store.createAdmin({ label: flags.label ?? rest[0], ownerPubkey: flags.owner });
+    const baseUrl =
+      typeof flags.url === "string" && flags.url.trim() ? flags.url.trim() : await publicGuestUrl();
+    const pairingUrl = buildInviteUrl(baseUrl, token);
+    if (flags.json) {
+      console.log(JSON.stringify({ token, pairingUrl, inviteUrl: pairingUrl, record }, null, 2));
+    } else {
+      console.log(`Created ADMIN token ${record.id} for "${record.label}"`);
+      console.log("Full access to this host (all agents, desktops, guest tokens). Keep it like a password.");
+      if (record.ownerPubkey) console.log(`Owner: ${record.ownerPubkey}`);
+      console.log(`\nToken (shown once):      ${token}`);
+      console.log(`1-paste pairing URL:     ${pairingUrl}`);
+      console.log(`Revoke with:             buzz-host-tokens revoke ${record.id}`);
+    }
+  } else if (cmd === "create") {
     const allowedRuntimes =
       typeof flags.runtimes === "string"
         ? flags.runtimes
@@ -92,22 +121,28 @@ try {
     if (flags.json) {
       console.log(JSON.stringify({ tokens }, null, 2));
     } else if (!tokens.length) {
-      console.log("No guest tokens.");
+      console.log("No access tokens.");
     } else {
       for (const t of tokens) {
         const status = t.revokedAt ? `REVOKED (${t.revokedAt})` : "active";
-        console.log(
-          `${t.id}  ${t.label}  [${status}]  owner=${t.ownerPubkey ? t.ownerPubkey.slice(0, 12) + "…" : "unbound"}  caps=${t.maxAgents}a/${t.maxConcurrency}c  runtimes=${t.allowedRuntimes.join(",")}${t.allowHostDesktop ? "  hostDesktop=yes" : ""}`,
-        );
+        const owner = t.ownerPubkey ? t.ownerPubkey.slice(0, 12) + "…" : t.role === "admin" ? "-" : "unbound";
+        const detail =
+          t.role === "admin"
+            ? "full access"
+            : `caps=${t.maxAgents}a/${t.maxConcurrency}c  runtimes=${t.allowedRuntimes.join(",")}${t.allowHostDesktop ? "  hostDesktop=yes" : ""}`;
+        console.log(`${t.id}  ${t.role.padEnd(5)}  ${t.label}  [${status}]  owner=${owner}  ${detail}`);
       }
     }
   } else if (cmd === "revoke") {
     const id = rest[0] || flags.id;
     const record = await store.revoke(id);
     if (flags.json) console.log(JSON.stringify({ record }, null, 2));
-    else console.log(`Revoked ${record.id} (${record.label}) at ${record.revokedAt}`);
+    else {
+      console.log(`Revoked ${record.role} token ${record.id} (${record.label}) at ${record.revokedAt}`);
+      console.log("buzz-host closes connections still using it within about 15 seconds.");
+    }
   } else {
-    console.error("Usage: buzz-host-tokens <create|list|revoke> [options]");
+    console.error(USAGE);
     process.exit(2);
   }
 } catch (error) {

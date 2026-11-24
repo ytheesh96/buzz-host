@@ -5,11 +5,16 @@
 // provision → activate → profile / instructions / remove. This server keeps
 // each agent's key on this machine and runs it with `buzz-acp` as a systemd
 // user unit (buzz-agent@<pubkey>.service), so agents answer while the owner's
-// laptop is closed.
+// laptop is closed. On macOS the same agent runs as a launchd LaunchAgent
+// (service-manager.mjs).
 //
 // Transport: JSON over WebSocket on 127.0.0.1, published to the tailnet with
 // `tailscale serve`, which adds the caller's Tailscale-User-Login header. Only
-// logins listed in config.json are served. No dependencies beyond Node.
+// logins listed in config.json are served. A second listener (guestPort) takes
+// access tokens instead, for public tunnels (Funnel, zrok, any wss:// proxy):
+// guest tokens, and admin tokens for an owner whose devices are not on the
+// tailnet. With no allowLogins the tailnet listener is not started at all.
+// No dependencies beyond Node.
 
 import { createServer } from "node:http";
 import { createHash, generateKeyPairSync, randomBytes } from "node:crypto";
@@ -45,10 +50,13 @@ import {
   canAccessAgent,
   createAuthRateLimiter,
   createTokenStore,
+  desktopTicketTokenAllowed,
   enforceGuestSettings,
   findIdleGuestDesktops,
   isValidDesktopTicket,
+  parseListenerConfig,
 } from "./auth.mjs";
+import { createServiceManager, ensurePrivateDir, runDir, runtimeBase } from "./service-manager.mjs";
 import {
   clientIpFromForwardedFor,
   createFragmentBuffer,
@@ -68,7 +76,17 @@ const WORK = path.join(HOME, "buzz-agents");
 const CONFIG = path.join(HOME, ".config/buzz-host/config.json");
 const BIN = path.join(LIB, "bin");
 const VERSION = 2;
-const RUN_DIR = path.join(process.env.XDG_RUNTIME_DIR || `/run/user/${process.getuid()}`, "buzz-host");
+// macOS has no XDG_RUNTIME_DIR: use the short per-user base service-manager.mjs
+// picks, and export it so every child (agent-run, docker-run, …) agrees.
+if (process.platform === "darwin" && !process.env.XDG_RUNTIME_DIR) process.env.XDG_RUNTIME_DIR = runtimeBase();
+const RUN_DIR = runDir();
+// Agent desktops (Xvnc + Xfce + cua-driver, bwrap) exist on Linux hosts only.
+const DESKTOP_SUPPORTED = process.platform === "linux";
+function assertDesktopSupported() {
+  if (!DESKTOP_SUPPORTED)
+    throw new Error(`Agent desktops are not supported on ${process.platform === "darwin" ? "macOS" : process.platform} hosts`);
+}
+const services = createServiceManager();
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const DEFAULT_CONCURRENCY = 4;
 const MIN_CONCURRENCY = 1;
@@ -172,15 +190,14 @@ async function ensureSessionEnv(profile) {
   sessionEnvReady.add(profile);
 }
 
-async function loadConfig() {
-  const raw = JSON.parse(await fs.readFile(CONFIG, "utf8"));
-  if (!Array.isArray(raw.allowLogins) || raw.allowLogins.length === 0)
-    throw new Error(`${CONFIG}: allowLogins must list Tailscale logins`);
+function parseConfig(raw, file = CONFIG) {
+  const { allowLogins, guestPort } = parseListenerConfig(raw, file);
   return {
     port: raw.port ?? 8457,
-    // Dedicated localhost listener for public Tailscale Funnel guest traffic.
-    // Ignores Tailscale-User-Login headers completely and requires a guest token.
-    guestPort: raw.guestPort ?? 8467,
+    // Dedicated localhost listener for public tunnel traffic (Tailscale Funnel,
+    // zrok, any wss:// proxy). Ignores Tailscale-User-Login headers completely
+    // and requires an access token (guest bhg_ or admin bha_).
+    guestPort,
     publicGuestUrl: raw.publicGuestUrl ?? "wss://omarchy.tail65c5a9.ts.net/_buzz-host",
     maxGuestDesktops: Number.isInteger(raw.maxGuestDesktops) && raw.maxGuestDesktops >= 0 ? raw.maxGuestDesktops : 1,
     guestDesktopIdleMs:
@@ -200,7 +217,7 @@ async function loadConfig() {
       Number.isInteger(raw.guestMaxUnauthenticated) && raw.guestMaxUnauthenticated >= 0
         ? raw.guestMaxUnauthenticated
         : MAX_UNAUTHENTICATED_GUEST_SOCKETS,
-    allowLogins: new Set(raw.allowLogins),
+    allowLogins,
     allowOrigins: new Set(
       raw.allowOrigins ?? [
         "tauri://localhost",
@@ -211,6 +228,10 @@ async function loadConfig() {
     // Communities agents may join; empty means any wss:// URL.
     allowCommunities: new Set(raw.allowCommunities ?? []),
   };
+}
+
+async function loadConfig() {
+  return parseConfig(JSON.parse(await fs.readFile(CONFIG, "utf8")));
 }
 
 // ---------- agent storage ----------
@@ -386,18 +407,8 @@ async function writeBuzzMcp(pubkey) {
   return file;
 }
 
-async function systemctl(...args) {
-  return run("systemctl", ["--user", ...args], { timeout: 60_000 });
-}
-const unit = (pubkey) => `buzz-agent@${pubkey}.service`;
-async function active(pubkey) {
-  try {
-    const { stdout } = await systemctl("is-active", unit(pubkey));
-    return stdout.trim();
-  } catch (error) {
-    return (error.stdout ?? "").trim() || "unknown";
-  }
-}
+// Agent processes: systemd --user units on Linux, launchd LaunchAgents on macOS.
+const active = (pubkey) => services.status(pubkey);
 
 async function buzzCli(pubkey, args) {
   const m = await meta(pubkey);
@@ -688,8 +699,15 @@ async function ownedMeta(pubkey, session) {
 const methods = {
   async auth(config, { token }, session) {
     if (session.role === "admin" && session.authenticated) {
-      return { role: "admin", login: session.login };
+      return {
+        role: "admin",
+        ...(session.login ? { login: session.login } : {}),
+        ...(session.tokenId ? { tokenId: session.tokenId, label: session.label, ownerPubkey: session.ownerPubkey } : {}),
+      };
     }
+    // One identity per socket: a socket already signed in with a guest token
+    // cannot switch tokens (reconnect to use another one).
+    if (session.authenticated) throw new Error("This connection is already authenticated");
     const key = session.remoteAddress || "unknown";
     if (authRateLimiter.isLimited(key)) {
       throw new Error("Too many failed authentication attempts; try again in a minute");
@@ -700,6 +718,20 @@ const methods = {
       throw new Error("Invalid or revoked access token");
     }
     authRateLimiter.clear(key);
+    if (record.role === "admin") {
+      // Admin access token: the owner on a device without Tailscale. Full
+      // access, like the tailnet listener; revoking it closes this socket.
+      session.authenticated = true;
+      session.role = "admin";
+      session.tokenId = record.id;
+      session.label = record.label;
+      session.ownerPubkey = record.ownerPubkey;
+      session.limits = null;
+      session.registerTokenSocket?.(record.id);
+      session.onAuthenticated?.();
+      console.log(`admin token authenticated: ${record.label} (${record.id})`);
+      return { role: "admin", tokenId: record.id, label: record.label, ownerPubkey: record.ownerPubkey };
+    }
     session.authenticated = true;
     session.role = "guest";
     session.tokenId = record.id;
@@ -745,6 +777,11 @@ const methods = {
       version: VERSION,
       host: os.hostname(),
       role: session?.role ?? "admin",
+      // Host OS and what it can do, so clients hide what this host lacks.
+      platform: process.platform,
+      capabilities: { desktop: DESKTOP_SUPPORTED },
+      // Which access token this connection uses (never the secret).
+      ...(session?.tokenId ? { tokenId: session.tokenId } : {}),
       ...(isGuest
         ? {
             label: session.label,
@@ -858,8 +895,8 @@ const methods = {
     await publishProfile(pubkey, next.name, next.picture);
     next.activated = true;
     await saveMeta(pubkey, next);
-    await systemctl("enable", "--now", unit(pubkey));
-    await systemctl("restart", unit(pubkey));
+    await services.enableAndStart(pubkey);
+    await services.restart(pubkey);
     return { status: await active(pubkey) };
   },
 
@@ -894,7 +931,7 @@ const methods = {
     await saveMeta(pubkey, next);
     if (m.activated) {
       await writeRuntimeEnv(pubkey, next);
-      await systemctl("restart", unit(pubkey));
+      await services.restart(pubkey);
     }
     return {};
   },
@@ -929,7 +966,7 @@ const methods = {
     await saveMeta(pubkey, next);
     if (m.activated) {
       await writeRuntimeEnv(pubkey, next);
-      await systemctl("restart", unit(pubkey));
+      await services.restart(pubkey);
     }
     return { status: await active(pubkey) };
   },
@@ -958,7 +995,7 @@ const methods = {
     const result = await attention.setEnabled(pubkey, enabled === true);
     if (m.activated) {
       await writeRuntimeEnv(pubkey, m);
-      await systemctl("restart", unit(pubkey));
+      await services.restart(pubkey);
     }
     return result;
   },
@@ -973,19 +1010,13 @@ const methods = {
   async restart(config, { pubkey }, session) {
     const m = await ownedMeta(pubkey, session);
     if (!m.activated) throw new Error("Agent is not activated yet");
-    await systemctl("restart", unit(pubkey));
+    await services.restart(pubkey);
     return { status: await active(pubkey) };
   },
 
   async logs(config, { pubkey, lines = 80 }, session) {
     await ownedMeta(pubkey, session);
-    const n = Math.min(Math.max(Number(lines) || 80, 1), 500);
-    const { stdout } = await run(
-      "journalctl",
-      ["--user", "-u", unit(pubkey), "-n", String(n), "--no-pager", "-o", "short-iso"],
-      { timeout: 30_000, maxBuffer: 4 << 20 },
-    ).catch((error) => ({ stdout: error.stdout ?? "" }));
-    return { text: stdout };
+    return { text: await services.logs(pubkey, lines) };
   },
 
   // Model ids the runtime offers, from the cached ACP catalog probe.
@@ -1106,24 +1137,27 @@ const methods = {
   // the agent's sessions); the desktop itself starts on first use.
   async "desktop.status"(config, { pubkey }, session) {
     const m = await ownedMeta(pubkey, session);
+    if (!DESKTOP_SUPPORTED) return { enabled: false, supported: false, running: false };
     return { enabled: m.desktop === true, ...desktopView(pubkey) };
   },
   async "desktop.set"(config, { pubkey, enabled }, session) {
     const m = await ownedMeta(pubkey, session);
+    if (enabled === true) assertDesktopSupported();
     const next = { ...m, desktop: enabled === true };
     if (next.desktop) assertSandboxRestrictions(next);
     await saveMeta(pubkey, next);
     if (!next.desktop) {
       desktopLastActivity.delete(pubkey);
-      await desktop.stop(pubkey);
+      if (DESKTOP_SUPPORTED) await desktop.stop(pubkey);
     }
     if (m.activated && next.desktop !== (m.desktop === true)) {
       await writeRuntimeEnv(pubkey, next);
-      await systemctl("restart", unit(pubkey));
+      await services.restart(pubkey);
     }
     return { enabled: next.desktop, ...desktopView(pubkey) };
   },
   async "desktop.start"(config, { pubkey }, session) {
+    assertDesktopSupported();
     const m = await ownedMeta(pubkey, session);
     if (m.desktop !== true) throw new Error("This agent has no desktop; turn it on first");
     await assertGuestDesktopCapacity(config, pubkey, m);
@@ -1132,6 +1166,7 @@ const methods = {
     return { enabled: true, ...desktopView(pubkey) };
   },
   async "desktop.stop"(config, { pubkey }, session) {
+    assertDesktopSupported();
     await ownedMeta(pubkey, session);
     desktopLastActivity.delete(pubkey);
     await desktop.stop(pubkey);
@@ -1145,6 +1180,7 @@ const methods = {
   async "desktop.snapshot"(config, { pubkey, width, since, etag, channelId, threadRootId }, session) {
     if (channelId != null) checkPlace(channelId, threadRootId);
     const m = await ownedMeta(pubkey, session);
+    if (!DESKTOP_SUPPORTED) return { enabled: false, supported: false };
     if (m.desktop !== true) return { enabled: false };
     const st = desktop.status(pubkey);
     const place = channelId ? { channelId, threadRootId: threadRootId || undefined } : undefined;
@@ -1160,6 +1196,7 @@ const methods = {
   // A ticket for one /desktop connection, and the viewer id that connection
   // takes over with. Starts the desktop if it is not running.
   async "desktop.view"(config, { pubkey }, session) {
+    assertDesktopSupported();
     const m = await ownedMeta(pubkey, session);
     if (m.desktop !== true) throw new Error("This agent has no desktop; turn it on first");
     await assertGuestDesktopCapacity(config, pubkey, m);
@@ -1181,6 +1218,7 @@ const methods = {
   // take: true = Take over (this viewer drives; the agent is refused),
   // false = Hand back. Only the viewer that holds it can hand it back.
   async "desktop.lease"(config, { pubkey, viewer, take, reason }, session) {
+    assertDesktopSupported();
     await ownedMeta(pubkey, session);
     if (typeof viewer !== "string" || viewer.length < 16) throw new Error("viewer is required");
     touchDesktop(pubkey);
@@ -1206,7 +1244,7 @@ const methods = {
     await saveMeta(pubkey, next);
     if (m.activated && next.orchestrate !== (m.orchestrate === true)) {
       await writeRuntimeEnv(pubkey, next);
-      await systemctl("restart", unit(pubkey));
+      await services.restart(pubkey);
     }
     return { enabled: next.orchestrate };
   },
@@ -1257,35 +1295,21 @@ const methods = {
   async "tokens.list"() {
     const [tokens, metas] = await Promise.all([tokenStore.list(), listAllMetas()]);
     return {
-      tokens: tokens.map((t) => ({
-        ...t,
-        agentCount: metas.filter(
-          (m) => (t.ownerPubkey && m.owner === t.ownerPubkey) || (!m.activated && m.createdByTokenId === t.id),
-        ).length,
-      })),
+      tokens: tokens.map((t) =>
+        t.role === "admin"
+          ? t
+          : {
+              ...t,
+              agentCount: metas.filter(
+                (m) => (t.ownerPubkey && m.owner === t.ownerPubkey) || (!m.activated && m.createdByTokenId === t.id),
+              ).length,
+            },
+      ),
     };
   },
   async "tokens.revoke"(_config, { id }) {
     const record = await tokenStore.revoke(id);
-    const sockets = guestSockets.get(record.id);
-    if (sockets) {
-      for (const sock of sockets) {
-        try {
-          sock.end(frame(8, Buffer.alloc(0)));
-        } catch {}
-      }
-      guestSockets.delete(record.id);
-    }
-    for (const [t, v] of viewTickets) {
-      if (v.tokenId === record.id) viewTickets.delete(t);
-    }
-    const metas = await listAllMetas();
-    for (const m of metas) {
-      if (m.createdByTokenId === record.id || (record.ownerPubkey && m.owner === record.ownerPubkey)) {
-        desktopLastActivity.delete(m.pubkey);
-        await desktop.stop(m.pubkey).catch(() => {});
-      }
-    }
+    await dropTokenAccess(record);
     return { record };
   },
 
@@ -1294,10 +1318,10 @@ const methods = {
     const existing = await meta(pubkey).catch(() => undefined);
     if (!existing) return {};
     assertAgentAccess(session, existing);
-    await systemctl("disable", "--now", unit(pubkey)).catch(() => {});
+    await services.disableAndStop(pubkey).catch(() => {});
     await runnerManager.cleanupAgent(pubkey).catch(() => {});
     await orchestrator.forget(pubkey).catch(() => {});
-    await desktop.stop(pubkey).catch(() => {});
+    if (DESKTOP_SUPPORTED) await desktop.stop(pubkey).catch(() => {});
     await fs.rm(dir(pubkey), { recursive: true, force: true });
     watcher.sync(pubkey, null);
     attention.forget(pubkey);
@@ -1378,10 +1402,66 @@ function serveSocket(socket, onText) {
 // ---------- server ----------
 
 const config = await loadConfig();
+// macOS: the short /tmp base is shared space, so create it 0700 and refuse one
+// another user planted. (Linux's /run/user/<uid> is already private.)
+if (process.platform === "darwin") {
+  await ensurePrivateDir(runtimeBase());
+  await fs.mkdir(RUN_DIR, { recursive: true, mode: 0o700 });
+}
 const tokenStore = createTokenStore({ filePath: path.join(HOME, ".local/share/buzz-host/tokens.json") });
 const authRateLimiter = createAuthRateLimiter({ maxFailures: 10, windowMs: 60_000 });
-/** tokenId -> Set<Socket> for immediate disconnect on revoke. */
+/** tokenId -> Set<Socket> (guest and admin token sockets) for immediate disconnect on revoke. */
 const guestSockets = new Map();
+
+/** Tokens revoked while this server runs: their sessions refuse every further call. */
+const revokedTokenIds = new Set();
+
+/** Close a revoked token's sockets, drop its desktop tickets, and stop a guest's desktops. */
+async function dropTokenAccess(record) {
+  revokedTokenIds.add(record.id);
+  const sockets = guestSockets.get(record.id);
+  if (sockets) {
+    for (const sock of sockets) {
+      try {
+        sock.end(frame(8, Buffer.alloc(0)));
+      } catch {}
+      // end() only half-closes: a client that ignores the close frame could
+      // keep sending. Cut the socket once the close frame has had a moment.
+      setTimeout(() => sock.destroy(), 1_000).unref();
+    }
+    guestSockets.delete(record.id);
+  }
+  for (const [t, v] of viewTickets) {
+    if (v.tokenId === record.id) viewTickets.delete(t);
+  }
+  // A revoked guest's desktops stop. An admin token's owner keeps theirs:
+  // their agents belong to them, not to the token they used to connect.
+  if (record.role !== "admin" && DESKTOP_SUPPORTED) {
+    const metas = await listAllMetas();
+    for (const m of metas) {
+      if (m.createdByTokenId === record.id || (record.ownerPubkey && m.owner === record.ownerPubkey)) {
+        desktopLastActivity.delete(m.pubkey);
+        await desktop.stop(m.pubkey).catch(() => {});
+      }
+    }
+  }
+}
+
+// `buzz-host-tokens revoke` only edits tokens.json: catch those revocations
+// (and deleted records) for sockets that are still connected.
+const REVOKE_SWEEP_MS = 15_000;
+const revokeSweepTimer = setInterval(() => {
+  void (async () => {
+    for (const tokenId of [...guestSockets.keys()]) {
+      const record = await tokenStore.getById(tokenId);
+      if (record && !record.revokedAt) continue;
+      console.log(`token ${tokenId} revoked or removed: closing its connections`);
+      // A record deleted by hand: stop what that token created, nothing more.
+      await dropTokenAccess(record ?? { id: tokenId, role: "guest", ownerPubkey: null });
+    }
+  })().catch((error) => console.error(`token revoke sweep failed: ${error.message}`));
+}, REVOKE_SWEEP_MS);
+revokeSweepTimer.unref();
 const memory = createMemory({ dataDir: DATA });
 const orchestrator = createOrchestrator({
   dataDir: DATA,
@@ -1475,7 +1555,7 @@ for (const m of allAgentMetas) {
   if (env.includes(path.join(dir(name), "mcp", "buzz"))) continue;
   try {
     await writeRuntimeEnv(name, m);
-    if ((await active(name)) === "active") await systemctl("restart", unit(name));
+    if ((await active(name)) === "active") await services.restart(name);
     console.log(`agent ${name.slice(0, 8)}: now has the buzz MCP server (memory)`);
   } catch (error) {
     console.error(`agent ${name.slice(0, 8)}: buzz MCP server not set up: ${error.message}`);
@@ -1515,6 +1595,10 @@ function attachRpcSocket(socket, session) {
       const methodName = message.method;
       const method = methods[methodName];
       if (!method) throw new Error(`Unknown method ${methodName}`);
+      if (session.tokenId && revokedTokenIds.has(session.tokenId)) {
+        socket.destroy();
+        throw new Error("Access token has been revoked");
+      }
       if (methodName !== "auth") assertMethodAllowed(session, methodName);
       const params = message.params ?? {};
       const result = UNSERIALIZED.has(methodName)
@@ -1530,12 +1614,18 @@ function attachRpcSocket(socket, session) {
   });
 }
 
-const server = createServer((req, res) => {
-  res.writeHead(req.url === "/health" ? 200 : 404, { "content-type": "text/plain" });
-  res.end(req.url === "/health" ? "ok\n" : "not found\n");
-});
+// Tailnet listener: trusts Tailscale-User-Login from `tailscale serve`. Off
+// when allowLogins is empty (token-only hosts): nothing then listens on `port`,
+// so no local process can forge that header to get in.
+const server =
+  config.allowLogins.size > 0
+    ? createServer((req, res) => {
+        res.writeHead(req.url === "/health" ? 200 : 404, { "content-type": "text/plain" });
+        res.end(req.url === "/health" ? "ok\n" : "not found\n");
+      })
+    : null;
 
-server.on("upgrade", (req, socket) => {
+server?.on("upgrade", (req, socket) => {
   const login = req.headers["tailscale-user-login"];
   const origin = req.headers.origin;
   const refuse = (code, why) => {
@@ -1584,13 +1674,18 @@ server.on("upgrade", (req, socket) => {
   });
 });
 
-server.listen(config.port, "127.0.0.1", () =>
-  console.log(`buzz-host admin listening on 127.0.0.1:${config.port}`),
-);
+if (server) {
+  server.listen(config.port, "127.0.0.1", () =>
+    console.log(`buzz-host admin listening on 127.0.0.1:${config.port}`),
+  );
+} else {
+  console.log("buzz-host: allowLogins is empty; tailnet listener off, access tokens only");
+}
 
-// Dedicated guest-only listener (for Tailscale Funnel /_buzz-host).
-// NEVER trusts Tailscale-User-Login headers. Serves /desktop only for valid,
-// single-use guest tickets minted by an authenticated trusted token.
+// Token listener (Tailscale Funnel /_buzz-host, zrok, any wss:// proxy).
+// NEVER trusts Tailscale-User-Login headers: every socket authenticates with a
+// guest (bhg_) or admin (bha_) access token. Serves /desktop only for valid,
+// single-use tickets minted by an admin token or a trusted guest token.
 let guestServer = null;
 if (Number.isInteger(config.guestPort) && config.guestPort > 0) {
   const guestSocketRegistry = createGuestSocketRegistry({
@@ -1640,8 +1735,10 @@ if (Number.isInteger(config.guestPort) && config.guestPort > 0) {
         const view = viewTickets.get(ticket);
         viewTickets.delete(ticket);
         if (!isValidDesktopTicket(view, "guest")) return refuse("403 Forbidden", "desktop ticket");
+        // The ticket's token must still be live and of the ticket's role:
+        // admin tokens always may view; guest tokens only when trusted.
         const tokenRecord = await tokenStore.getById(view.tokenId);
-        if (!tokenRecord || tokenRecord.revokedAt || !tokenRecord.allowHostDesktop) {
+        if (!desktopTicketTokenAllowed(view, tokenRecord)) {
           return refuse("403 Forbidden", "desktop not permitted");
         }
         const st = desktop.status(view.pubkey);
@@ -1655,7 +1752,9 @@ if (Number.isInteger(config.guestPort) && config.guestPort > 0) {
         }
         set.add(socket);
         trackViewer(view.pubkey, socket);
-        console.log(`guest desktop view: ${tokenRecord.label} (${view.tokenId}) agent=${view.pubkey.slice(0, 8)}`);
+        console.log(
+          `${view.role === "admin" ? "admin token" : "guest"} desktop view: ${tokenRecord.label} (${view.tokenId}) agent=${view.pubkey.slice(0, 8)}`,
+        );
         const leaseDir = desktop.desktopDir(view.pubkey);
         rfbBridge(socket, { rfbSocket: st.rfbSocket, leaseDir, viewerId: view.viewer });
         socket.on("close", () => {
@@ -1740,7 +1839,8 @@ async function shutdown(signal) {
   closing = true;
   console.log(`buzz-host shutting down (${signal})`);
   if (idleSweepTimer) clearInterval(idleSweepTimer);
-  server.close();
+  clearInterval(revokeSweepTimer);
+  server?.close();
   guestServer?.close();
   await mcpServer.stop().catch(() => {});
   await runnerManager.close().catch(() => {});

@@ -26,6 +26,8 @@ Buzz (laptop) ── plugins (Remote Agents, Viewport, Hive Watch) ── wss://
 | `server/shims/*` | `~/.local/lib/buzz-host/shims/` | Adapter wrappers named like the adapters, so buzz-acp applies its per-runtime defaults |
 | `server/agent-bin/buzz` | `~/.local/lib/buzz-host/agent-bin/` | `buzz` CLI wrapper first on agents' PATH: loads the agent's own key from `BUZZ_HOST_AGENT` (Hermes strips secret env vars from its terminal) |
 | `server/*.service` | `~/.config/systemd/user/` | `buzz-host.service`, `buzz-agent@.service` |
+| `server/service-manager.mjs` | `~/.local/lib/buzz-host/` | Runs each agent: `systemd --user` units on Linux, launchd LaunchAgents (`~/Library/LaunchAgents/com.buzz-host.agent.<pubkey>.plist`, logs in `~/Library/Logs/buzz-host/`) on macOS |
+| `server/com.buzz-host.server.plist` | `~/Library/LaunchAgents/` (macOS) | buzz-host itself on macOS, filled in by `deploy.sh --local` |
 | `server/desktop/` | `~/.local/lib/buzz-host/desktop/` | Agent desktops (see below): `desktop.mjs` (Xvnc + Xfce + cua-driver per agent), `lease.mjs` (take over / hand back), `computer.mjs` (the agent's computer tools), `rfb-bridge.mjs` + `rfb-filter.mjs` (the `/desktop` live view), `launcher.sh` (Hermes Bot Desktop's) |
 | `plugin/` | installed in Buzz | **Remote Agents** plugin (ID `local.buzz-host`): source modules under `plugin/src/` bundled into `plugin/plugin.js` by `node plugin/build.mjs`. Registers the **Self-hosted** agent type (ID `omarchy`, tabs: Activity, Settings), composer runtime/model/effort picker & session controls, Orchestrator settings, and Settings → Plugins → Remote Agents |
 | `plugins/viewport/` | installed in Buzz | **Viewport** plugin (ID `local.buzz-host.viewport`): adds dedicated **Desktop** tab on self-hosted agents, in-chat desktop preview accessory, and full-screen noVNC viewer |
@@ -43,6 +45,17 @@ block/buzz desktop amd64 deb; adapters are npm packages in `~/.local/lib/buzz-ho
 - Listens on 127.0.0.1 only; reachable through `tailscale serve --https=8447`.
 - Requests must carry a `Tailscale-User-Login` listed in `allowLogins` (tailscale
   serve sets it; tagged devices have none) and, if sent, an allowed Origin.
+- A second listener (`guestPort`, default 8467) never trusts that header: every
+  socket sends an access token in its first `auth` call (never in the URL).
+  Guest tokens (`bhg_…`) are scoped, sandboxed friend accounts. Admin tokens
+  (`bha_…`) give the owner full access from devices that are not on the
+  tailnet, behind server-only Tailscale Funnel, zrok or any `wss://` proxy:
+  `buzz-host-tokens create-admin --label "My laptop" [--url wss://…]` prints the
+  token and a 1-paste `wss://…#token=bha_…` pairing URL once. Tokens are stored
+  only as SHA-256 hashes; `buzz-host-tokens list` shows each one's role, and
+  `buzz-host-tokens revoke <tok_…>` cuts its connections within about 15 seconds.
+- `allowLogins` is optional. Leave it out (or empty) on a token-only host: the
+  `Tailscale-User-Login` listener does not start at all.
 - Agents only answer their owner by default (`BUZZ_ACP_RESPOND_TO=owner-only`).
 
 ## Patched buzz-acp (no fork repo)
@@ -117,7 +130,18 @@ After changing the plugin: `systemctl --user reload hermes-gateway` while it is 
 
 - Deploy changes: `./deploy.sh`
 - Call the API: `node tools/call.mjs list` / `logs '{"pubkey":"…"}'`
-- Agent logs on the server: `journalctl --user -u buzz-agent@<pubkey>`
+- Agent logs on the server: `journalctl --user -u buzz-agent@<pubkey>` (macOS:
+  `~/Library/Logs/buzz-host/agent-<pubkey>.log`, server in `server.log` there)
+- macOS hosts: `./deploy.sh --local` installs the `com.buzz-host.server`
+  LaunchAgent instead of systemd units. Sockets live under `/tmp/bh-<uid>`
+  (exported as `XDG_RUNTIME_DIR`) to stay under macOS's 104-byte socket path
+  limit. Agent desktops are Linux-only; `hello` reports `platform` and
+  `capabilities.desktop` so clients can hide them.
+  LaunchAgents live in the logged-in user's `gui/<uid>` domain, so the Mac
+  needs that user logged in (automatic login on a headless Mac); logging out
+  stops buzz-host and its agents. launchd respawns an agent after any non-zero
+  exit (including agent-run's exit 78 for a not-yet-activated agent, every
+  10 s) and leaves a clean exit down. Agent logs are not rotated.
 
 ## Attention
 

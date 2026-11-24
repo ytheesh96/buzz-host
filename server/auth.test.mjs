@@ -14,9 +14,13 @@ import {
   canAccessAgent,
   createAuthRateLimiter,
   createTokenStore,
+  desktopTicketTokenAllowed,
   enforceGuestSettings,
   findIdleGuestDesktops,
+  hashToken,
   isValidDesktopTicket,
+  parseListenerConfig,
+  tokenRole,
 } from "./auth.mjs";
 
 const OWNER_A = "a".repeat(64);
@@ -383,4 +387,186 @@ test("desktop ticket validation isolates admin and guest listeners, and idle swe
     idleMs: 15 * 60_000,
   });
   assert.deepEqual(idle, ["4".repeat(64)]);
+});
+
+test("admin tokens: bha_ secret, hashed at rest, verify as admin, no guest caps, revoke blocks", async (t) => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "buzz-auth-admin-"));
+  t.after(() => fs.rm(tmp, { recursive: true, force: true }));
+  const filePath = path.join(tmp, "tokens.json");
+  const store = createTokenStore({ filePath });
+
+  const { token, record } = await store.createAdmin({ label: "My laptop", ownerPubkey: OWNER_A.toUpperCase() });
+  assert.match(token, /^bha_[0-9a-f]{48}$/);
+  assert.equal(record.role, "admin");
+  assert.equal(record.ownerPubkey, OWNER_A);
+  for (const key of ["maxAgents", "maxConcurrency", "allowedRuntimes", "allowHostDesktop"]) {
+    assert.ok(!(key in record), `admin view has no ${key}`);
+  }
+
+  // Hashed at rest, mode 0600, never the plaintext.
+  const raw = await fs.readFile(filePath, "utf8");
+  assert.ok(!raw.includes(token));
+  assert.ok(raw.includes(hashToken(token)));
+  assert.equal((await fs.stat(filePath)).mode & 0o777, 0o600);
+
+  const verified = await store.verify(token);
+  assert.equal(verified.role, "admin");
+  assert.equal(verified.id, record.id);
+  assert.ok(verified.lastUsedAt === null || typeof verified.lastUsedAt === "string");
+  assert.equal(await store.verify(`bha_${"0".repeat(48)}`), null);
+  assert.equal((await store.getById(record.id)).role, "admin");
+
+  // Admin tokens never bind like guest tokens do.
+  await assert.rejects(() => store.bindOwner(record.id, OWNER_B), /Only guest tokens/);
+
+  // Listing shows each token's role.
+  await store.create({ label: "Guest" });
+  const roles = (await store.list()).map((t) => t.role).sort();
+  assert.deepEqual(roles, ["admin", "guest"]);
+
+  const revoked = await store.revoke(record.id);
+  assert.equal(revoked.role, "admin");
+  assert.ok(revoked.revokedAt);
+  assert.equal(await store.verify(token), null);
+  assert.equal((await store.getById(record.id)).revokedAt, revoked.revokedAt);
+
+  await assert.rejects(() => store.createAdmin({ label: "" }), /label/);
+  await assert.rejects(() => store.createAdmin({ label: "x", ownerPubkey: "short" }), /ownerPubkey/);
+});
+
+test("guest tokens can never escalate to admin", async (t) => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "buzz-auth-escalate-"));
+  t.after(() => fs.rm(tmp, { recursive: true, force: true }));
+  const filePath = path.join(tmp, "tokens.json");
+  const store = createTokenStore({ filePath });
+
+  const guest = await store.create({ label: "Friend", allowHostDesktop: true });
+  const guestView = await store.verify(guest.token);
+  assert.equal(guestView.role, "guest");
+  // create() takes no role: passing one is ignored.
+  const sneaky = await store.create({ label: "Sneaky", role: "admin" });
+  assert.equal(sneaky.record.role, "guest");
+  assert.match(sneaky.token, /^bhg_/);
+
+  // A guest secret relabelled as bha_ hashes differently: no match.
+  assert.equal(await store.verify(guest.token.replace(/^bhg_/, "bha_")), null);
+
+  // Even a tampered record (role flipped to admin) refuses the bhg_ secret,
+  // because the secret's prefix must match the stored role.
+  const disk = JSON.parse(await fs.readFile(filePath, "utf8"));
+  disk.tokens.find((r) => r.id === guest.record.id).role = "admin";
+  await fs.writeFile(filePath, JSON.stringify(disk));
+  assert.equal(await store.verify(guest.token), null);
+
+  // Records from before admin tokens (no role) are guests.
+  assert.equal(tokenRole({}), "guest");
+  assert.equal(tokenRole({ role: "weird" }), "guest");
+  assert.equal(tokenRole({ role: "admin" }), "admin");
+
+  // Guest sessions keep every guest restriction whatever the token's flags.
+  const session = { authenticated: true, role: "guest", tokenId: guest.record.id, limits: guestView };
+  for (const m of ["tokens.create", "tokens.list", "tokens.revoke", "orchestrator.set", "hermes.profiles"]) {
+    assert.throws(() => assertMethodAllowed(session, m), /not permitted for guest/);
+  }
+  assert.equal(canAccessAgent(session, { owner: OWNER_B, activated: true }), false);
+  // An admin-token session gets full access.
+  const admin = { authenticated: true, role: "admin", tokenId: "tok_aaaaaaaaaaaa", limits: null };
+  assert.doesNotThrow(() => assertMethodAllowed(admin, "tokens.create"));
+  assert.doesNotThrow(() => assertMethodAllowed(admin, "desktop.view"));
+  assert.equal(canAccessAgent(admin, { owner: OWNER_B, activated: true }), true);
+  const settings = { runtime: "codex", runner: "host", concurrency: 16, profile: "work" };
+  assert.deepEqual(enforceGuestSettings(admin, settings), settings);
+});
+
+test("admin desktop tickets on the token listener need a live admin token", () => {
+  const now = 1_000_000;
+  const adminTokenTicket = { pubkey: OWNER_A, viewer: "v", expires: now + 30_000, role: "admin", tokenId: "tok_aaaaaaaaaaaa" };
+  const tailnetTicket = { ...adminTokenTicket, tokenId: null };
+  const guestTicket = { ...adminTokenTicket, role: "guest", tokenId: "tok_bbbbbbbbbbbb" };
+
+  // Token listener: token-minted tickets only (a tailnet ticket has no token).
+  assert.equal(isValidDesktopTicket(adminTokenTicket, "guest", now), true);
+  assert.equal(isValidDesktopTicket(tailnetTicket, "guest", now), false);
+  // …and the tailnet listener refuses token-minted tickets (re-checked on the token listener only).
+  assert.equal(isValidDesktopTicket(adminTokenTicket, "admin", now), false);
+  assert.equal(isValidDesktopTicket(tailnetTicket, "admin", now), true);
+  assert.equal(isValidDesktopTicket({ ...adminTokenTicket, expires: now - 1 }, "guest", now), false);
+  assert.equal(isValidDesktopTicket({ ...adminTokenTicket, role: "root" }, "guest", now), false);
+
+  const adminRecord = { id: "tok_aaaaaaaaaaaa", role: "admin", revokedAt: null };
+  const guestRecord = { id: "tok_bbbbbbbbbbbb", role: "guest", allowHostDesktop: false, revokedAt: null };
+  // Admin token: allowed without allowHostDesktop; not once revoked.
+  assert.equal(desktopTicketTokenAllowed(adminTokenTicket, adminRecord), true);
+  assert.equal(desktopTicketTokenAllowed(adminTokenTicket, { ...adminRecord, revokedAt: "2026-01-01" }), false);
+  assert.equal(desktopTicketTokenAllowed(adminTokenTicket, null), false);
+  // Role must match the token: an "admin" ticket backed by a guest token is refused.
+  assert.equal(
+    desktopTicketTokenAllowed({ ...adminTokenTicket, tokenId: guestRecord.id }, { ...guestRecord, allowHostDesktop: true }),
+    false,
+  );
+  // Ticket and record must be the same token.
+  assert.equal(desktopTicketTokenAllowed(adminTokenTicket, { ...adminRecord, id: "tok_cccccccccccc" }), false);
+  // Guest tickets stay strict: trusted guest tokens only.
+  assert.equal(desktopTicketTokenAllowed(guestTicket, guestRecord), false);
+  assert.equal(desktopTicketTokenAllowed(guestTicket, { ...guestRecord, allowHostDesktop: true }), true);
+  assert.equal(desktopTicketTokenAllowed(guestTicket, { ...guestRecord, allowHostDesktop: true, revokedAt: "x" }), false);
+  // Legacy guest record without a role.
+  assert.equal(desktopTicketTokenAllowed(guestTicket, { id: guestRecord.id, allowHostDesktop: true }), true);
+});
+
+test("allowLogins is optional for token-only hosts and unchanged when populated", () => {
+  const populated = parseListenerConfig({ allowLogins: ["me@example.com", "you@example.com"] });
+  assert.deepEqual([...populated.allowLogins], ["me@example.com", "you@example.com"]);
+  assert.equal(populated.guestPort, 8467);
+
+  for (const raw of [{}, { allowLogins: [] }, { allowLogins: null }]) {
+    const cfg = parseListenerConfig(raw);
+    assert.equal(cfg.allowLogins.size, 0);
+    assert.equal(cfg.guestPort, 8467);
+  }
+  assert.equal(parseListenerConfig({ guestPort: 9000 }).guestPort, 9000);
+  // Populated allowLogins may still turn the token listener off.
+  assert.equal(parseListenerConfig({ allowLogins: ["me@example.com"], guestPort: 0 }).guestPort, 0);
+
+  assert.throws(() => parseListenerConfig({ allowLogins: "me@example.com" }, "cfg.json"), /cfg\.json: allowLogins must list/);
+  // No tailnet logins AND no token listener: nothing could ever connect.
+  assert.throws(() => parseListenerConfig({ allowLogins: [], guestPort: 0 }), /guestPort must be set/);
+  assert.throws(() => parseListenerConfig({ guestPort: "8467" }), /guestPort must be set/);
+});
+
+test("buzz-host-tokens CLI creates admin tokens and lists roles", async (t) => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "buzz-tokens-admin-cli-"));
+  t.after(() => fs.rm(tmp, { recursive: true, force: true }));
+  const file = path.join(tmp, "tokens.json");
+  const cli = path.join(path.dirname(fileURLToPath(import.meta.url)), "buzz-host-tokens");
+  const runCli = (...args) =>
+    execFileSync(process.execPath, [cli, ...args, "--file", file], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+
+  const admin = JSON.parse(
+    runCli("create-admin", "--label", "Laptop", "--owner", OWNER_A, "--url", "wss://tunnel.example/_buzz-host", "--json"),
+  );
+  assert.match(admin.token, /^bha_[0-9a-f]{48}$/);
+  assert.equal(admin.record.role, "admin");
+  assert.equal(admin.record.ownerPubkey, OWNER_A);
+  assert.equal(admin.pairingUrl, `wss://tunnel.example/_buzz-host#token=${admin.token}`);
+
+  const viaRole = JSON.parse(runCli("create", "--role", "admin", "--label", "Desktop", "--url", "wss://x.example", "--json"));
+  assert.match(viaRole.token, /^bha_/);
+  const guest = JSON.parse(runCli("create", "--label", "Friend", "--url", "wss://x.example", "--json"));
+  assert.match(guest.token, /^bhg_/);
+
+  // Guest caps make no sense on an admin token; bad roles are refused.
+  assert.throws(() => runCli("create-admin", "--label", "X", "--max-agents", "3"), /no guest caps/);
+  assert.throws(() => runCli("create", "--role", "root", "--label", "X"), /--role must be/);
+
+  const listed = JSON.parse(runCli("list", "--json")).tokens;
+  assert.deepEqual(listed.map((t) => t.role), ["admin", "admin", "guest"]);
+  const text = runCli("list");
+  assert.match(text, new RegExp(`${admin.record.id}  admin  Laptop  \\[active\\].*full access`));
+  assert.match(text, new RegExp(`${guest.record.id}  guest  Friend  \\[active\\].*caps=2a/2c`));
+
+  const revoked = JSON.parse(runCli("revoke", admin.record.id, "--json")).record;
+  assert.equal(revoked.role, "admin");
+  assert.ok(revoked.revokedAt);
+  assert.match(runCli("list"), /admin  Laptop  \[REVOKED/);
 });

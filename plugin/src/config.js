@@ -2,6 +2,11 @@
 
 export const URL_KEY = "local.buzz-host.url";
 export const TOKEN_KEY = "local.buzz-host.token";
+export const MACHINES_KEY = "local.buzz-host.machines.v1";
+export const AGENT_HOSTS_KEY = "local.buzz-host.agent-hosts.v1";
+export const ACTIVE_MACHINE_KEY = "local.buzz-host.active-machine.v1";
+export const MACHINES_CHANGED_EVENT = "buzz-host:machines-changed";
+export const AGENT_HOSTS_CHANGED_EVENT = "buzz-host:agent-hosts-changed";
 export const DEFAULT_URL = "wss://omarchy.tail65c5a9.ts.net:8447";
 export const RUNTIMES = [
   { id: "claude", title: "Claude Code" },
@@ -171,4 +176,149 @@ export function setStoredToken(token) {
     if (clean) localStorage.setItem(TOKEN_KEY, clean);
     else localStorage.removeItem(TOKEN_KEY);
   } catch {}
+}
+
+/** First wss:// route URL on a machine record, falling back to `machine.url`. */
+export function machineWssUrl(machine) {
+  if (!machine || typeof machine !== "object") return "";
+  if (Array.isArray(machine.routes)) {
+    for (const route of machine.routes) {
+      if (route?.type === "wss" && typeof route.url === "string" && route.url.trim()) {
+        return route.url.trim();
+      }
+    }
+  }
+  return typeof machine.url === "string" ? machine.url.trim() : "";
+}
+
+function normalizeStoredMachine(entry) {
+  if (!entry || typeof entry !== "object") return null;
+  const id = typeof entry.id === "string" ? entry.id.trim() : "";
+  const url = machineWssUrl(entry);
+  if (!id || (!url && !(Array.isArray(entry.routes) && entry.routes.length))) return null;
+  return {
+    id,
+    name: typeof entry.name === "string" && entry.name.trim() ? entry.name.trim() : id,
+    url,
+    token: typeof entry.token === "string" ? entry.token.trim() : "",
+    routes: Array.isArray(entry.routes) ? entry.routes : url ? [{ type: "wss", url }] : [],
+    platform: typeof entry.platform === "string" ? entry.platform : undefined,
+    host: typeof entry.host === "string" ? entry.host : undefined,
+    role: entry.role === "admin" || entry.role === "guest" ? entry.role : undefined,
+    capabilities: entry.capabilities && typeof entry.capabilities === "object" ? entry.capabilities : undefined,
+  };
+}
+
+/** Read configured machines from Buzz's multi-machine registry, falling back to legacy single-URL storage. */
+export function storedMachines() {
+  try {
+    const raw = localStorage.getItem(MACHINES_KEY);
+    if (raw !== null) {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        const list = [];
+        const seen = new Set();
+        for (const item of parsed) {
+          const norm = normalizeStoredMachine(item);
+          if (!norm || seen.has(norm.id)) continue;
+          seen.add(norm.id);
+          list.push(norm);
+        }
+        if (list.length) return list;
+      }
+    }
+  } catch {}
+  const url = storedUrl();
+  if (!url) return [];
+  return [
+    {
+      id: "default",
+      name: "Remote machine",
+      url,
+      token: storedToken(),
+      routes: [{ type: "wss", url }],
+    },
+  ];
+}
+
+export function machineById(id) {
+  const clean = typeof id === "string" ? id.trim() : "";
+  if (!clean) return undefined;
+  return storedMachines().find((m) => m.id === clean);
+}
+
+export function activeMachine() {
+  const machines = storedMachines();
+  if (!machines.length) return undefined;
+  try {
+    const activeId = localStorage.getItem(ACTIVE_MACHINE_KEY)?.trim();
+    if (activeId) {
+      const hit = machines.find((m) => m.id === activeId);
+      if (hit) return hit;
+    }
+  } catch {}
+  return machines[0];
+}
+
+export function storedAgentHosts() {
+  try {
+    const raw = localStorage.getItem(AGENT_HOSTS_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    const out = {};
+    for (const [k, v] of Object.entries(parsed)) {
+      if (typeof k === "string" && typeof v === "string" && k.trim() && v.trim()) {
+        out[k.trim().toLowerCase()] = v.trim();
+      }
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+export function setStoredAgentHost(pubkey, machineId) {
+  const cleanPubkey = typeof pubkey === "string" ? pubkey.trim().toLowerCase() : "";
+  const cleanId = typeof machineId === "string" ? machineId.trim() : "";
+  if (!cleanPubkey || !cleanId) return;
+  try {
+    const current = storedAgentHosts();
+    if (current[cleanPubkey] === cleanId) return;
+    current[cleanPubkey] = cleanId;
+    localStorage.setItem(AGENT_HOSTS_KEY, JSON.stringify(current));
+    if (typeof window !== "undefined") {
+      window.dispatchEvent(new CustomEvent(AGENT_HOSTS_CHANGED_EVENT));
+    }
+  } catch {}
+}
+
+export function mergeStoredAgentHosts(machineId, pubkeys) {
+  const cleanId = typeof machineId === "string" ? machineId.trim() : "";
+  if (!cleanId) return;
+  try {
+    const current = storedAgentHosts();
+    const owned = new Set(
+      (Array.isArray(pubkeys) ? pubkeys : [])
+        .map((p) => (typeof p === "string" ? p.trim().toLowerCase() : ""))
+        .filter(Boolean),
+    );
+    const next = {};
+    for (const [pubkey, existingId] of Object.entries(current)) {
+      if (existingId === cleanId && !owned.has(pubkey)) continue;
+      next[pubkey] = existingId;
+    }
+    for (const pubkey of owned) next[pubkey] = cleanId;
+    localStorage.setItem(AGENT_HOSTS_KEY, JSON.stringify(next));
+    if (typeof window !== "undefined") {
+      window.dispatchEvent(new CustomEvent(AGENT_HOSTS_CHANGED_EVENT));
+    }
+  } catch {}
+}
+
+export function machineForAgent(pubkey) {
+  const clean = typeof pubkey === "string" ? pubkey.trim().toLowerCase() : "";
+  if (!clean) return undefined;
+  const machineId = storedAgentHosts()[clean];
+  return machineId ? machineById(machineId) : undefined;
 }

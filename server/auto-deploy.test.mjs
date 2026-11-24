@@ -76,6 +76,7 @@ function makeFixture(t) {
     "control.mjs",
     "file-lock.mjs",
     "ws-security.mjs",
+    "service-manager.mjs",
   ];
   for (const f of serverFiles) {
     const p = path.join(work, "server", f);

@@ -3,6 +3,11 @@
 //#region plugin/src/config.js
 const URL_KEY = "local.buzz-host.url";
 const TOKEN_KEY = "local.buzz-host.token";
+const MACHINES_KEY = "local.buzz-host.machines.v1";
+const AGENT_HOSTS_KEY = "local.buzz-host.agent-hosts.v1";
+const ACTIVE_MACHINE_KEY = "local.buzz-host.active-machine.v1";
+const MACHINES_CHANGED_EVENT = "buzz-host:machines-changed";
+const AGENT_HOSTS_CHANGED_EVENT = "buzz-host:agent-hosts-changed";
 const DEFAULT_URL = "wss://omarchy.tail65c5a9.ts.net:8447";
 const DEFAULT_CONCURRENCY = 4;
 const CONCURRENCY_VALUES = [
@@ -39,28 +44,152 @@ function storedToken() {
 		return "";
 	}
 }
+/** First wss:// route URL on a machine record, falling back to `machine.url`. */
+function machineWssUrl(machine) {
+	if (!machine || typeof machine !== "object") return "";
+	if (Array.isArray(machine.routes)) {
+		for (const route of machine.routes) if (route?.type === "wss" && typeof route.url === "string" && route.url.trim()) return route.url.trim();
+	}
+	return typeof machine.url === "string" ? machine.url.trim() : "";
+}
+function normalizeStoredMachine(entry) {
+	if (!entry || typeof entry !== "object") return null;
+	const id = typeof entry.id === "string" ? entry.id.trim() : "";
+	const url = machineWssUrl(entry);
+	if (!id || !url && !(Array.isArray(entry.routes) && entry.routes.length)) return null;
+	return {
+		id,
+		name: typeof entry.name === "string" && entry.name.trim() ? entry.name.trim() : id,
+		url,
+		token: typeof entry.token === "string" ? entry.token.trim() : "",
+		routes: Array.isArray(entry.routes) ? entry.routes : url ? [{
+			type: "wss",
+			url
+		}] : [],
+		platform: typeof entry.platform === "string" ? entry.platform : void 0,
+		host: typeof entry.host === "string" ? entry.host : void 0,
+		role: entry.role === "admin" || entry.role === "guest" ? entry.role : void 0,
+		capabilities: entry.capabilities && typeof entry.capabilities === "object" ? entry.capabilities : void 0
+	};
+}
+/** Read configured machines from Buzz's multi-machine registry, falling back to legacy single-URL storage. */
+function storedMachines() {
+	try {
+		const raw = localStorage.getItem(MACHINES_KEY);
+		if (raw !== null) {
+			const parsed = JSON.parse(raw);
+			if (Array.isArray(parsed)) {
+				const list = [];
+				const seen = /* @__PURE__ */ new Set();
+				for (const item of parsed) {
+					const norm = normalizeStoredMachine(item);
+					if (!norm || seen.has(norm.id)) continue;
+					seen.add(norm.id);
+					list.push(norm);
+				}
+				if (list.length) return list;
+			}
+		}
+	} catch {}
+	const url = storedUrl();
+	if (!url) return [];
+	return [{
+		id: "default",
+		name: "Remote machine",
+		url,
+		token: storedToken(),
+		routes: [{
+			type: "wss",
+			url
+		}]
+	}];
+}
+function machineById(id) {
+	const clean = typeof id === "string" ? id.trim() : "";
+	if (!clean) return void 0;
+	return storedMachines().find((m) => m.id === clean);
+}
+function activeMachine() {
+	const machines = storedMachines();
+	if (!machines.length) return void 0;
+	try {
+		const activeId = localStorage.getItem(ACTIVE_MACHINE_KEY)?.trim();
+		if (activeId) {
+			const hit = machines.find((m) => m.id === activeId);
+			if (hit) return hit;
+		}
+	} catch {}
+	return machines[0];
+}
+function storedAgentHosts() {
+	try {
+		const raw = localStorage.getItem(AGENT_HOSTS_KEY);
+		if (!raw) return {};
+		const parsed = JSON.parse(raw);
+		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+		const out = {};
+		for (const [k, v] of Object.entries(parsed)) if (typeof k === "string" && typeof v === "string" && k.trim() && v.trim()) out[k.trim().toLowerCase()] = v.trim();
+		return out;
+	} catch {
+		return {};
+	}
+}
+function setStoredAgentHost(pubkey, machineId) {
+	const cleanPubkey = typeof pubkey === "string" ? pubkey.trim().toLowerCase() : "";
+	const cleanId = typeof machineId === "string" ? machineId.trim() : "";
+	if (!cleanPubkey || !cleanId) return;
+	try {
+		const current = storedAgentHosts();
+		if (current[cleanPubkey] === cleanId) return;
+		current[cleanPubkey] = cleanId;
+		localStorage.setItem(AGENT_HOSTS_KEY, JSON.stringify(current));
+		if (typeof window !== "undefined") window.dispatchEvent(new CustomEvent(AGENT_HOSTS_CHANGED_EVENT));
+	} catch {}
+}
+function mergeStoredAgentHosts(machineId, pubkeys) {
+	const cleanId = typeof machineId === "string" ? machineId.trim() : "";
+	if (!cleanId) return;
+	try {
+		const current = storedAgentHosts();
+		const owned = new Set((Array.isArray(pubkeys) ? pubkeys : []).map((p) => typeof p === "string" ? p.trim().toLowerCase() : "").filter(Boolean));
+		const next = {};
+		for (const [pubkey, existingId] of Object.entries(current)) {
+			if (existingId === cleanId && !owned.has(pubkey)) continue;
+			next[pubkey] = existingId;
+		}
+		for (const pubkey of owned) next[pubkey] = cleanId;
+		localStorage.setItem(AGENT_HOSTS_KEY, JSON.stringify(next));
+		if (typeof window !== "undefined") window.dispatchEvent(new CustomEvent(AGENT_HOSTS_CHANGED_EVENT));
+	} catch {}
+}
+function machineForAgent(pubkey) {
+	const clean = typeof pubkey === "string" ? pubkey.trim().toLowerCase() : "";
+	if (!clean) return void 0;
+	const machineId = storedAgentHosts()[clean];
+	return machineId ? machineById(machineId) : void 0;
+}
 
 //#endregion
 //#region plugin/src/client.js
-function createClient() {
+function createMachineSocket({ id, url, token, onState }) {
 	let socket;
 	let opening;
 	let next = 1;
 	const pending = /* @__PURE__ */ new Map();
-	const listeners = /* @__PURE__ */ new Set();
 	let state = {
+		id,
 		status: "idle",
-		url: storedUrl(),
+		url,
+		token,
 		error: "",
-		session: null,
-		epoch: 0
+		session: null
 	};
 	const set = (patch) => {
 		state = {
 			...state,
 			...patch
 		};
-		for (const listener of listeners) listener();
+		onState?.(state);
 	};
 	function fail(error) {
 		for (const [, p] of pending) {
@@ -71,24 +200,24 @@ function createClient() {
 	}
 	function sendRaw(ws, method, params = {}, { signal, timeoutMs = 12e4 } = {}) {
 		if (signal?.aborted) return Promise.reject(new DOMException("Aborted", "AbortError"));
-		const id = next++;
+		const reqId = next++;
 		return new Promise((resolve, reject) => {
 			const timer = setTimeout(() => {
-				pending.delete(id);
+				pending.delete(reqId);
 				reject(/* @__PURE__ */ new Error(`buzz-host did not answer ${method} in time`));
 			}, timeoutMs);
-			pending.set(id, {
+			pending.set(reqId, {
 				resolve,
 				reject,
 				timer
 			});
 			signal?.addEventListener("abort", () => {
-				if (!pending.delete(id)) return;
+				if (!pending.delete(reqId)) return;
 				clearTimeout(timer);
 				reject(new DOMException("Aborted", "AbortError"));
 			}, { once: true });
 			ws.send(JSON.stringify({
-				id,
+				id: reqId,
 				method,
 				params
 			}));
@@ -97,10 +226,8 @@ function createClient() {
 	function open() {
 		if (socket && socket.readyState === WebSocket.OPEN) return Promise.resolve(socket);
 		if (opening) return opening;
-		const url = storedUrl();
-		const token = storedToken();
 		if (!url) {
-			const error = /* @__PURE__ */ new Error("No buzz-host server configured yet. Open Settings → Plugins → Remote Agents and paste your server URL or invite link.");
+			const error = /* @__PURE__ */ new Error("No buzz-host server configured yet. Open Settings → Agent setup → Machines and paste your server URL or pairing link.");
 			set({
 				status: "idle",
 				url: "",
@@ -195,7 +322,7 @@ function createClient() {
 				if (!settled && opening && !wasOpen) {
 					opening = void 0;
 					settled = true;
-					const error = /* @__PURE__ */ new Error(token ? `Could not reach buzz-host at ${url}. Check that the server is up and the invite URL is correct.` : `Could not reach buzz-host at ${url}. Check that the server is up and this device is on the tailnet.`);
+					const error = /* @__PURE__ */ new Error(token ? `Could not reach buzz-host at ${url}. Check that the server is up and the pairing URL is correct.` : `Could not reach buzz-host at ${url}. Check that the server is up and this device is on the tailnet.`);
 					set({
 						status: "error",
 						error: error.message,
@@ -216,33 +343,253 @@ function createClient() {
 			label: result.label ?? null,
 			ownerPubkey: result.ownerPubkey ?? null,
 			limits: result.limits ?? null,
+			platform: result.platform ?? null,
+			capabilities: result.capabilities ?? null,
 			publicGuestUrl: result.publicGuestUrl ?? null
 		} });
+		return result;
+	}
+	function close() {
+		const old = socket;
+		socket = void 0;
+		opening = void 0;
+		try {
+			old?.close();
+		} catch {}
+		fail(/* @__PURE__ */ new Error("Connection to buzz-host closed"));
+	}
+	return {
+		id,
+		url,
+		token,
+		call,
+		open,
+		close,
+		snapshot: () => state
+	};
+}
+function createClient() {
+	const pool = /* @__PURE__ */ new Map();
+	const listeners = /* @__PURE__ */ new Set();
+	const fallbackTarget = () => {
+		const primary = activeMachine();
+		if (primary) return {
+			id: primary.id,
+			url: machineWssUrl(primary),
+			token: primary.token || ""
+		};
+		return {
+			id: "default",
+			url: storedUrl(),
+			token: storedToken()
+		};
+	};
+	let state = {
+		status: "idle",
+		url: fallbackTarget().url,
+		machineId: fallbackTarget().id,
+		error: "",
+		session: null,
+		epoch: 0
+	};
+	const emit = () => {
+		for (const listener of [...listeners]) listener();
+	};
+	const set = (patch) => {
+		state = {
+			...state,
+			...patch
+		};
+		emit();
+	};
+	function resolveTarget(params = {}, options = {}) {
+		if (options?.machineId) {
+			const hit = machineById(options.machineId);
+			if (hit) return {
+				id: hit.id,
+				url: machineWssUrl(hit),
+				token: hit.token || ""
+			};
+		}
+		if (params && typeof params.pubkey === "string" && params.pubkey) {
+			const owner = machineForAgent(params.pubkey);
+			if (owner) return {
+				id: owner.id,
+				url: machineWssUrl(owner),
+				token: owner.token || ""
+			};
+		}
+		return fallbackTarget();
+	}
+	function getSocket(target) {
+		const existing = pool.get(target.id);
+		if (existing && existing.url === target.url && existing.token === target.token) return existing;
+		if (existing) {
+			existing.close();
+			pool.delete(target.id);
+		}
+		const created = createMachineSocket({
+			id: target.id,
+			url: target.url,
+			token: target.token,
+			onState(nextState) {
+				const current = fallbackTarget();
+				if (nextState.id === current.id) set({
+					status: nextState.status,
+					url: nextState.url,
+					machineId: nextState.id,
+					error: nextState.error,
+					session: nextState.session
+				});
+			}
+		});
+		pool.set(target.id, created);
+		return created;
+	}
+	function syncPoolWithStorage() {
+		const machines = storedMachines();
+		const byId = new Map(machines.map((m) => [m.id, m]));
+		for (const [id, conn] of [...pool.entries()]) {
+			const fresh = byId.get(id);
+			if (!fresh || machineWssUrl(fresh) !== conn.url || (fresh.token || "") !== conn.token) {
+				conn.close();
+				pool.delete(id);
+			}
+		}
+		const primary = fallbackTarget();
+		const primaryConn = pool.get(primary.id);
+		set({
+			url: primary.url,
+			machineId: primary.id,
+			status: primaryConn?.snapshot().status ?? "idle",
+			error: primaryConn?.snapshot().error ?? "",
+			session: primaryConn?.snapshot().session ?? null,
+			epoch: state.epoch + 1
+		});
+	}
+	const onStorage = (event) => {
+		if (event.key === null || event.key === "local.buzz-host.machines.v1" || event.key === "local.buzz-host.active-machine.v1" || event.key === "local.buzz-host.url" || event.key === "local.buzz-host.token") syncPoolWithStorage();
+	};
+	const onMachinesChanged = () => syncPoolWithStorage();
+	if (typeof window !== "undefined") {
+		window.addEventListener("storage", onStorage);
+		window.addEventListener(MACHINES_CHANGED_EVENT, onMachinesChanged);
+	}
+	async function callAllList(params = {}, options = {}) {
+		const machines = storedMachines();
+		if (!machines.length) return {
+			agents: [],
+			errors: []
+		};
+		const settled = await Promise.allSettled(machines.map(async (machine) => {
+			const target = {
+				id: machine.id,
+				url: machineWssUrl(machine),
+				token: machine.token || ""
+			};
+			if (!target.url) return {
+				machine,
+				agents: []
+			};
+			const conn = getSocket(target);
+			const res = await conn.call("list", params, options);
+			const rawAgents = Array.isArray(res?.agents) ? res.agents : [];
+			mergeStoredAgentHosts(machine.id, rawAgents.map((a) => a.pubkey).filter(Boolean));
+			const sessionCaps = conn.snapshot().session?.capabilities;
+			const platform = machine.platform ?? conn.snapshot().session?.platform ?? void 0;
+			const desktopSupported = machine.capabilities?.desktop !== void 0 ? machine.capabilities.desktop !== false : sessionCaps?.desktop !== void 0 ? sessionCaps.desktop !== false : platform !== "darwin";
+			return {
+				machine,
+				agents: rawAgents.map((a) => ({
+					...a,
+					machineId: machine.id,
+					machineName: machine.name,
+					machinePlatform: platform,
+					desktopSupported
+				}))
+			};
+		}));
+		const agents = [];
+		const seen = /* @__PURE__ */ new Set();
+		const errors = [];
+		for (let i = 0; i < settled.length; i++) {
+			const outcome = settled[i];
+			const machine = machines[i];
+			if (outcome.status === "fulfilled") for (const agent of outcome.value.agents) {
+				const key = String(agent.pubkey || "").toLowerCase();
+				if (!key || seen.has(key)) continue;
+				seen.add(key);
+				agents.push(agent);
+			}
+			else errors.push({
+				machineId: machine.id,
+				machineName: machine.name,
+				error: outcome.reason instanceof Error ? outcome.reason.message : String(outcome.reason)
+			});
+		}
+		if (!agents.length && errors.length === machines.length) throw new Error(errors[0].error);
+		return {
+			agents,
+			errors
+		};
+	}
+	async function call(method, params = {}, options = {}) {
+		if (options.signal?.aborted) throw new DOMException("Aborted", "AbortError");
+		if (method === "list" && options.allMachines) return callAllList(params, options);
+		const target = resolveTarget(params, options);
+		const result = await getSocket(target).call(method, params, options);
+		if (method === "provision" && result?.pubkey) setStoredAgentHost(result.pubkey, target.id);
+		if (method === "list" && Array.isArray(result?.agents)) mergeStoredAgentHosts(target.id, result.agents.map((a) => a.pubkey).filter(Boolean));
 		return result;
 	}
 	return {
 		call,
 		snapshot: () => state,
+		sessionFor(machineId) {
+			const id = (machineId ? machineById(machineId) : activeMachine())?.id ?? "default";
+			return pool.get(id)?.snapshot().session ?? null;
+		},
+		machineFor(pubkeyOrId) {
+			return machineForAgent(pubkeyOrId) ?? machineById(pubkeyOrId) ?? activeMachine();
+		},
+		urlForAgent(pubkey) {
+			const machine = machineForAgent(pubkey) ?? activeMachine();
+			return machine && machineWssUrl(machine) || storedUrl();
+		},
+		listMachines: () => storedMachines(),
 		subscribe(listener) {
 			listeners.add(listener);
 			return () => listeners.delete(listener);
 		},
-		reconnect() {
-			const old = socket;
-			socket = void 0;
-			opening = void 0;
-			try {
-				old?.close();
-			} catch {}
+		reconnect(machineId) {
+			if (machineId) {
+				const target = resolveTarget({}, { machineId });
+				const existing = pool.get(target.id);
+				if (existing) {
+					existing.close();
+					pool.delete(target.id);
+				}
+				set({ epoch: state.epoch + 1 });
+				return getSocket(target).open();
+			}
+			for (const conn of pool.values()) conn.close();
+			pool.clear();
+			const target = fallbackTarget();
 			set({
-				url: storedUrl(),
+				url: target.url,
+				machineId: target.id,
 				session: null,
 				epoch: state.epoch + 1
 			});
-			return open();
+			return getSocket(target).open();
 		},
 		close() {
-			socket?.close();
+			if (typeof window !== "undefined") {
+				window.removeEventListener("storage", onStorage);
+				window.removeEventListener(MACHINES_CHANGED_EVENT, onMachinesChanged);
+			}
+			for (const conn of pool.values()) conn.close();
+			pool.clear();
 		}
 	};
 }
@@ -7565,7 +7912,8 @@ function createDesktop({ React, client, ctx, uiKit, Btn, Icon, navigation, panel
 					const v = await client.call("desktop.view", { pubkey }, { timeoutMs: 6e4 });
 					if (state.status !== "connecting") return;
 					const { RFB } = novncClient();
-					const r = new RFB(screen, `${storedUrl().replace(/\/+$/, "")}${v.path}`, {
+					const baseUrl = (client.urlForAgent?.(pubkey) || storedUrl()).replace(/\/+$/, "");
+					const r = new RFB(screen, `${baseUrl}${v.path}`, {
 						wsProtocols: ["binary"],
 						shared: true
 					});
@@ -7714,10 +8062,11 @@ function createDesktop({ React, client, ctx, uiKit, Btn, Icon, navigation, panel
 			try {
 				const res = await client.call("list", {}, {
 					signal,
-					timeoutMs: 2e4
+					timeoutMs: 2e4,
+					allMachines: true
 				});
 				if (signal?.aborted) return [];
-				let list = Array.isArray(res?.agents) ? res.agents : [];
+				let list = (Array.isArray(res?.agents) ? res.agents : []).filter((a) => a.desktopSupported !== false);
 				const needsProbe = list.filter((a) => a.desktop && a.desktopRunning === void 0);
 				if (needsProbe.length) {
 					const statuses = await Promise.all(needsProbe.map((a) => client.call("desktop.status", { pubkey: a.pubkey }, {
@@ -8237,12 +8586,15 @@ function createDesktop({ React, client, ctx, uiKit, Btn, Icon, navigation, panel
 	function DesktopSettings({ ui, agent }) {
 		const pubkey = agent.pubkey;
 		const name = agent.name || "the agent";
+		const machine = client.machineFor?.(pubkey);
+		const desktopUnsupported = machine?.capabilities?.desktop === false || machine?.platform === "darwin";
 		const viewer = desktopViewer(pubkey);
 		const view = React.useSyncExternalStore(viewer.subscribe, viewer.snapshot);
 		const [info, setInfo] = React.useState();
 		const [busy, setBusy] = React.useState("");
 		const [error, setError] = React.useState("");
 		const refresh = React.useCallback(async (signal) => {
+			if (desktopUnsupported) return;
 			try {
 				setInfo(await client.call("desktop.status", { pubkey }, {
 					signal,
@@ -8252,12 +8604,21 @@ function createDesktop({ React, client, ctx, uiKit, Btn, Icon, navigation, panel
 			} catch (e) {
 				if (!signal?.aborted) setError(String(e.message ?? e));
 			}
-		}, [pubkey]);
+		}, [pubkey, desktopUnsupported]);
 		React.useEffect(() => {
+			if (desktopUnsupported) return void 0;
 			const controller = new AbortController();
 			refresh(controller.signal);
 			return () => controller.abort();
-		}, [refresh]);
+		}, [refresh, desktopUnsupported]);
+		if (desktopUnsupported) {
+			const subtitle = `${name} runs on ${machine?.name || "this machine"} (macOS). Virtual Linux desktops in Viewport are only available on Linux hosts.`;
+			if (ui) return h(ui.SettingsGroup, null, h(ui.PreferenceRow, {
+				title: "Desktop unavailable on macOS",
+				subtitle
+			}));
+			return h(Note, null, subtitle);
+		}
 		const act = async (label, task) => {
 			setBusy(label);
 			setError("");
@@ -8368,8 +8729,11 @@ function createDesktop({ React, client, ctx, uiKit, Btn, Icon, navigation, panel
 		const listeners = /* @__PURE__ */ new Set();
 		const load = () => {
 			if (loading || Date.now() - checkedAt < 6e4) return;
-			loading = client.call("list", {}, { timeoutMs: 2e4 }).then((r) => {
-				const next = new Set(r.agents.filter((a) => a.desktop).map((a) => a.pubkey));
+			loading = client.call("list", {}, {
+				timeoutMs: 2e4,
+				allMachines: true
+			}).then((r) => {
+				const next = new Set((r.agents ?? []).filter((a) => a.desktop && a.desktopSupported !== false).map((a) => a.pubkey));
 				checkedAt = Date.now();
 				if (next.size !== agents.size || [...next].some((p) => !agents.has(p))) {
 					agents = next;

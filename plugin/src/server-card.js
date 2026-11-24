@@ -486,11 +486,15 @@ export function createServerCard({ React, client, uiKit, Btn, relay }) {
                     h(
                       Note,
                       null,
-                      `${t.agentCount ?? 0}/${t.maxAgents} agents · max ${t.maxConcurrency} parallel · ${t.allowedRuntimes.join(", ")}${
-                        t.allowHostDesktop ? " · host desktop (trusted)" : ""
-                      } · ${
-                        t.ownerPubkey ? `bound ${t.ownerPubkey.slice(0, 10)}…` : "unbound (binds on first agent)"
-                      }`,
+                      t.role === "admin"
+                        ? `Admin access token · full access to this host${
+                            t.ownerPubkey ? ` · owner ${t.ownerPubkey.slice(0, 10)}…` : ""
+                          }`
+                        : `${t.agentCount ?? 0}/${t.maxAgents} agents · max ${t.maxConcurrency} parallel · ${(t.allowedRuntimes ?? []).join(", ")}${
+                            t.allowHostDesktop ? " · host desktop (trusted)" : ""
+                          } · ${
+                            t.ownerPubkey ? `bound ${t.ownerPubkey.slice(0, 10)}…` : "unbound (binds on first agent)"
+                          }`,
                     ),
                   ),
                   h(
@@ -571,7 +575,7 @@ export function createServerCard({ React, client, uiKit, Btn, relay }) {
         Row,
         {
           label: "Server (or paste invite link)",
-          hint: "Admin: your wss:// tailscale serve address. Guest: paste the invite link from your host.",
+          hint: "Admin: your wss:// tailscale serve address, or an admin link (#token=bha_…) for any wss:// tunnel. Guest: paste the invite link from your host.",
         },
         h(Text, {
           value: url,
@@ -582,8 +586,8 @@ export function createServerCard({ React, client, uiKit, Btn, relay }) {
       h(
         Row,
         {
-          label: "Access token (guests only)",
-          hint: "Leave blank on your own tailnet admin connection. Filled automatically when pasting an invite link.",
+          label: "Access token",
+          hint: "Leave blank on your own tailnet admin connection. Guests use a bhg_ invite token; an admin access token (bha_, from buzz-host-tokens create-admin) connects without Tailscale. Filled automatically when pasting an invite link.",
         },
         h(
           "div",
@@ -591,7 +595,7 @@ export function createServerCard({ React, client, uiKit, Btn, relay }) {
           h(Text, {
             type: showToken ? "text" : "password",
             value: token,
-            placeholder: "bhg_… (optional)",
+            placeholder: "bhg_… or bha_… (optional)",
             style: { flex: 1 },
             onChange: (e) => setToken(e.target.value),
           }),

@@ -34,7 +34,8 @@ export BUZZ_ACP_AGENTS="${BUZZ_ACP_AGENTS:-4}"
 # (the eager pool), and an unrecognized one is reported and treated the same
 # way rather than crashing the unit.
 _lazy_pool="${BUZZ_ACP_LAZY_POOL:-true}"
-case "${_lazy_pool,,}" in
+# tr, not ${x,,}: macOS ships bash 3.2, which lacks case modification.
+case "$(printf '%s' "$_lazy_pool" | tr '[:upper:]' '[:lower:]')" in
   true|1|yes|on)
     export BUZZ_ACP_LAZY_POOL=true
     _idle_pool_sleep="${BUZZ_ACP_IDLE_POOL_SLEEP:-300}"
@@ -68,13 +69,24 @@ export BUZZHOST_AGENT="$pubkey"
 # function in ~/.bash_profile routes to agent-bin/buzz.
 export BUZZ_MANAGED_AGENT="$pubkey"
 export BUZZ_HOST_LIB="$HOME/.local/lib/buzz-host"
-export PATH="$HOME/.local/lib/buzz-host/agent-bin:$HOME/.local/lib/buzz-host/bin:$HOME/.local/share/mise/command-wrappers/bin:$HOME/.local/share/mise/shims:$HOME/.local/bin:/usr/local/bin:/usr/bin"
+export PATH="$HOME/.local/lib/buzz-host/agent-bin:$HOME/.local/lib/buzz-host/bin:$HOME/.local/share/mise/command-wrappers/bin:$HOME/.local/share/mise/shims:$HOME/.local/bin:/usr/local/bin:/usr/bin:/opt/homebrew/bin:/bin"
 # Chat commands (acp-proxy) and, with the patched buzz-acp from build-acp.sh,
 # fresh-session requests and thread-scoped sessions.
 export BUZZ_HOST_AGENT_DIR="$d"
 # Stop/session controls from Buzz reach each acp-proxy worker in this dir
 # (one <pid>.sock per worker, avoiding clobbering when BUZZ_ACP_AGENTS > 1).
 run_dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/buzz-host"
+if [[ "$(uname -s)" == Darwin ]]; then
+  # macOS: the run base is /tmp/bh-<uid> (shared space). Never put sockets in
+  # one another user planted or symlinked; buzz-host checks the same.
+  _base="${run_dir%/buzz-host}"
+  mkdir -m 700 "$_base" 2>/dev/null || true
+  if [[ -L "$_base" || ! -d "$_base" || ! -O "$_base" ]]; then
+    echo "agent-run: $_base is not a directory owned by $(id -un); refusing to use it" >&2
+    exit 78
+  fi
+  chmod 700 "$_base"
+fi
 mkdir -p -m 700 "$run_dir"
 rm -f "$run_dir/$pubkey.sock"
 # Short 16-hex prefix keeps Unix socket paths well under Linux's 108-byte sun_path limit.

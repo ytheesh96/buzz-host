@@ -2,7 +2,8 @@
 # Copy buzz-host's server files to the host and restart it. Agents keep running.
 # Usage:
 #   ./deploy.sh [host]        Deploy over SSH (default: omarchy)
-#   ./deploy.sh --local       Deploy atomically to the local machine (no SSH)
+#   ./deploy.sh --local       Deploy atomically to the local machine (no SSH;
+#                             systemd --user on Linux, a launchd LaunchAgent on macOS)
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
@@ -26,6 +27,7 @@ SERVER_FILES=(
   control.mjs
   file-lock.mjs
   ws-security.mjs
+  service-manager.mjs
 )
 
 atomic_copy() {
@@ -56,13 +58,65 @@ sync_hermes_plugin_local() {
   done
 }
 
+# Escape a value for an XML text node, then for a sed replacement (| delimiter).
+plist_value() {
+  printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/[|&\\]/\\&/g'
+}
+
+# macOS: install the buzz-host LaunchAgent from server/com.buzz-host.server.plist
+# and (re)start it in the user's gui/<uid> domain.
+install_launch_agent() {
+  local lib_dir="$1"
+  local agents_dir="${BUZZ_HOST_LAUNCH_AGENTS_DIR:-$HOME/Library/LaunchAgents}"
+  local log_dir="${BUZZ_HOST_LOG_DIR:-$HOME/Library/Logs/buzz-host}"
+  local label="com.buzz-host.server"
+  local plist="$agents_dir/$label.plist"
+  local node_bin runtime_dir
+  node_bin="$(command -v node || true)"
+  [ -n "$node_bin" ] || { echo "error: node not found on PATH" >&2; exit 1; }
+  runtime_dir="${XDG_RUNTIME_DIR:-/tmp/bh-$(id -u)}"
+  mkdir -p "$agents_dir" "$log_dir"
+  local tmp
+  tmp="$(mktemp "$agents_dir/.$label.plist.tmp.XXXXXX")"
+  sed -e "s|__NODE__|$(plist_value "$node_bin")|g" \
+      -e "s|__LIB__|$(plist_value "$lib_dir")|g" \
+      -e "s|__HOME__|$(plist_value "$HOME")|g" \
+      -e "s|__RUNTIME_DIR__|$(plist_value "$runtime_dir")|g" \
+      -e "s|__LOG_DIR__|$(plist_value "$log_dir")|g" \
+      "$SERVER_DIR/com.buzz-host.server.plist" > "$tmp"
+  chmod 0644 "$tmp"
+  mv -f "$tmp" "$plist"
+  if [ "${BUZZ_HOST_SKIP_RESTART:-0}" != "1" ]; then
+    local domain="gui/$(id -u)"
+    if launchctl print "$domain/$label" >/dev/null 2>&1; then
+      # Reload so plist edits take effect, then it starts (RunAtLoad).
+      launchctl bootout "$domain/$label" || true
+      # bootout returns before the old job is gone; bootstrapping too soon
+      # fails with "5: Input/output error".
+      local i
+      for i in 1 2 3 4 5 6 7 8 9 10; do
+        launchctl print "$domain/$label" >/dev/null 2>&1 || break
+        sleep 0.5
+      done
+    fi
+    launchctl bootstrap "$domain" "$plist"
+    launchctl print "$domain/$label" | grep -E '^[[:space:]]*state = ' || true
+  fi
+}
+
 deploy_local() {
   local lib_dir="${BUZZ_HOST_LIB_DIR:-$HOME/.local/lib/buzz-host}"
   local systemd_dir="${BUZZ_HOST_SYSTEMD_DIR:-$HOME/.config/systemd/user}"
   local hermes_dir="${BUZZ_HOST_HERMES_DIR:-$HOME/.hermes}"
   local gemini_dir="${BUZZ_HOST_GEMINI_DIR:-$HOME/.gemini}"
 
-  mkdir -p "$lib_dir"/{bin,shims,agent-bin} "$systemd_dir"
+  local os_name
+  os_name="$(uname -s)"
+
+  mkdir -p "$lib_dir"/{bin,shims,agent-bin}
+  if [ "$os_name" != "Darwin" ]; then
+    mkdir -p "$systemd_dir"
+  fi
 
   local f mode
   for f in "${SERVER_FILES[@]}"; do
@@ -137,15 +191,17 @@ deploy_local() {
     atomic_copy "$f" "$lib_dir/agent-bin/$(basename "$f")" 0755
   done
 
-  atomic_copy "$SERVER_DIR/buzz-host.service" "$systemd_dir/buzz-host.service" 0644
-  atomic_copy "$SERVER_DIR/buzz-agent@.service" "$systemd_dir/buzz-agent@.service" 0644
+  if [ "$os_name" != "Darwin" ]; then
+    atomic_copy "$SERVER_DIR/buzz-host.service" "$systemd_dir/buzz-host.service" 0644
+    atomic_copy "$SERVER_DIR/buzz-agent@.service" "$systemd_dir/buzz-agent@.service" 0644
 
-  # Refresh auto-deploy units only if already enabled/installed on this host.
-  for f in buzz-host-deploy.service buzz-host-deploy.timer; do
-    if [ -f "$systemd_dir/$f" ] && [ -f "$SERVER_DIR/$f" ]; then
-      atomic_copy "$SERVER_DIR/$f" "$systemd_dir/$f" 0644
-    fi
-  done
+    # Refresh auto-deploy units only if already enabled/installed on this host.
+    for f in buzz-host-deploy.service buzz-host-deploy.timer; do
+      if [ -f "$systemd_dir/$f" ] && [ -f "$SERVER_DIR/$f" ]; then
+        atomic_copy "$SERVER_DIR/$f" "$systemd_dir/$f" 0644
+      fi
+    done
+  fi
 
   # Hermes plugin: per-session agent identity in the gateway.
   local hp_tmp
@@ -175,7 +231,10 @@ deploy_local() {
     fi
   fi
 
-  if [ "${BUZZ_HOST_SKIP_RESTART:-0}" != "1" ]; then
+  # Agents' own LaunchAgents are written by buzz-host (service-manager.mjs).
+  if [ "$os_name" = "Darwin" ]; then
+    install_launch_agent "$lib_dir"
+  elif [ "${BUZZ_HOST_SKIP_RESTART:-0}" != "1" ]; then
     systemctl --user daemon-reload
     systemctl --user restart buzz-host
     systemctl --user is-active buzz-host

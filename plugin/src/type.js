@@ -89,15 +89,21 @@ export function createType({
    * Model show; the rest sit behind a "More options" row whose subtitle names
    * their current values, so the defaults stay visible without crowding.
    */
-  function RuntimeRows({ ui, draft, onChange, disabled, serverInfo, collapsible = false }) {
+  function RuntimeRows({ ui, draft, onChange, disabled, serverInfo, machineId = "", collapsible = false }) {
     const [expanded, setExpanded] = React.useState(false);
     const isGuest = serverInfo?.role === "guest";
     const canUseHost = !isGuest || serverInfo?.limits?.allowHostDesktop === true;
     const effective = isGuest ? applyGuestConstraints(draft, serverInfo) : draft;
     const sandboxed = (effective.runner || (canUseHost ? "host" : "docker")) !== "host";
-    const { models, error } = useModels(React, client, effective.runtime, !isGuest && !sandboxed ? effective.profile : "");
+    const { models, error } = useModels(
+      React,
+      client,
+      effective.runtime,
+      !isGuest && !sandboxed ? effective.profile : "",
+      machineId,
+    );
     const hermes = !isGuest && effective.runtime === "hermes" && !sandboxed;
-    const { profiles, error: profileError } = useProfiles(React, client, hermes);
+    const { profiles, error: profileError } = useProfiles(React, client, hermes, machineId);
     const choice = modelChoices(models);
     const respondTo = effective.respondTo || "owner-only";
     const showMore = !collapsible || expanded;
@@ -252,7 +258,8 @@ export function createType({
   function CreateConfiguration({ agent, config, onChange, disabled, harnessControl, onReadyChange }) {
     React.useEffect(() => onReadyChange?.(true), [onReadyChange]);
     const ui = agentUi();
-    const { info: serverInfo } = useServerInfo(React, client);
+    const machineId = typeof config?.machineId === "string" ? config.machineId : "";
+    const { info: serverInfo } = useServerInfo(React, client, machineId);
     const isGuest = serverInfo?.role === "guest";
     const draft = isGuest ? applyGuestConstraints(asConfig(config), serverInfo) : asConfig(config);
     React.useEffect(() => {
@@ -283,7 +290,7 @@ export function createType({
         ui.SettingsGroup,
         null,
         harnessControl,
-        h(RuntimeRows, { ui, draft, onChange, disabled, serverInfo, collapsible: true }),
+        h(RuntimeRows, { ui, draft, onChange, disabled, serverInfo, machineId, collapsible: true }),
       ),
       h(AllowlistField, { draft, onChange, disabled }),
     );
@@ -782,7 +789,12 @@ export function createType({
       h(
         Note,
         null,
-        `Runs on buzz-host (${client.snapshot().url.replace(/^wss:\/\//, "")})${loaded.runtime === "hermes" ? ` · Hermes profile ${loaded.profile || "default"}` : ""} · service ${loaded.status}. Up to ${loaded.concurrency} parallel conversations.`,
+        (() => {
+          const machine = client.machineFor?.(pubkey);
+          const hostDisplay = (machine?.url || client.snapshot().url || "").replace(/^wss:\/\//, "");
+          const place = machine?.name && machine.name !== "Remote machine" ? `${machine.name} (${hostDisplay})` : `buzz-host (${hostDisplay})`;
+          return `Runs on ${place}${loaded.runtime === "hermes" ? ` · Hermes profile ${loaded.profile || "default"}` : ""} · service ${loaded.status}. Up to ${loaded.concurrency} parallel conversations.`;
+        })(),
       ),
       h(
         Row,
@@ -952,7 +964,8 @@ export function createType({
     ],
     remote: {
       async provision({ name, picture, community, config, signal }) {
-        const session = client.snapshot().session;
+        const machineId = typeof config?.machineId === "string" ? config.machineId : "";
+        const session = (machineId ? client.sessionFor?.(machineId) : client.snapshot().session) ?? null;
         const c = applyGuestConstraints(asConfig(config), session);
         return client.call(
           "provision",
@@ -971,11 +984,12 @@ export function createType({
               instructions: c.instructions,
             },
           },
-          { signal },
+          { signal, ...(machineId ? { machineId } : {}) },
         );
       },
       async activate({ pubkey, name, community, auth, config, signal }) {
-        const session = client.snapshot().session;
+        const machineId = typeof config?.machineId === "string" ? config.machineId : "";
+        const session = (machineId ? client.sessionFor?.(machineId) : client.snapshot().session) ?? null;
         const c = config === undefined ? undefined : applyGuestConstraints(asConfig(config), session);
         await client.call(
           "activate",
@@ -999,7 +1013,7 @@ export function createType({
                 }
               : {}),
           },
-          { signal, timeoutMs: 180000 },
+          { signal, timeoutMs: 180000, ...(machineId ? { machineId } : {}) },
         );
       },
       async profile({ pubkey, community, name, picture, signal }) {

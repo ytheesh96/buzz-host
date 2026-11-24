@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  buzz-host on macOS: the launchd counterpart of buzz-host.service.
+  deploy.sh install_launch_agent fills in the __PLACEHOLDERS__ (XML-escaped)
+  and writes it to ~/Library/LaunchAgents/com.buzz-host.server.plist.
+  Each agent gets its own LaunchAgent from buzz-host (service-manager.mjs).
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.buzz-host.server</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__NODE__</string>
+    <string>__LIB__/buzz-host.mjs</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>__LIB__/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>HOME</key>
+    <string>__HOME__</string>
+    <!-- Short socket base, well under macOS's 104-byte sun_path limit. -->
+    <key>XDG_RUNTIME_DIR</key>
+    <string>__RUNTIME_DIR__</string>
+  </dict>
+  <key>WorkingDirectory</key>
+  <string>__HOME__</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <!-- Restart=on-failure: respawn after a crash, stay down after a clean exit. -->
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>5</integer>
+  <!-- UMask=0077 (decimal 63). -->
+  <key>Umask</key>
+  <integer>63</integer>
+  <key>StandardOutPath</key>
+  <string>__LOG_DIR__/server.log</string>
+  <key>StandardErrorPath</key>
+  <string>__LOG_DIR__/server.log</string>
+</dict>
+</plist>

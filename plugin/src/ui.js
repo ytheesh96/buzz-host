@@ -108,14 +108,18 @@ export function createBuzzPrimitives(React) {
 
 // Model choices for a runtime (for Hermes, its profile's): loaded from
 // buzz-host, free text as fallback.
-export function useModels(React, client, runtime, profile = "") {
-  const key = `${runtime}\n${runtime === "hermes" ? profile : ""}`;
+export function useModels(React, client, runtime, profile = "", machineId = "") {
+  const key = `${machineId}\n${runtime}\n${runtime === "hermes" ? profile : ""}`;
   const [state, setState] = React.useState({ key, models: undefined, error: "" });
   React.useEffect(() => {
     const controller = new AbortController();
     setState({ key, models: undefined, error: "" });
     client
-      .call("models", { runtime, profile: runtime === "hermes" ? profile : "" }, { signal: controller.signal, timeoutMs: 60000 })
+      .call(
+        "models",
+        { runtime, profile: runtime === "hermes" ? profile : "" },
+        { signal: controller.signal, timeoutMs: 60000, ...(machineId ? { machineId } : {}) },
+      )
       .then(
         (r) => !controller.signal.aborted && setState({ key, models: r.models, error: "" }),
         (e) =>
@@ -128,39 +132,48 @@ export function useModels(React, client, runtime, profile = "") {
 }
 
 // The server's role, limits, and capabilities from `hello`.
-export function useServerInfo(React, client) {
+export function useServerInfo(React, client, machineId = "") {
   const snap = React.useSyncExternalStore(client.subscribe, client.snapshot);
-  const key = `${snap.url}#${snap.epoch ?? 0}`;
+  const key = `${machineId || snap.url}#${snap.epoch ?? 0}`;
+  const initialSession = (machineId ? client.sessionFor?.(machineId) : snap.session) ?? null;
   const [state, setState] = React.useState(() => ({
     key,
-    info: snap.session ? { ...snap.session } : undefined,
+    info: initialSession ? { ...initialSession } : undefined,
     error: "",
   }));
   React.useEffect(() => {
     const controller = new AbortController();
-    client.call("hello", {}, { signal: controller.signal, timeoutMs: 20000 }).then(
-      (info) => !controller.signal.aborted && setState({ key, info, error: "" }),
-      (e) => !controller.signal.aborted && setState({ key, info: undefined, error: String(e.message ?? e) }),
-    );
+    client
+      .call("hello", {}, { signal: controller.signal, timeoutMs: 20000, ...(machineId ? { machineId } : {}) })
+      .then(
+        (info) => !controller.signal.aborted && setState({ key, info, error: "" }),
+        (e) => !controller.signal.aborted && setState({ key, info: undefined, error: String(e.message ?? e) }),
+      );
     return () => controller.abort();
   }, [client, key]);
   return state.key === key
     ? state
-    : { key, info: snap.session ? { ...snap.session } : undefined, error: "" };
+    : { key, info: initialSession ? { ...initialSession } : undefined, error: "" };
 }
 
 // The server's Hermes profiles, from `hermes profile list`.
-export function useProfiles(React, client, enabled) {
+export function useProfiles(React, client, enabled, machineId = "") {
   const [state, setState] = React.useState({ profiles: undefined, error: "" });
   React.useEffect(() => {
     if (!enabled) return undefined;
     const controller = new AbortController();
-    client.call("hermes.profiles", {}, { signal: controller.signal, timeoutMs: 60000 }).then(
-      (r) => !controller.signal.aborted && setState({ profiles: r.profiles, error: "" }),
-      (e) => !controller.signal.aborted && setState({ profiles: [], error: String(e.message ?? e) }),
-    );
+    client
+      .call(
+        "hermes.profiles",
+        {},
+        { signal: controller.signal, timeoutMs: 60000, ...(machineId ? { machineId } : {}) },
+      )
+      .then(
+        (r) => !controller.signal.aborted && setState({ profiles: r.profiles, error: "" }),
+        (e) => !controller.signal.aborted && setState({ profiles: [], error: String(e.message ?? e) }),
+      );
     return () => controller.abort();
-  }, [client, enabled]);
+  }, [client, enabled, machineId]);
   return state;
 }
 

@@ -173,7 +173,8 @@ export function createDesktop({ React, client, ctx, uiKit, Btn, Icon, navigation
           const v = await client.call("desktop.view", { pubkey }, { timeoutMs: 60000 });
           if (state.status !== "connecting") return; // disconnected meanwhile
           const { RFB } = novncClient();
-          const r = new RFB(screen, `${storedUrl().replace(/\/+$/, "")}${v.path}`, { wsProtocols: ["binary"], shared: true });
+          const baseUrl = (client.urlForAgent?.(pubkey) || storedUrl()).replace(/\/+$/, "");
+          const r = new RFB(screen, `${baseUrl}${v.path}`, { wsProtocols: ["binary"], shared: true });
           r.viewOnly = true;
           r.scaleViewport = true;
           r.resizeSession = false;
@@ -321,9 +322,11 @@ export function createDesktop({ React, client, ctx, uiKit, Btn, Icon, navigation
     const loadAgents = React.useCallback(async (signal) => {
       setLoading(true);
       try {
-        const res = await client.call("list", {}, { signal, timeoutMs: 20000 });
+        const res = await client.call("list", {}, { signal, timeoutMs: 20000, allMachines: true });
         if (signal?.aborted) return [];
-        let list = Array.isArray(res?.agents) ? res.agents : [];
+        let list = (Array.isArray(res?.agents) ? res.agents : []).filter(
+          (a) => a.desktopSupported !== false,
+        );
         // Compatibility fallback if talking to an older buzz-host that omits desktopRunning on list.
         const needsProbe = list.filter((a) => a.desktop && a.desktopRunning === undefined);
         if (needsProbe.length) {
@@ -1018,6 +1021,9 @@ export function createDesktop({ React, client, ctx, uiKit, Btn, Icon, navigation
   function DesktopSettings({ ui, agent }) {
     const pubkey = agent.pubkey;
     const name = agent.name || "the agent";
+    const machine = client.machineFor?.(pubkey);
+    const desktopUnsupported =
+      machine?.capabilities?.desktop === false || machine?.platform === "darwin";
     const viewer = desktopViewer(pubkey);
     const view = React.useSyncExternalStore(viewer.subscribe, viewer.snapshot);
     const [info, setInfo] = React.useState();
@@ -1025,6 +1031,7 @@ export function createDesktop({ React, client, ctx, uiKit, Btn, Icon, navigation
     const [error, setError] = React.useState("");
     const refresh = React.useCallback(
       async (signal) => {
+        if (desktopUnsupported) return;
         try {
           setInfo(await client.call("desktop.status", { pubkey }, { signal, timeoutMs: 30000 }));
           setError("");
@@ -1032,13 +1039,26 @@ export function createDesktop({ React, client, ctx, uiKit, Btn, Icon, navigation
           if (!signal?.aborted) setError(String(e.message ?? e));
         }
       },
-      [pubkey],
+      [pubkey, desktopUnsupported],
     );
     React.useEffect(() => {
+      if (desktopUnsupported) return undefined;
       const controller = new AbortController();
       refresh(controller.signal);
       return () => controller.abort();
-    }, [refresh]);
+    }, [refresh, desktopUnsupported]);
+    if (desktopUnsupported) {
+      const hostName = machine?.name || "this machine";
+      const subtitle = `${name} runs on ${hostName} (macOS). Virtual Linux desktops in Viewport are only available on Linux hosts.`;
+      if (ui) {
+        return h(
+          ui.SettingsGroup,
+          null,
+          h(ui.PreferenceRow, { title: "Desktop unavailable on macOS", subtitle }),
+        );
+      }
+      return h(Note, null, subtitle);
+    }
     const act = async (label, task) => {
       setBusy(label);
       setError("");
@@ -1160,9 +1180,13 @@ export function createDesktop({ React, client, ctx, uiKit, Btn, Icon, navigation
     const load = () => {
       if (loading || Date.now() - checkedAt < 60000) return;
       loading = client
-        .call("list", {}, { timeoutMs: 20000 })
+        .call("list", {}, { timeoutMs: 20000, allMachines: true })
         .then((r) => {
-          const next = new Set(r.agents.filter((a) => a.desktop).map((a) => a.pubkey));
+          const next = new Set(
+            (r.agents ?? [])
+              .filter((a) => a.desktop && a.desktopSupported !== false)
+              .map((a) => a.pubkey),
+          );
           checkedAt = Date.now();
           if (next.size !== agents.size || [...next].some((p) => !agents.has(p))) {
             agents = next;
