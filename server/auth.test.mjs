@@ -154,6 +154,74 @@ test("auth rate limiter blocks repeated failures and clears on success", () => {
   assert.equal(rl.isLimited("1.2.3.4"), false);
 });
 
+test("auth rate limiter caps buckets so rotating IPs cannot grow it unboundedly", () => {
+  let clock = 1_000_000;
+  const rl = createAuthRateLimiter({
+    maxFailures: 1,
+    windowMs: 60_000,
+    maxKeys: 4,
+    now: () => clock,
+    sweepEvery: 1,
+  });
+
+  for (let i = 0; i < 50; i += 1) {
+    clock += 10;
+    rl.recordFailure(`10.0.0.${i}`);
+    assert.ok(rl.size() <= 4, `buckets stay capped (saw ${rl.size()})`);
+  }
+  // The newest offender is tracked; the oldest ones were evicted.
+  assert.equal(rl.isLimited("10.0.0.49"), true);
+  assert.equal(rl.isLimited("10.0.0.0"), false);
+});
+
+test("auth rate limiter prunes buckets once their window has passed", () => {
+  let clock = 1_000_000;
+  const rl = createAuthRateLimiter({
+    maxFailures: 2,
+    windowMs: 60_000,
+    maxKeys: 10_000,
+    now: () => clock,
+    sweepEvery: 1,
+  });
+
+  rl.recordFailure("1.2.3.4");
+  rl.recordFailure("5.6.7.8");
+  assert.equal(rl.size(), 2);
+
+  // One window later both buckets are empty and get swept away.
+  clock += 60_001;
+  rl.sweep();
+  assert.equal(rl.size(), 0);
+  assert.equal(rl.isLimited("1.2.3.4"), false);
+});
+
+test("auth rate limiter evicts the least-recently-failed bucket at the cap", () => {
+  let clock = 1_000_000;
+  const rl = createAuthRateLimiter({
+    maxFailures: 3,
+    windowMs: 60_000,
+    maxKeys: 2,
+    now: () => clock,
+    sweepEvery: 1,
+  });
+
+  for (let i = 0; i < 3; i += 1) {
+    clock += 1;
+    rl.recordFailure("9.9.9.9");
+  }
+  assert.equal(rl.isLimited("9.9.9.9"), true);
+
+  // New keys evict the oldest bucket once two are already tracked.
+  clock += 1;
+  rl.recordFailure("8.8.8.8");
+  clock += 1;
+  rl.recordFailure("7.7.7.7");
+  assert.equal(rl.size(), 2);
+  assert.equal(rl.isLimited("9.9.9.9"), false, "oldest bucket evicted");
+  assert.equal(rl.isLimited("8.8.8.8"), false, "one failure is below maxFailures");
+  assert.equal(rl.isLimited("7.7.7.7"), false);
+});
+
 test("buzz-host-tokens CLI creates, lists, and revokes tokens via --file", async (t) => {
   const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "buzz-tokens-cli-"));
   t.after(() => fs.rm(tmp, { recursive: true, force: true }));

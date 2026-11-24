@@ -47,6 +47,16 @@ import {
   findIdleGuestDesktops,
   isValidDesktopTicket,
 } from "./auth.mjs";
+import {
+  clientIpFromForwardedFor,
+  createFragmentBuffer,
+  createGuestSocketRegistry,
+  createIdleWatch,
+  GUEST_IDLE_TIMEOUT_MS,
+  MAX_GUEST_SOCKETS,
+  MAX_MESSAGE_BYTES,
+  MAX_UNAUTHENTICATED_GUEST_SOCKETS,
+} from "./ws-security.mjs";
 
 const run = promisify(execFile);
 const HOME = os.homedir();
@@ -175,6 +185,19 @@ async function loadConfig() {
       Number.isFinite(raw.guestDesktopIdleMs) && raw.guestDesktopIdleMs >= 0
         ? raw.guestDesktopIdleMs
         : 15 * 60_000,
+    // A public guest socket that never authenticates is closed after this long.
+    guestSocketIdleMs:
+      Number.isFinite(raw.guestSocketIdleMs) && raw.guestSocketIdleMs > 0
+        ? raw.guestSocketIdleMs
+        : GUEST_IDLE_TIMEOUT_MS,
+    guestMaxSockets:
+      Number.isInteger(raw.guestMaxSockets) && raw.guestMaxSockets > 0
+        ? raw.guestMaxSockets
+        : MAX_GUEST_SOCKETS,
+    guestMaxUnauthenticated:
+      Number.isInteger(raw.guestMaxUnauthenticated) && raw.guestMaxUnauthenticated >= 0
+        ? raw.guestMaxUnauthenticated
+        : MAX_UNAUTHENTICATED_GUEST_SOCKETS,
     allowLogins: new Set(raw.allowLogins),
     allowOrigins: new Set(
       raw.allowOrigins ?? [
@@ -669,6 +692,7 @@ const methods = {
       allowHostDesktop: record.allowHostDesktop === true,
     };
     session.registerTokenSocket?.(record.id);
+    session.onAuthenticated?.();
     console.log(`guest authenticated: ${record.label} (${record.id})`);
     return {
       role: "guest",
@@ -1285,7 +1309,8 @@ function frame(opcode, payload) {
 
 function serveSocket(socket, onText) {
   let buffer = Buffer.alloc(0);
-  let fragments = [];
+  // A fragmented message may not exceed one MAX_FRAME-sized message in total.
+  const message = createFragmentBuffer({ maxBytes: MAX_MESSAGE_BYTES });
   const send = (text) => socket.write(frame(1, Buffer.from(text)));
   socket.on("data", (chunk) => {
     buffer = Buffer.concat([buffer, chunk]);
@@ -1320,12 +1345,10 @@ function serveSocket(socket, onText) {
       }
       if (opcode === 10) continue;
       if (opcode === 1 || opcode === 0) {
-        fragments.push(payload);
-        if (fin) {
-          const text = Buffer.concat(fragments).toString("utf8");
-          fragments = [];
-          onText(text, send);
-        }
+        // Continuation frames used to accumulate without a total cap, letting an
+        // unauthenticated Funnel socket grow the server's heap without bound.
+        if (!message.push(payload)) return socket.destroy();
+        if (fin) onText(message.take().toString("utf8"), send);
       }
     }
   });
@@ -1522,16 +1545,42 @@ server.listen(config.port, "127.0.0.1", () =>
 // single-use guest tickets minted by an authenticated trusted token.
 let guestServer = null;
 if (Number.isInteger(config.guestPort) && config.guestPort > 0) {
+  const guestSocketRegistry = createGuestSocketRegistry({
+    maxSockets: config.guestMaxSockets,
+    maxUnauthenticated: config.guestMaxUnauthenticated,
+  });
   guestServer = createServer((req, res) => {
     res.writeHead(req.url === "/health" ? 200 : 404, { "content-type": "text/plain" });
     res.end(req.url === "/health" ? "ok\n" : "not found\n");
   });
   guestServer.on("upgrade", async (req, socket) => {
     const origin = req.headers.origin;
+    // Tailscale Funnel appends the peer address it saw to X-Forwarded-For, so
+    // only the RIGHTMOST entry is trustworthy: everything to its left is
+    // client-supplied and spoofable (it keys the auth rate limiter).
+    const remoteAddress = clientIpFromForwardedFor(
+      req.headers["x-forwarded-for"],
+      req.socket.remoteAddress,
+    );
     const refuse = (code, why) => {
-      console.warn(`guest refused ${code}: ${why} (origin=${origin ?? "-"})`);
+      console.warn(`guest refused ${code}: ${why} (remote=${remoteAddress} origin=${origin ?? "-"})`);
       socket.end(`HTTP/1.1 ${code}\r\nConnection: close\r\n\r\n`);
     };
+    // Charged before the upgrade is accepted: unauthenticated sockets are cheap
+    // to open and each one pins memory until it authenticates or times out.
+    const slot = guestSocketRegistry.admit();
+    if (!slot) return refuse("503 Service Unavailable", "connection cap");
+    socket.once("close", () => slot.release());
+    const idle = createIdleWatch({
+      timeoutMs: config.guestSocketIdleMs,
+      onTimeout: () => {
+        console.warn(
+          `guest socket closed after ${config.guestSocketIdleMs}ms without auth (remote=${remoteAddress})`,
+        );
+        socket.destroy();
+      },
+    });
+    socket.once("close", () => idle.cancel());
     try {
       if (origin && !config.allowOrigins.has(origin)) return refuse("403 Forbidden", "origin");
       const key = req.headers["sec-websocket-key"];
@@ -1549,6 +1598,7 @@ if (Number.isInteger(config.guestPort) && config.guestPort > 0) {
         }
         const st = desktop.status(view.pubkey);
         if (!st.running) return refuse("409 Conflict", "desktop not running");
+        slot.authenticate(); // the single-use ticket is the credential here
         acceptUpgrade(req, socket);
         let set = guestSockets.get(view.tokenId);
         if (!set) {
@@ -1575,10 +1625,8 @@ if (Number.isInteger(config.guestPort) && config.guestPort > 0) {
         "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" +
           `Sec-WebSocket-Accept: ${accept}\r\n\r\n`,
       );
-      const remoteAddress =
-        String(req.headers["x-forwarded-for"] || "").split(",")[0].trim() ||
-        req.socket.remoteAddress ||
-        "unknown";
+      // Public Funnel socket: it must authenticate within the idle window.
+      idle.arm();
       let registeredTokenId = null;
       const session = {
         authenticated: false,
@@ -1588,7 +1636,16 @@ if (Number.isInteger(config.guestPort) && config.guestPort > 0) {
         ownerPubkey: null,
         limits: null,
         remoteAddress,
+        // Called by methods.auth on a successful token exchange: the idle
+        // timeout and unauthenticated accounting stop applying.
+        onAuthenticated() {
+          slot.authenticate();
+          idle.cancel();
+        },
         registerTokenSocket(tokenId) {
+          // A socket that died while the token was being verified must not be
+          // tracked: its close event has already fired.
+          if (socket.destroyed) return;
           registeredTokenId = tokenId;
           let set = guestSockets.get(tokenId);
           if (!set) {

@@ -340,29 +340,67 @@ export function findIdleGuestDesktops({ metas, isRunning, activeViewers, lastAct
   return idle;
 }
 
-/** Simple sliding-window auth failure rate limiter (per remote address). */
-export function createAuthRateLimiter({ maxFailures = 10, windowMs = 60_000 } = {}) {
+/**
+ * Simple sliding-window auth failure rate limiter (per remote address).
+ *
+ * Buckets are capped at `maxKeys` so rotating/spoofed addresses cannot grow the
+ * map without bound: expired buckets are swept periodically and, once over the
+ * cap, the least-recently-touched buckets are evicted (they start empty again,
+ * so an evicted attacker simply gets a fresh window).
+ */
+export function createAuthRateLimiter({
+  maxFailures = 10,
+  windowMs = 60_000,
+  maxKeys = 10_000,
+  now = () => Date.now(),
+  sweepEvery = 256,
+} = {}) {
   const buckets = new Map();
-  function prune(key, now) {
+  const limit = Math.max(1, Number(maxKeys) || 10_000);
+  const sweepInterval = Math.max(1, Number(sweepEvery) || 256);
+  let opsSinceSweep = 0;
+
+  function prune(key, at) {
     const list = buckets.get(key);
     if (!list) return [];
-    const cutoff = now - windowMs;
-    while (list.length && list[0] < cutoff) list.shift();
+    const cutoff = at - windowMs;
+    while (list.length && list[0] <= cutoff) list.shift();
     if (!list.length) buckets.delete(key);
     return list;
   }
+
+  /** Drop expired buckets, then the oldest ones while over the cap. */
+  function sweep(at = now()) {
+    for (const key of [...buckets.keys()]) prune(key, at);
+    while (buckets.size > limit) buckets.delete(buckets.keys().next().value);
+    opsSinceSweep = 0;
+  }
+
+  function maybeSweep(at) {
+    if (++opsSinceSweep >= sweepInterval || buckets.size > limit) sweep(at);
+  }
+
   return {
     isLimited(key) {
-      return prune(key, Date.now()).length >= maxFailures;
+      const at = now();
+      return prune(key, at).length >= maxFailures;
     },
     recordFailure(key) {
-      const now = Date.now();
-      const list = prune(key, now);
-      list.push(now);
+      const at = now();
+      const list = prune(key, at);
+      list.push(at);
+      // Re-insert so the map's insertion order tracks recency for eviction.
+      buckets.delete(key);
       buckets.set(key, list);
+      maybeSweep(at);
     },
     clear(key) {
       buckets.delete(key);
     },
+    /** Current bucket count (tests/ops). */
+    size() {
+      return buckets.size;
+    },
+    sweep,
   };
 }

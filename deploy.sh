@@ -24,6 +24,7 @@ SERVER_FILES=(
   orchestrator.mjs
   control.mjs
   file-lock.mjs
+  ws-security.mjs
 )
 
 atomic_copy() {
