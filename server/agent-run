@@ -21,6 +21,40 @@ unset BUZZ_ACP_RESPOND_TO_ALLOWLIST
 # Parallel conversations: buzz-acp spawns this many acp-proxy worker processes
 # so multiple chats/threads run concurrently instead of queuing behind one turn.
 export BUZZ_ACP_AGENTS="${BUZZ_ACP_AGENTS:-4}"
+# Slots are lazily filled: buzz-acp connects and subscribes first, starts a
+# worker subprocess only when a turn claims a slot, and releases idle workers
+# again after BUZZ_ACP_IDLE_POOL_SLEEP quiet seconds. Without this every slot
+# holds a full `agy acp` / `claude-agent-acp` process from boot (~0.4 GiB each),
+# which is most of a small host's RAM before anyone says anything. Mirrors the
+# sandbox defaults in server/sandbox/docker.mjs.
+# buzz-acp parses BUZZ_ACP_LAZY_POOL as a clap bool that accepts ONLY
+# "true"/"false": any other non-empty value (including "0") is a fatal parse
+# error and an empty value is "a value is required". So normalize here instead
+# of passing the raw opt-out through: a recognized off value unsets both vars
+# (the eager pool), and an unrecognized one is reported and treated the same
+# way rather than crashing the unit.
+_lazy_pool="${BUZZ_ACP_LAZY_POOL:-true}"
+case "${_lazy_pool,,}" in
+  true|1|yes|on)
+    export BUZZ_ACP_LAZY_POOL=true
+    _idle_pool_sleep="${BUZZ_ACP_IDLE_POOL_SLEEP:-300}"
+    if [[ "$_idle_pool_sleep" =~ ^[0-9]+$ ]]; then
+      export BUZZ_ACP_IDLE_POOL_SLEEP="$_idle_pool_sleep"
+    else
+      echo "agent-run: BUZZ_ACP_IDLE_POOL_SLEEP='$_idle_pool_sleep' is not a number; using 300" >&2
+      export BUZZ_ACP_IDLE_POOL_SLEEP=300
+    fi
+    unset _idle_pool_sleep
+    ;;
+  false|0|no|off|"")
+    unset BUZZ_ACP_LAZY_POOL BUZZ_ACP_IDLE_POOL_SLEEP
+    ;;
+  *)
+    echo "agent-run: unrecognized BUZZ_ACP_LAZY_POOL='$_lazy_pool'; running an eager pool" >&2
+    unset BUZZ_ACP_LAZY_POOL BUZZ_ACP_IDLE_POOL_SLEEP
+    ;;
+esac
+unset _lazy_pool
 # Publish turn activity (tool calls, steps) to the owner, encrypted, as kind
 # 24200 observer frames: Buzz shows them like a local agent's activity.
 export BUZZ_ACP_RELAY_OBSERVER="${BUZZ_ACP_RELAY_OBSERVER:-true}"

@@ -10,7 +10,15 @@ ExecStart=%h/.local/lib/buzz-host/agent-run %i
 Restart=always
 RestartSec=10
 RestartPreventExitStatus=78
+# A clean `systemctl --user stop` (or host shutdown) SIGTERMs agent-run, whose
+# exit status is then 128+15=143. Without this the unit is recorded as
+# `Active: failed` even though it stopped exactly as asked.
+SuccessExitStatus=143
 UMask=0077
+# MemoryMax is the hard cap the kernel enforces by OOM-killing the newest
+# process; MemoryHigh is the soft one that starts reclaim/throttling first so a
+# wedged agent slows down instead of being killed mid-turn.
+MemoryHigh=2G
 MemoryMax=4G
 
 [Install]
