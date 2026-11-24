@@ -7,13 +7,25 @@ import {
   storedToken,
   storedUrl,
 } from "./config.js";
+import { formatInviteMessage, sendInviteDm } from "./invite.js";
 
-export function createServerCard({ React, client, uiKit }) {
+export function createServerCard({ React, client, uiKit, Btn, relay }) {
   const { h, Row, Text, Note } = uiKit;
 
   function GuestInvites({ publicGuestUrl }) {
+    const relaySnap = React.useSyncExternalStore(
+      (onStoreChange) => (relay?.subscribe ? relay.subscribe(onStoreChange) : () => {}),
+      () => relay?.snapshot?.() ?? { status: "disconnected" },
+    );
+    const session = relaySnap?.status === "ready" ? relaySnap.session : undefined;
+    const dmAvailable = Boolean(session?.directMessages?.available && session?.messages?.send);
+
     const [tokens, setTokens] = React.useState([]);
     const [loading, setLoading] = React.useState(true);
+    const [memberQuery, setMemberQuery] = React.useState("");
+    const [members, setMembers] = React.useState([]);
+    const [searchingMembers, setSearchingMembers] = React.useState(false);
+    const [selectedMember, setSelectedMember] = React.useState(null);
     const [label, setLabel] = React.useState("");
     const [ownerPubkey, setOwnerPubkey] = React.useState("");
     const [maxAgents, setMaxAgents] = React.useState("2");
@@ -22,6 +34,7 @@ export function createServerCard({ React, client, uiKit }) {
     const [busy, setBusy] = React.useState(false);
     const [error, setError] = React.useState("");
     const [created, setCreated] = React.useState(null);
+    const [dmSentTo, setDmSentTo] = React.useState("");
     const [copied, setCopied] = React.useState(false);
 
     const refresh = async () => {
@@ -40,27 +53,100 @@ export function createServerCard({ React, client, uiKit }) {
       void refresh();
     }, []);
 
-    const createInvite = async () => {
+    // Load/search human community members for 1-click DM invites.
+    React.useEffect(() => {
+      if (!dmAvailable || !session?.directMessages?.people) {
+        setMembers([]);
+        return undefined;
+      }
+      const controller = new AbortController();
+      const timer = setTimeout(() => {
+        setSearchingMembers(true);
+        session.directMessages
+          .people(memberQuery.trim(), 1, controller.signal)
+          .then((res) => {
+            if (controller.signal.aborted) return;
+            const humans = (Array.isArray(res?.people) ? res.people : []).filter((p) => p?.pubkey && !p.isAgent);
+            setMembers(humans);
+          })
+          .catch(() => {
+            if (!controller.signal.aborted) setMembers([]);
+          })
+          .finally(() => {
+            if (!controller.signal.aborted) setSearchingMembers(false);
+          });
+      }, memberQuery.trim() ? 180 : 0);
+      return () => {
+        clearTimeout(timer);
+        controller.abort();
+      };
+    }, [dmAvailable, session, memberQuery]);
+
+    const selectMember = (person) => {
+      setSelectedMember(person);
+      setLabel(person.name || person.username || person.pubkey.slice(0, 8));
+      setOwnerPubkey(person.pubkey);
+      setError("");
+    };
+
+    const clearMember = () => {
+      setSelectedMember(null);
+      setOwnerPubkey("");
+    };
+
+    const createInvite = async ({ sendDm = false } = {}) => {
       const cleanLabel = label.trim();
       if (!cleanLabel) {
-        setError("Enter a friend's name or label first.");
+        setError("Enter a friend's name or pick a Buzz member first.");
+        return;
+      }
+      if (sendDm && !selectedMember?.pubkey) {
+        setError("Pick a Buzz member first to send an in-app invite.");
+        return;
+      }
+      if (sendDm && !publicGuestUrl) {
+        setError("Guest endpoint (publicGuestUrl) is not configured on this buzz-host server.");
         return;
       }
       setBusy(true);
       setError("");
       setCreated(null);
+      setDmSentTo("");
       setCopied(false);
       try {
+        const cleanPubkey = (selectedMember?.pubkey || ownerPubkey).trim();
         const res = await client.call("tokens.create", {
           label: cleanLabel,
-          ...(ownerPubkey.trim() ? { ownerPubkey: ownerPubkey.trim() } : {}),
+          ...(cleanPubkey ? { ownerPubkey: cleanPubkey } : {}),
           maxAgents: Number(maxAgents) || 2,
           maxConcurrency: Number(maxConcurrency) || 2,
           allowHostDesktop,
         });
         setCreated(res);
+        if (sendDm && session) {
+          const inviteMsg = formatInviteMessage({
+            url: publicGuestUrl,
+            token: res.token,
+            label: res.record?.label || cleanLabel,
+            ownerPubkey: selectedMember.pubkey,
+          });
+          const controller = new AbortController();
+          const timeout = setTimeout(() => controller.abort(), 20000);
+          try {
+            await sendInviteDm(session, selectedMember.pubkey, inviteMsg, controller.signal);
+            setDmSentTo(selectedMember.name || selectedMember.username || cleanLabel);
+          } catch (dmErr) {
+            setError(
+              `Invite token was created, but DM delivery failed (${String(dmErr?.message ?? dmErr)}). Copy the invite link below to share manually.`,
+            );
+          } finally {
+            clearTimeout(timeout);
+          }
+        }
         setLabel("");
         setOwnerPubkey("");
+        setSelectedMember(null);
+        setMemberQuery("");
         setAllowHostDesktop(false);
         await refresh();
       } catch (e) {
@@ -110,10 +196,116 @@ export function createServerCard({ React, client, uiKit }) {
       h(
         Note,
         null,
-        `Create a personal invite link so a friend can host sandboxed agents on this server.${
+        `Send a one-click Buzz invite or create a personal invite link so a friend can host sandboxed agents on this server.${
           publicGuestUrl ? ` Guest endpoint: ${publicGuestUrl}` : ""
         }`,
       ),
+      dmAvailable &&
+        h(
+          "div",
+          {
+            style: {
+              display: "grid",
+              gap: "var(--space-2)",
+              padding: "var(--space-3)",
+              borderRadius: "var(--radius-control)",
+              background: "var(--surface-inset)",
+              border: "1px solid var(--border-standard)",
+            },
+          },
+          h(
+            Row,
+            {
+              label: "Send directly to a Buzz member",
+              hint: "They'll get an automatic Accept & Connect popup right in Buzz — no copy-paste needed.",
+            },
+            selectedMember
+              ? h(
+                  "div",
+                  {
+                    style: {
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "space-between",
+                      gap: "var(--space-2)",
+                      padding: "var(--space-2)",
+                      borderRadius: "var(--radius-control)",
+                      background: "var(--surface-panel, var(--surface-elevated, transparent))",
+                      border: "1px solid var(--border-standard)",
+                    },
+                  },
+                  h(
+                    "div",
+                    { style: { display: "grid", gap: "2px", minWidth: 0 } },
+                    h("strong", null, selectedMember.name || selectedMember.username || selectedMember.pubkey.slice(0, 10)),
+                    h(
+                      Note,
+                      null,
+                      `${selectedMember.username ? `@${selectedMember.username} · ` : ""}${selectedMember.pubkey.slice(0, 12)}… (token pre-bound to this account)`,
+                    ),
+                  ),
+                  h(
+                    "button",
+                    { type: "button", disabled: busy, onClick: clearMember },
+                    "Change",
+                  ),
+                )
+              : h(
+                  "div",
+                  { style: { display: "grid", gap: "var(--space-2)" } },
+                  h(Text, {
+                    value: memberQuery,
+                    disabled: busy,
+                    placeholder: "Search community members (e.g. Anu)…",
+                    onChange: (e) => setMemberQuery(e.target.value),
+                  }),
+                  searchingMembers
+                    ? h(Note, null, "Searching members…")
+                    : members.length === 0
+                      ? h(Note, null, memberQuery.trim() ? "No matching members found." : "No other community members loaded yet.")
+                      : h(
+                          "div",
+                          {
+                            style: {
+                              display: "flex",
+                              flexWrap: "wrap",
+                              gap: "var(--space-1, 6px)",
+                              maxHeight: "120px",
+                              overflowY: "auto",
+                            },
+                          },
+                          ...members.slice(0, 12).map((person) =>
+                            h(
+                              "button",
+                              {
+                                key: person.pubkey,
+                                type: "button",
+                                disabled: busy,
+                                onClick: () => selectMember(person),
+                                style: {
+                                  display: "inline-flex",
+                                  alignItems: "center",
+                                  gap: "6px",
+                                  padding: "4px 10px",
+                                  borderRadius: "999px",
+                                  border: "1px solid var(--border-standard)",
+                                  background: "var(--surface-panel, transparent)",
+                                  color: "var(--text-standard)",
+                                  cursor: busy ? "default" : "pointer",
+                                  font: "inherit",
+                                  fontSize: "0.85rem",
+                                },
+                              },
+                              person.name || person.username || `${person.pubkey.slice(0, 8)}…`,
+                              person.username && person.name && person.username !== person.name
+                                ? h("span", { className: "text-secondary" }, `@${person.username}`)
+                                : null,
+                            ),
+                          ),
+                        ),
+                ),
+          ),
+        ),
       h(
         "div",
         { style: { display: "grid", gap: "var(--space-2)", gridTemplateColumns: "minmax(0, 1fr) minmax(0, 1fr)" } },
@@ -129,10 +321,15 @@ export function createServerCard({ React, client, uiKit }) {
         ),
         h(
           Row,
-          { label: "Owner pubkey (optional)", hint: "Leave blank to bind automatically on their first agent." },
+          {
+            label: "Owner pubkey (optional)",
+            hint: selectedMember
+              ? "Auto-filled from selected Buzz member."
+              : "Leave blank to bind automatically on their first agent.",
+          },
           h(Text, {
             value: ownerPubkey,
-            disabled: busy,
+            disabled: busy || Boolean(selectedMember),
             placeholder: "64-char hex pubkey (optional)",
             onChange: (e) => setOwnerPubkey(e.target.value),
           }),
@@ -196,11 +393,23 @@ export function createServerCard({ React, client, uiKit }) {
       ),
       h(
         "div",
-        { style: { display: "flex", gap: "var(--space-2)" } },
+        { style: { display: "flex", gap: "var(--space-2)", flexWrap: "wrap" } },
+        selectedMember && dmAvailable &&
+          (Btn
+            ? h(
+                Btn,
+                { variant: "primary", disabled: busy, onClick: () => void createInvite({ sendDm: true }) },
+                busy ? "Sending…" : `Send invite to ${selectedMember.name || selectedMember.username || label || "member"}`,
+              )
+            : h(
+                "button",
+                { type: "button", disabled: busy, onClick: () => void createInvite({ sendDm: true }) },
+                busy ? "Sending…" : `Send invite to ${selectedMember.name || selectedMember.username || label || "member"}`,
+              )),
         h(
           "button",
-          { type: "button", disabled: busy, onClick: () => void createInvite() },
-          busy ? "Working…" : "Create guest invite",
+          { type: "button", disabled: busy, onClick: () => void createInvite({ sendDm: false }) },
+          busy ? "Working…" : selectedMember ? "Create link only" : "Create guest invite",
         ),
       ),
       error && h(Note, { tone: "error" }, error),
@@ -220,7 +429,9 @@ export function createServerCard({ React, client, uiKit }) {
           h(
             Note,
             null,
-            `Invite created for ${created.record.label}. Copy and send it now — the secret token is shown only once.`,
+            dmSentTo
+              ? `Invite sent to ${dmSentTo} in Buzz! An Accept & Connect popup will appear on their Buzz app (and the DM also has an Accept button). Fallback link below if needed:`
+              : `Invite created for ${created.record.label}. Copy and send it now — the secret token is shown only once.`,
           ),
           h(Text, {
             readOnly: true,

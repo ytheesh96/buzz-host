@@ -459,6 +459,76 @@ function ui(React) {
 		control
 	};
 }
+const ICONS = {
+	chat: ["M3 20l1.3 -3.9c-2.324 -3.437 -1.426 -7.872 2.1 -10.374c3.526 -2.501 8.59 -2.296 11.845 .48c3.255 2.777 3.695 7.266 1.029 10.501c-2.666 3.235 -7.615 4.215 -11.574 2.293l-4.7 1"],
+	clock: [
+		"M3 12a9 9 0 1 0 18 0a9 9 0 1 0 -18 0",
+		"M12 12l3 2",
+		"M12 7v5"
+	],
+	hash: [
+		"M5 9l14 0",
+		"M5 15l14 0",
+		"M11 4l-4 16",
+		"M17 4l-4 16"
+	],
+	lock: [
+		"M5 13a2 2 0 0 1 2 -2h10a2 2 0 0 1 2 2v6a2 2 0 0 1 -2 2h-10a2 2 0 0 1 -2 -2v-6",
+		"M11 16a1 1 0 1 0 2 0a1 1 0 0 0 -2 0",
+		"M8 11v-4a4 4 0 1 1 8 0v4"
+	],
+	bolt: ["M13 3l0 7l6 0l-8 11l0 -7l-6 0l8 -11"],
+	caret: ["M9 6l6 6l-6 6"],
+	gear: ["M10.325 4.317c.426 -1.756 2.924 -1.756 3.35 0a1.724 1.724 0 0 0 2.573 1.066c1.543 -.94 3.31 .826 2.37 2.37a1.724 1.724 0 0 0 1.065 2.572c1.756 .426 1.756 2.924 0 3.35a1.724 1.724 0 0 0 -1.066 2.573c.94 1.543 -.826 3.31 -2.37 2.37a1.724 1.724 0 0 0 -2.572 1.065c-.426 1.756 -2.924 1.756 -3.35 0a1.724 1.724 0 0 0 -2.573 -1.066c-1.543 .94 -3.31 -.826 -2.37 -2.37a1.724 1.724 0 0 0 -1.065 -2.572c-1.756 -.426 -1.756 -2.924 0 -3.35a1.724 1.724 0 0 0 1.066 -2.573c-.94 -1.543 .826 -3.31 2.37 -2.37c1 .608 2.296 .07 2.572 -1.065", "M9 12a3 3 0 1 0 6 0a3 3 0 0 0 -6 0"],
+	circle: ["M3 12a9 9 0 1 0 18 0a9 9 0 1 0 -18 0"],
+	x: ["M18 6l-12 12", "M6 6l12 12"],
+	monitor: [
+		"M3 5a1 1 0 0 1 1 -1h16a1 1 0 0 1 1 1v10a1 1 0 0 1 -1 1h-16a1 1 0 0 1 -1 -1v-10",
+		"M7 20h10",
+		"M9 16v4",
+		"M15 16v4"
+	],
+	sidebar: ["M4 6a2 2 0 0 1 2 -2h12a2 2 0 0 1 2 2v12a2 2 0 0 1 -2 2h-12a2 2 0 0 1 -2 -2z", "M9 4l0 16"],
+	sidebarRight: ["M4 6a2 2 0 0 1 2 -2h12a2 2 0 0 1 2 2v12a2 2 0 0 1 -2 2h-12a2 2 0 0 1 -2 -2z", "M15 4l0 16"],
+	refresh: ["M20 11a8.1 8.1 0 0 0 -15.5 -2m-.5 -4v4h4", "M4 13a8.1 8.1 0 0 0 15.5 2m.5 4v-4h-4"]
+};
+function createBuzzPrimitives(React) {
+	const h = React.createElement;
+	/** A Tabler outline icon, as Buzz's icon set renders it (size in px → rem). */
+	const Icon = ({ name, size = 16, filled = false, style, className }) => h("svg", {
+		xmlns: "http://www.w3.org/2000/svg",
+		width: `${size / 16}rem`,
+		height: `${size / 16}rem`,
+		viewBox: "0 0 24 24",
+		fill: filled ? "currentColor" : "none",
+		stroke: filled ? "none" : "currentColor",
+		strokeWidth: filled ? 0 : 2,
+		strokeLinecap: "round",
+		strokeLinejoin: "round",
+		"aria-hidden": "true",
+		style,
+		className
+	}, ...ICONS[name].map((d, i) => h("path", {
+		key: i,
+		d
+	})));
+	/** Buzz's Button: Base UI button with the design system's data attributes. */
+	const Btn = ({ variant = "subtle", size = "md", children, style, ...props }) => h("button", {
+		type: "button",
+		"data-buzz-ui": "",
+		className: "buzz-button",
+		"data-variant": variant,
+		"data-size": size,
+		"data-button-shape": "capsule",
+		"data-disabled": props.disabled ? "" : void 0,
+		style,
+		...props
+	}, h("span", { className: "buzz-button-label" }, children));
+	return {
+		Icon,
+		Btn
+	};
+}
 function useModels(React, client, runtime, profile = "") {
 	const key = `${runtime}\n${runtime === "hermes" ? profile : ""}`;
 	const [state, setState] = React.useState({
@@ -2175,12 +2245,586 @@ function createType({ React, client, ctx, uiKit, invalidateCatalog, ActivityTab,
 }
 
 //#endregion
+//#region plugin/src/invite.js
+const INVITE_FENCE = "buzz-host-invite";
+const INVITE_STATE_KEY = "local.buzz-host.invite-state.v1";
+const INVITE_MAX_AGE_SECS = 604800;
+const HEX64 = /^[0-9a-f]{64}$/i;
+const TOKEN_RE = /^bhg_[0-9a-fA-F]{16,}$/;
+const FENCE_RE = /```buzz-host-invite[ \t]*\r?\n([\s\S]*?)\r?\n```/;
+const MAX_STORED_DECISIONS = 100;
+const decisionListeners = /* @__PURE__ */ new Set();
+function notifyDecisionListeners() {
+	for (const fn of [...decisionListeners]) try {
+		fn();
+	} catch {}
+}
+function subscribeInviteDecisions(listener) {
+	decisionListeners.add(listener);
+	return () => decisionListeners.delete(listener);
+}
+function readDecisionMap() {
+	try {
+		const raw = localStorage.getItem(INVITE_STATE_KEY);
+		if (!raw) return {};
+		const parsed = JSON.parse(raw);
+		return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+	} catch {
+		return {};
+	}
+}
+function writeDecisionMap(map) {
+	try {
+		const entries = Object.entries(map).sort((a, b) => (Number(b[1]?.at) || 0) - (Number(a[1]?.at) || 0)).slice(0, MAX_STORED_DECISIONS);
+		localStorage.setItem(INVITE_STATE_KEY, JSON.stringify(Object.fromEntries(entries)));
+	} catch {}
+}
+function getInviteDecision(messageId) {
+	if (!messageId) return void 0;
+	const entry = readDecisionMap()[messageId];
+	const status = typeof entry === "string" ? entry : entry?.status;
+	return status === "accepted" || status === "declined" ? status : void 0;
+}
+function setInviteDecision(messageId, status) {
+	if (!messageId || status !== "accepted" && status !== "declined") return;
+	const map = readDecisionMap();
+	map[messageId] = {
+		status,
+		at: Date.now()
+	};
+	writeDecisionMap(map);
+	notifyDecisionListeners();
+}
+function extractHost(url) {
+	try {
+		const parsed = new URL(String(url ?? "").trim());
+		if (parsed.protocol !== "wss:") return "";
+		return parsed.host;
+	} catch {
+		return "";
+	}
+}
+function normalizeWsUrl(raw) {
+	const clean = String(raw ?? "").trim().replace(/#.*$/, "");
+	if (!clean) return "";
+	try {
+		const parsed = new URL(clean);
+		if (parsed.protocol !== "wss:") return "";
+		return parsed.toString().replace(/\/+$/, "");
+	} catch {
+		return "";
+	}
+}
+function formatInviteMessage({ url, token, label, ownerPubkey }) {
+	const cleanUrl = normalizeWsUrl(url);
+	if (!cleanUrl) throw new Error("Guest invite requires a valid wss:// server URL.");
+	const cleanToken = String(token ?? "").trim();
+	if (!TOKEN_RE.test(cleanToken)) throw new Error("Guest invite requires a valid access token.");
+	const host = extractHost(cleanUrl);
+	const payload = {
+		v: 1,
+		url: cleanUrl,
+		token: cleanToken,
+		host
+	};
+	const cleanLabel = String(label ?? "").trim().slice(0, 80);
+	if (cleanLabel) payload.label = cleanLabel;
+	const cleanPubkey = String(ownerPubkey ?? "").trim().toLowerCase();
+	if (cleanPubkey) {
+		if (!HEX64.test(cleanPubkey)) throw new Error("ownerPubkey must be a 64-character hex pubkey.");
+		payload.ownerPubkey = cleanPubkey;
+	}
+	return [
+		`Remote Agents invite — connect to hosted agents on \`${host}\``,
+		"",
+		`\`\`\`${INVITE_FENCE}`,
+		JSON.stringify(payload),
+		"```"
+	].join("\n");
+}
+function parseInviteMessage(content) {
+	if (typeof content !== "string" || !content.includes("buzz-host-invite")) return null;
+	const match = FENCE_RE.exec(content);
+	if (!match) return null;
+	let data;
+	try {
+		data = JSON.parse(match[1].trim());
+	} catch {
+		return null;
+	}
+	if (!data || typeof data !== "object" || data.v !== 1) return null;
+	const url = normalizeWsUrl(data.url);
+	if (!url) return null;
+	const token = typeof data.token === "string" ? data.token.trim() : "";
+	if (!TOKEN_RE.test(token)) return null;
+	let ownerPubkey;
+	if (data.ownerPubkey !== void 0 && data.ownerPubkey !== null && data.ownerPubkey !== "") {
+		if (typeof data.ownerPubkey !== "string" || !HEX64.test(data.ownerPubkey.trim())) return null;
+		ownerPubkey = data.ownerPubkey.trim().toLowerCase();
+	}
+	const label = typeof data.label === "string" ? data.label.trim().slice(0, 80) : "";
+	return {
+		v: 1,
+		url,
+		token,
+		host: extractHost(url),
+		...label ? { label } : {},
+		...ownerPubkey ? { ownerPubkey } : {}
+	};
+}
+function isOneToOneDm(channel) {
+	return Boolean(channel && channel.channelType === "dm" && !channel.archived && Array.isArray(channel.participants) && channel.participants.length === 1);
+}
+function isInviteForViewer(invite, viewer, authorId) {
+	if (!invite || typeof viewer !== "string" || !viewer) return false;
+	const me = viewer.toLowerCase();
+	if (typeof authorId === "string" && authorId.toLowerCase() === me) return false;
+	if (invite.ownerPubkey && invite.ownerPubkey.toLowerCase() !== me) return false;
+	return true;
+}
+function isAlreadyConfigured(invite, currentUrl = storedUrl(), currentToken = storedToken()) {
+	if (!invite) return false;
+	return normalizeWsUrl(currentUrl) === normalizeWsUrl(invite.url) && String(currentToken ?? "").trim() === invite.token;
+}
+async function sendInviteDm(session, recipientPubkey, inviteMessage, signal) {
+	const cleanKey = String(recipientPubkey ?? "").trim().toLowerCase();
+	if (!HEX64.test(cleanKey)) throw new Error("Choose a valid community member.");
+	if (!session?.directMessages?.open || !session?.messages?.send) throw new Error("Direct messages are unavailable on this connection.");
+	const activeSignal = signal ?? new AbortController().signal;
+	const channelId = await session.directMessages.open([cleanKey], activeSignal);
+	const eventId = session.messages.send(channelId, inviteMessage);
+	if (eventId && typeof session.directMessages.delivered === "function") await session.directMessages.delivered(eventId, channelId, activeSignal);
+	return {
+		channelId,
+		eventId
+	};
+}
+async function acceptInvite(client, invite, messageId) {
+	if (!invite) throw new Error("Invalid invite.");
+	const prevUrl = storedUrl();
+	const prevToken = storedToken();
+	setStoredUrl(invite.url);
+	setStoredToken(invite.token);
+	try {
+		await client.reconnect();
+		const hello = await client.call("hello");
+		if (messageId) setInviteDecision(messageId, "accepted");
+		return { hello };
+	} catch (error) {
+		setStoredUrl(prevUrl);
+		setStoredToken(prevToken);
+		client.reconnect().catch(() => {});
+		throw error;
+	}
+}
+function findChannel(session, channelId) {
+	if (!session?.channels || !channelId) return void 0;
+	const listed = session.channels.list?.()?.channels;
+	if (Array.isArray(listed)) {
+		const found = listed.find((c) => c.id === channelId);
+		if (found) return found;
+	}
+	return session.channels.get?.(channelId);
+}
+function senderDisplayName(session, pubkey) {
+	if (!pubkey) return "A community member";
+	const profile = session?.profiles?.snapshot?.()?.get(pubkey);
+	if (profile?.name) return profile.name;
+	if (profile?.username) return profile.username;
+	return `${pubkey.slice(0, 8)}…`;
+}
+function createInviteFeature({ React, client, relay, uiKit, Btn }) {
+	const { h, Note } = uiKit;
+	function useRelaySnapshot() {
+		return React.useSyncExternalStore((onStoreChange) => relay?.subscribe ? relay.subscribe(onStoreChange) : () => {}, () => relay?.snapshot?.() ?? { status: "disconnected" });
+	}
+	function useDecision(messageId) {
+		return React.useSyncExternalStore(subscribeInviteDecisions, () => getInviteDecision(messageId));
+	}
+	function useProfileName(session, pubkey) {
+		const [, setTick] = React.useState(0);
+		React.useEffect(() => {
+			if (!session?.profiles || !pubkey) return void 0;
+			session.profiles.ensure?.([pubkey], "background")?.catch?.(() => {});
+			return session.profiles.subscribe?.(() => setTick((t) => t + 1));
+		}, [session, pubkey]);
+		return senderDisplayName(session, pubkey);
+	}
+	function InviteOverlay() {
+		const relaySnap = useRelaySnapshot();
+		const session = relaySnap?.status === "ready" ? relaySnap.session : void 0;
+		const viewer = relaySnap?.status === "ready" ? relaySnap.viewer : void 0;
+		const [queue, setQueue] = React.useState([]);
+		const [busy, setBusy] = React.useState(false);
+		const [error, setError] = React.useState("");
+		const [connected, setConnected] = React.useState(null);
+		const dismissedThisRunRef = React.useRef(/* @__PURE__ */ new Set());
+		const enqueue = React.useCallback((entry) => {
+			if (!entry?.messageId || dismissedThisRunRef.current.has(entry.messageId)) return;
+			if (getInviteDecision(entry.messageId)) return;
+			if (isAlreadyConfigured(entry.invite)) return;
+			setQueue((prev) => {
+				if (prev.some((item) => item.messageId === entry.messageId)) return prev;
+				return [entry, ...prev].sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+			});
+		}, []);
+		React.useEffect(() => subscribeInviteDecisions(() => {
+			setQueue((prev) => prev.filter((item) => !getInviteDecision(item.messageId)));
+		}), []);
+		React.useEffect(() => {
+			if (!session || !viewer) return void 0;
+			let disposed = false;
+			const awaitingChannel = /* @__PURE__ */ new Map();
+			const windowStops = /* @__PURE__ */ new Set();
+			const tryAdmit = (channelId, messageId, authorId, content, createdAt) => {
+				const invite = parseInviteMessage(content);
+				if (!invite || !isInviteForViewer(invite, viewer, authorId)) return;
+				if (getInviteDecision(messageId) || isAlreadyConfigured(invite)) return;
+				const ch = findChannel(session, channelId);
+				if (ch) {
+					if (isOneToOneDm(ch)) enqueue({
+						channelId,
+						messageId,
+						authorId,
+						invite,
+						createdAt: createdAt || 0
+					});
+					return;
+				}
+				awaitingChannel.set(messageId, {
+					channelId,
+					messageId,
+					authorId,
+					invite,
+					createdAt: createdAt || 0
+				});
+				session.channels?.ensureList?.();
+			};
+			const flushAwaiting = () => {
+				if (disposed || awaitingChannel.size === 0) return;
+				for (const [id, item] of [...awaitingChannel.entries()]) {
+					const ch = findChannel(session, item.channelId);
+					if (!ch) continue;
+					awaitingChannel.delete(id);
+					if (isOneToOneDm(ch)) enqueue(item);
+				}
+			};
+			const stopIncoming = session.subscribeIncoming?.((messages) => {
+				if (disposed || !Array.isArray(messages)) return;
+				for (const msg of messages) {
+					if (!msg?.channelId || !msg?.messageId) continue;
+					tryAdmit(msg.channelId, msg.messageId, msg.authorId, msg.previewContent, msg.createdAt);
+				}
+			});
+			const scannedDms = /* @__PURE__ */ new Set();
+			const scanDmWindow = (channelId) => {
+				if (disposed || scannedDms.has(channelId) || !session.channels?.window) return;
+				scannedDms.add(channelId);
+				const nowSecs = Math.floor(Date.now() / 1e3);
+				const inspect = () => {
+					if (disposed) return true;
+					const win = session.channels.window(channelId);
+					if (!win || win.status === "idle" || win.status === "loading") return false;
+					if (win.status === "ready" && Array.isArray(win.rows)) {
+						const recentInvites = [];
+						for (const row of win.rows) {
+							if (!row?.id || !row?.content) continue;
+							if (row.createdAt && nowSecs - row.createdAt > 604800) continue;
+							const invite = parseInviteMessage(row.content);
+							if (!invite || !isInviteForViewer(invite, viewer, row.authorId)) continue;
+							recentInvites.push({
+								channelId,
+								messageId: row.id,
+								authorId: row.authorId,
+								invite,
+								createdAt: row.createdAt || 0
+							});
+						}
+						recentInvites.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+						const newest = recentInvites[0];
+						if (newest && !getInviteDecision(newest.messageId) && !isAlreadyConfigured(newest.invite)) enqueue(newest);
+					}
+					return true;
+				};
+				session.channels.ensure?.(channelId);
+				if (inspect()) return;
+				let stopWin;
+				const timer = setTimeout(() => {
+					stopWin?.();
+					windowStops.delete(cleanup);
+				}, 1e4);
+				const cleanup = () => {
+					clearTimeout(timer);
+					stopWin?.();
+					windowStops.delete(cleanup);
+				};
+				stopWin = session.channels.subscribeWindow?.(channelId, () => {
+					if (inspect()) cleanup();
+				});
+				windowStops.add(cleanup);
+			};
+			const scanDms = () => {
+				if (disposed || !session.channels?.list) return;
+				flushAwaiting();
+				const list = session.channels.list();
+				if (list?.status !== "ready" || !Array.isArray(list.channels)) return;
+				const nowSecs = Math.floor(Date.now() / 1e3);
+				const hasConfiguredServer = Boolean(storedUrl().trim());
+				const dms = list.channels.filter((ch) => isOneToOneDm(ch)).filter((ch) => {
+					if ((session.unread?.snapshot?.({
+						kind: "channel",
+						channelId: ch.id
+					})?.observedCount ?? 0) > 0) return true;
+					if (hasConfiguredServer) return false;
+					return !ch.lastActivityAt || nowSecs - ch.lastActivityAt <= 604800;
+				}).sort((a, b) => (b.lastActivityAt || 0) - (a.lastActivityAt || 0)).slice(0, 5);
+				for (const dm of dms) scanDmWindow(dm.id);
+			};
+			const stopList = session.channels?.subscribeList?.(scanDms);
+			session.channels?.ensureList?.();
+			scanDms();
+			return () => {
+				disposed = true;
+				stopIncoming?.();
+				stopList?.();
+				for (const cleanup of [...windowStops]) cleanup();
+				windowStops.clear();
+			};
+		}, [
+			session,
+			viewer,
+			enqueue
+		]);
+		const active = queue[0];
+		const senderName = useProfileName(session, active?.authorId);
+		const dismissForNow = React.useCallback(() => {
+			if (busy) return;
+			if (connected) {
+				setConnected(null);
+				setError("");
+				return;
+			}
+			if (!active) return;
+			dismissedThisRunRef.current.add(active.messageId);
+			setError("");
+			setQueue((prev) => prev.filter((item) => item.messageId !== active.messageId));
+		}, [
+			active,
+			busy,
+			connected
+		]);
+		React.useEffect(() => {
+			if (!active && !connected) return void 0;
+			const onKey = (e) => {
+				if (e.key === "Escape") dismissForNow();
+			};
+			window.addEventListener("keydown", onKey);
+			return () => window.removeEventListener("keydown", onKey);
+		}, [
+			active,
+			connected,
+			dismissForNow
+		]);
+		if (!active && !connected) return null;
+		const handleAccept = async () => {
+			if (!active || busy) return;
+			setBusy(true);
+			setError("");
+			try {
+				const { hello } = await acceptInvite(client, active.invite, active.messageId);
+				setQueue((prev) => prev.filter((item) => item.messageId !== active.messageId));
+				setConnected({
+					host: active.invite.host,
+					label: hello?.label || active.invite.label || ""
+				});
+			} catch (e) {
+				setError(String(e?.message ?? e));
+			} finally {
+				setBusy(false);
+			}
+		};
+		const handleDecline = () => {
+			if (!active || busy) return;
+			setInviteDecision(active.messageId, "declined");
+			setError("");
+			setQueue((prev) => prev.filter((item) => item.messageId !== active.messageId));
+		};
+		const existingUrl = storedUrl().trim();
+		const replacingExisting = Boolean(active && existingUrl && normalizeWsUrl(existingUrl) !== normalizeWsUrl(active.invite.url));
+		return h("div", {
+			role: "dialog",
+			"aria-modal": "true",
+			"aria-label": "Remote Agents invite",
+			style: {
+				position: "fixed",
+				inset: 0,
+				zIndex: 9999,
+				display: "flex",
+				alignItems: "center",
+				justifyContent: "center",
+				padding: "var(--space-4, 16px)",
+				background: "rgba(0, 0, 0, 0.52)",
+				backdropFilter: "blur(2px)"
+			},
+			onClick: (e) => {
+				if (e.target === e.currentTarget) dismissForNow();
+			}
+		}, h("div", { style: {
+			width: "min(440px, 100%)",
+			display: "grid",
+			gap: "var(--space-3, 12px)",
+			padding: "var(--space-5, 20px)",
+			borderRadius: "var(--radius-modal, 14px)",
+			background: "var(--surface-elevated, var(--surface-panel, #1e1e22))",
+			color: "var(--text-standard)",
+			border: "1px solid var(--border-standard)",
+			boxShadow: "0 18px 48px rgba(0, 0, 0, 0.35)"
+		} }, h("div", { style: {
+			display: "flex",
+			alignItems: "center",
+			justifyContent: "space-between",
+			gap: "var(--space-2)"
+		} }, h("strong", { style: { fontSize: "1.05rem" } }, connected ? "Connected to Remote Agents" : "Remote Agents invite"), h("button", {
+			type: "button",
+			"aria-label": "Close",
+			disabled: busy,
+			onClick: dismissForNow,
+			style: {
+				background: "transparent",
+				border: "none",
+				color: "var(--text-secondary)",
+				cursor: busy ? "default" : "pointer",
+				fontSize: "1.1rem",
+				lineHeight: 1,
+				padding: "4px 6px"
+			}
+		}, "×")), connected ? h(React.Fragment, null, h(Note, null, `Connected to ${connected.host}${connected.label ? ` as ${connected.label}` : ""}. You can now create hosted agents in Agents → New agent.`), h("div", { style: {
+			display: "flex",
+			justifyContent: "flex-end",
+			gap: "var(--space-2)"
+		} }, h(Btn, {
+			variant: "primary",
+			onClick: dismissForNow
+		}, "Done"))) : h(React.Fragment, null, h("p", { style: {
+			margin: 0,
+			lineHeight: 1.5
+		} }, h("strong", null, senderName), " invited you to host agents on ", h("code", null, active.invite.host), "."), h(Note, null, "Clicking Accept & Connect configures Remote Agents automatically so you can create agents in Agents → New agent."), replacingExisting && h(Note, null, `Note: this will replace your current Remote Agents server (${extractHost(existingUrl) || existingUrl}).`), error && h(Note, { tone: "error" }, error), h("div", { style: {
+			display: "flex",
+			justifyContent: "flex-end",
+			gap: "var(--space-2)",
+			marginTop: "var(--space-1)"
+		} }, h(Btn, {
+			variant: "subtle",
+			disabled: busy,
+			onClick: handleDecline
+		}, "Decline"), h(Btn, {
+			variant: "primary",
+			disabled: busy,
+			onClick: () => void handleAccept()
+		}, busy ? "Connecting…" : "Accept & Connect")))));
+	}
+	function InviteMessageCard({ message }) {
+		const relaySnap = useRelaySnapshot();
+		const session = relaySnap?.status === "ready" ? relaySnap.session : void 0;
+		const viewer = relaySnap?.status === "ready" ? relaySnap.viewer : void 0;
+		const clientSnap = React.useSyncExternalStore(client.subscribe, client.snapshot);
+		const decision = useDecision(message?.id);
+		const [, setListTick] = React.useState(0);
+		const [busy, setBusy] = React.useState(false);
+		const [error, setError] = React.useState("");
+		const [okNote, setOkNote] = React.useState("");
+		const senderName = useProfileName(session, message?.authorId);
+		React.useEffect(() => {
+			if (!session?.channels?.subscribeList) return void 0;
+			return session.channels.subscribeList(() => setListTick((t) => t + 1));
+		}, [session]);
+		const invite = parseInviteMessage(message?.content);
+		if (!invite) return null;
+		const channel = findChannel(session, message?.channelId);
+		const channelKnown = Boolean(channel);
+		const isDm = isOneToOneDm(channel);
+		const isOwn = Boolean(viewer && message?.authorId && message.authorId.toLowerCase() === viewer.toLowerCase());
+		const wrongRecipient = Boolean(!isOwn && invite.ownerPubkey && viewer && invite.ownerPubkey.toLowerCase() !== viewer.toLowerCase());
+		const configuredNow = isAlreadyConfigured(invite, clientSnap?.url || storedUrl(), storedToken());
+		const handleAccept = async () => {
+			if (busy) return;
+			setBusy(true);
+			setError("");
+			setOkNote("");
+			try {
+				const { hello } = await acceptInvite(client, invite, message.id);
+				setOkNote(`Connected to ${invite.host}${hello?.label ? ` as ${hello.label}` : ""}. Create agents in Agents → New agent.`);
+			} catch (e) {
+				setError(String(e?.message ?? e));
+			} finally {
+				setBusy(false);
+			}
+		};
+		const handleDecline = () => {
+			if (busy) return;
+			setInviteDecision(message.id, "declined");
+			setError("");
+			setOkNote("");
+		};
+		const statusBadge = isOwn ? "Sent" : configuredNow || decision === "accepted" ? "Connected ✓" : decision === "declined" ? "Declined" : "";
+		return h("div", { style: {
+			maxWidth: "420px",
+			display: "grid",
+			gap: "var(--space-2, 8px)",
+			padding: "var(--space-3, 12px)",
+			borderRadius: "var(--radius-control, 10px)",
+			background: "var(--surface-inset)",
+			border: "1px solid var(--border-standard)"
+		} }, h("div", { style: {
+			display: "flex",
+			alignItems: "center",
+			justifyContent: "space-between",
+			gap: "var(--space-2)"
+		} }, h("strong", null, isOwn ? "Remote Agents invite sent" : "Remote Agents invite"), statusBadge && h("span", {
+			className: "text-body-sm text-secondary",
+			style: { fontWeight: 600 }
+		}, statusBadge)), isOwn ? h(Note, null, `Server: ${invite.host}${invite.label ? ` · For ${invite.label}` : ""}. Their Buzz app will prompt them to accept & connect.`) : !channelKnown ? h(Note, null, `Server: ${invite.host} — loading conversation…`) : !isDm ? h(Note, { tone: "error" }, "For safety, Remote Agents invites can only be accepted in a 1:1 direct message.") : wrongRecipient ? h(Note, null, "This invite is bound to a different Buzz account.") : h(React.Fragment, null, h(Note, null, configuredNow ? `Connected to ${invite.host}.` : `${senderName} invited you to host agents on ${invite.host}.`), okNote && h(Note, null, okNote), error && h(Note, { tone: "error" }, error), h("div", { style: {
+			display: "flex",
+			gap: "var(--space-2)",
+			flexWrap: "wrap"
+		} }, configuredNow ? h(Btn, {
+			variant: "subtle",
+			size: "sm",
+			disabled: busy,
+			onClick: () => void handleAccept()
+		}, busy ? "Reconnecting…" : "Reconnect") : h(React.Fragment, null, h(Btn, {
+			variant: "primary",
+			size: "sm",
+			disabled: busy,
+			onClick: () => void handleAccept()
+		}, busy ? "Connecting…" : "Accept & Connect"), decision !== "declined" && h(Btn, {
+			variant: "subtle",
+			size: "sm",
+			disabled: busy,
+			onClick: handleDecline
+		}, "Decline")))));
+	}
+	return {
+		InviteOverlay,
+		InviteMessageCard,
+		matchesInviteMessage: (message) => Boolean(parseInviteMessage(message?.content))
+	};
+}
+
+//#endregion
 //#region plugin/src/server-card.js
-function createServerCard({ React, client, uiKit }) {
+function createServerCard({ React, client, uiKit, Btn, relay }) {
 	const { h, Row, Text, Note } = uiKit;
 	function GuestInvites({ publicGuestUrl }) {
+		const relaySnap = React.useSyncExternalStore((onStoreChange) => relay?.subscribe ? relay.subscribe(onStoreChange) : () => {}, () => relay?.snapshot?.() ?? { status: "disconnected" });
+		const session = relaySnap?.status === "ready" ? relaySnap.session : void 0;
+		const dmAvailable = Boolean(session?.directMessages?.available && session?.messages?.send);
 		const [tokens, setTokens] = React.useState([]);
 		const [loading, setLoading] = React.useState(true);
+		const [memberQuery, setMemberQuery] = React.useState("");
+		const [members, setMembers] = React.useState([]);
+		const [searchingMembers, setSearchingMembers] = React.useState(false);
+		const [selectedMember, setSelectedMember] = React.useState(null);
 		const [label, setLabel] = React.useState("");
 		const [ownerPubkey, setOwnerPubkey] = React.useState("");
 		const [maxAgents, setMaxAgents] = React.useState("2");
@@ -2189,6 +2833,7 @@ function createServerCard({ React, client, uiKit }) {
 		const [busy, setBusy] = React.useState(false);
 		const [error, setError] = React.useState("");
 		const [created, setCreated] = React.useState(null);
+		const [dmSentTo, setDmSentTo] = React.useState("");
 		const [copied, setCopied] = React.useState(false);
 		const refresh = async () => {
 			setLoading(true);
@@ -2204,27 +2849,94 @@ function createServerCard({ React, client, uiKit }) {
 		React.useEffect(() => {
 			refresh();
 		}, []);
-		const createInvite = async () => {
+		React.useEffect(() => {
+			if (!dmAvailable || !session?.directMessages?.people) {
+				setMembers([]);
+				return;
+			}
+			const controller = new AbortController();
+			const timer = setTimeout(() => {
+				setSearchingMembers(true);
+				session.directMessages.people(memberQuery.trim(), 1, controller.signal).then((res) => {
+					if (controller.signal.aborted) return;
+					const humans = (Array.isArray(res?.people) ? res.people : []).filter((p) => p?.pubkey && !p.isAgent);
+					setMembers(humans);
+				}).catch(() => {
+					if (!controller.signal.aborted) setMembers([]);
+				}).finally(() => {
+					if (!controller.signal.aborted) setSearchingMembers(false);
+				});
+			}, memberQuery.trim() ? 180 : 0);
+			return () => {
+				clearTimeout(timer);
+				controller.abort();
+			};
+		}, [
+			dmAvailable,
+			session,
+			memberQuery
+		]);
+		const selectMember = (person) => {
+			setSelectedMember(person);
+			setLabel(person.name || person.username || person.pubkey.slice(0, 8));
+			setOwnerPubkey(person.pubkey);
+			setError("");
+		};
+		const clearMember = () => {
+			setSelectedMember(null);
+			setOwnerPubkey("");
+		};
+		const createInvite = async ({ sendDm = false } = {}) => {
 			const cleanLabel = label.trim();
 			if (!cleanLabel) {
-				setError("Enter a friend's name or label first.");
+				setError("Enter a friend's name or pick a Buzz member first.");
+				return;
+			}
+			if (sendDm && !selectedMember?.pubkey) {
+				setError("Pick a Buzz member first to send an in-app invite.");
+				return;
+			}
+			if (sendDm && !publicGuestUrl) {
+				setError("Guest endpoint (publicGuestUrl) is not configured on this buzz-host server.");
 				return;
 			}
 			setBusy(true);
 			setError("");
 			setCreated(null);
+			setDmSentTo("");
 			setCopied(false);
 			try {
+				const cleanPubkey = (selectedMember?.pubkey || ownerPubkey).trim();
 				const res = await client.call("tokens.create", {
 					label: cleanLabel,
-					...ownerPubkey.trim() ? { ownerPubkey: ownerPubkey.trim() } : {},
+					...cleanPubkey ? { ownerPubkey: cleanPubkey } : {},
 					maxAgents: Number(maxAgents) || 2,
 					maxConcurrency: Number(maxConcurrency) || 2,
 					allowHostDesktop
 				});
 				setCreated(res);
+				if (sendDm && session) {
+					const inviteMsg = formatInviteMessage({
+						url: publicGuestUrl,
+						token: res.token,
+						label: res.record?.label || cleanLabel,
+						ownerPubkey: selectedMember.pubkey
+					});
+					const controller = new AbortController();
+					const timeout = setTimeout(() => controller.abort(), 2e4);
+					try {
+						await sendInviteDm(session, selectedMember.pubkey, inviteMsg, controller.signal);
+						setDmSentTo(selectedMember.name || selectedMember.username || cleanLabel);
+					} catch (dmErr) {
+						setError(`Invite token was created, but DM delivery failed (${String(dmErr?.message ?? dmErr)}). Copy the invite link below to share manually.`);
+					} finally {
+						clearTimeout(timeout);
+					}
+				}
 				setLabel("");
 				setOwnerPubkey("");
+				setSelectedMember(null);
+				setMemberQuery("");
 				setAllowHostDesktop(false);
 				await refresh();
 			} catch (e) {
@@ -2261,7 +2973,66 @@ function createServerCard({ React, client, uiKit }) {
 			gap: "var(--space-3)",
 			paddingTop: "var(--space-3)",
 			borderTop: "1px solid var(--border-standard)"
-		} }, h("strong", null, "Guest invites (friends)"), h(Note, null, `Create a personal invite link so a friend can host sandboxed agents on this server.${publicGuestUrl ? ` Guest endpoint: ${publicGuestUrl}` : ""}`), h("div", { style: {
+		} }, h("strong", null, "Guest invites (friends)"), h(Note, null, `Send a one-click Buzz invite or create a personal invite link so a friend can host sandboxed agents on this server.${publicGuestUrl ? ` Guest endpoint: ${publicGuestUrl}` : ""}`), dmAvailable && h("div", { style: {
+			display: "grid",
+			gap: "var(--space-2)",
+			padding: "var(--space-3)",
+			borderRadius: "var(--radius-control)",
+			background: "var(--surface-inset)",
+			border: "1px solid var(--border-standard)"
+		} }, h(Row, {
+			label: "Send directly to a Buzz member",
+			hint: "They'll get an automatic Accept & Connect popup right in Buzz — no copy-paste needed."
+		}, selectedMember ? h("div", { style: {
+			display: "flex",
+			alignItems: "center",
+			justifyContent: "space-between",
+			gap: "var(--space-2)",
+			padding: "var(--space-2)",
+			borderRadius: "var(--radius-control)",
+			background: "var(--surface-panel, var(--surface-elevated, transparent))",
+			border: "1px solid var(--border-standard)"
+		} }, h("div", { style: {
+			display: "grid",
+			gap: "2px",
+			minWidth: 0
+		} }, h("strong", null, selectedMember.name || selectedMember.username || selectedMember.pubkey.slice(0, 10)), h(Note, null, `${selectedMember.username ? `@${selectedMember.username} · ` : ""}${selectedMember.pubkey.slice(0, 12)}… (token pre-bound to this account)`)), h("button", {
+			type: "button",
+			disabled: busy,
+			onClick: clearMember
+		}, "Change")) : h("div", { style: {
+			display: "grid",
+			gap: "var(--space-2)"
+		} }, h(Text, {
+			value: memberQuery,
+			disabled: busy,
+			placeholder: "Search community members (e.g. Anu)…",
+			onChange: (e) => setMemberQuery(e.target.value)
+		}), searchingMembers ? h(Note, null, "Searching members…") : members.length === 0 ? h(Note, null, memberQuery.trim() ? "No matching members found." : "No other community members loaded yet.") : h("div", { style: {
+			display: "flex",
+			flexWrap: "wrap",
+			gap: "var(--space-1, 6px)",
+			maxHeight: "120px",
+			overflowY: "auto"
+		} }, ...members.slice(0, 12).map((person) => h("button", {
+			key: person.pubkey,
+			type: "button",
+			disabled: busy,
+			onClick: () => selectMember(person),
+			style: {
+				display: "inline-flex",
+				alignItems: "center",
+				gap: "6px",
+				padding: "4px 10px",
+				borderRadius: "999px",
+				border: "1px solid var(--border-standard)",
+				background: "var(--surface-panel, transparent)",
+				color: "var(--text-standard)",
+				cursor: busy ? "default" : "pointer",
+				font: "inherit",
+				fontSize: "0.85rem"
+			}
+		}, person.name || person.username || `${person.pubkey.slice(0, 8)}…`, person.username && person.name && person.username !== person.name ? h("span", { className: "text-secondary" }, `@${person.username}`) : null)))))), h("div", { style: {
 			display: "grid",
 			gap: "var(--space-2)",
 			gridTemplateColumns: "minmax(0, 1fr) minmax(0, 1fr)"
@@ -2275,10 +3046,10 @@ function createServerCard({ React, client, uiKit }) {
 			onChange: (e) => setLabel(e.target.value)
 		})), h(Row, {
 			label: "Owner pubkey (optional)",
-			hint: "Leave blank to bind automatically on their first agent."
+			hint: selectedMember ? "Auto-filled from selected Buzz member." : "Leave blank to bind automatically on their first agent."
 		}, h(Text, {
 			value: ownerPubkey,
-			disabled: busy,
+			disabled: busy || Boolean(selectedMember),
 			placeholder: "64-char hex pubkey (optional)",
 			onChange: (e) => setOwnerPubkey(e.target.value)
 		}))), h("div", { style: {
@@ -2315,19 +3086,28 @@ function createServerCard({ React, client, uiKit }) {
 			gap: "2px"
 		} }, h("span", { style: { fontWeight: 500 } }, "Allow remote desktop (trusted — runs on host)"), h(Note, null, "Only for people you trust on this machine. Lets them run owner-only agents on the host and open Viewport Remote Desktop."))), h("div", { style: {
 			display: "flex",
-			gap: "var(--space-2)"
-		} }, h("button", {
+			gap: "var(--space-2)",
+			flexWrap: "wrap"
+		} }, selectedMember && dmAvailable && (Btn ? h(Btn, {
+			variant: "primary",
+			disabled: busy,
+			onClick: () => void createInvite({ sendDm: true })
+		}, busy ? "Sending…" : `Send invite to ${selectedMember.name || selectedMember.username || label || "member"}`) : h("button", {
 			type: "button",
 			disabled: busy,
-			onClick: () => void createInvite()
-		}, busy ? "Working…" : "Create guest invite")), error && h(Note, { tone: "error" }, error), created && h("div", { style: {
+			onClick: () => void createInvite({ sendDm: true })
+		}, busy ? "Sending…" : `Send invite to ${selectedMember.name || selectedMember.username || label || "member"}`)), h("button", {
+			type: "button",
+			disabled: busy,
+			onClick: () => void createInvite({ sendDm: false })
+		}, busy ? "Working…" : selectedMember ? "Create link only" : "Create guest invite")), error && h(Note, { tone: "error" }, error), created && h("div", { style: {
 			display: "grid",
 			gap: "var(--space-2)",
 			padding: "var(--space-3)",
 			borderRadius: "var(--radius-control)",
 			background: "var(--surface-inset)",
 			border: "1px solid var(--border-standard)"
-		} }, h(Note, null, `Invite created for ${created.record.label}. Copy and send it now — the secret token is shown only once.`), h(Text, {
+		} }, h(Note, null, dmSentTo ? `Invite sent to ${dmSentTo} in Buzz! An Accept & Connect popup will appear on their Buzz app (and the DM also has an Accept button). Fallback link below if needed:` : `Invite created for ${created.record.label}. Copy and send it now — the secret token is shown only once.`), h(Text, {
 			readOnly: true,
 			value: created.inviteUrl || created.token,
 			onFocus: (e) => e.target.select()
@@ -2472,6 +3252,7 @@ const inject = [
 function apply(ctx) {
 	const React = ctx.react;
 	const uiKit = ui(React);
+	const { Btn } = createBuzzPrimitives(React);
 	const client = createClient();
 	ctx.effect(() => () => client.close());
 	const relay = ctx.reflect?.get?.("relay");
@@ -2489,6 +3270,13 @@ function apply(ctx) {
 		React,
 		client,
 		uiKit
+	});
+	const { InviteOverlay, InviteMessageCard, matchesInviteMessage } = createInviteFeature({
+		React,
+		client,
+		relay,
+		uiKit,
+		Btn
 	});
 	createType({
 		React,
@@ -2508,8 +3296,26 @@ function apply(ctx) {
 		component: createServerCard({
 			React,
 			client,
-			uiKit
+			uiKit,
+			Btn,
+			relay
 		})
+	});
+	ctx.inject?.(["conversation"], (scope) => {
+		scope.conversation?.registerMessage?.({
+			id: "guest-invite",
+			title: "Remote Agents invite",
+			matches: matchesInviteMessage,
+			component: InviteMessageCard
+		});
+	});
+	ctx.inject?.(["pages"], (scope) => {
+		try {
+			scope.pages?.registerOverlay?.({
+				id: "guest-invite",
+				component: InviteOverlay
+			});
+		} catch {}
 	});
 }
 

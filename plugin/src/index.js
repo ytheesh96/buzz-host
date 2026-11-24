@@ -7,12 +7,13 @@
 // non-Buzz network scheme the app's CSP allows.
 
 import { createClient } from "./client.js";
-import { ui } from "./ui.js";
+import { createBuzzPrimitives, ui } from "./ui.js";
 import { createComposer } from "./composer.js";
 import { createActivity } from "./activity.js";
 import { createOrchestrator } from "./orchestrator.js";
 import { createType } from "./type.js";
 import { createServerCard } from "./server-card.js";
+import { createInviteFeature } from "./invite.js";
 
 export { catalogKey, catalogParams, composerModels } from "./composer.js";
 
@@ -21,6 +22,7 @@ export const inject = ["react", "agents", "settingsCards"];
 export function apply(ctx) {
   const React = ctx.react;
   const uiKit = ui(React);
+  const { Btn } = createBuzzPrimitives(React);
   const client = createClient();
   ctx.effect(() => () => client.close());
 
@@ -28,6 +30,13 @@ export function apply(ctx) {
   const { invalidateCatalog, hostedModels, hostedSessions } = createComposer({ client, ctx });
   const { ActivityTab } = createActivity({ React, ctx, uiKit, relay });
   const { OrchestratorSettings } = createOrchestrator({ React, client, uiKit });
+  const { InviteOverlay, InviteMessageCard, matchesInviteMessage } = createInviteFeature({
+    React,
+    client,
+    relay,
+    uiKit,
+    Btn,
+  });
 
   createType({
     React,
@@ -46,6 +55,28 @@ export function apply(ctx) {
     id: "server",
     title: "Remote Agents",
     group: "Plugins",
-    component: createServerCard({ React, client, uiKit }),
+    component: createServerCard({ React, client, uiKit, Btn, relay }),
+  });
+
+  // ----- Seamless 1:1 DM invites: inline card + automatic Accept overlay -----
+  ctx.inject?.(["conversation"], (scope) => {
+    scope.conversation?.registerMessage?.({
+      id: "guest-invite",
+      title: "Remote Agents invite",
+      matches: matchesInviteMessage,
+      component: InviteMessageCard,
+    });
+  });
+
+  // App overlays are available when bundled in Buzz; external installs fall back to the DM card.
+  ctx.inject?.(["pages"], (scope) => {
+    try {
+      scope.pages?.registerOverlay?.({
+        id: "guest-invite",
+        component: InviteOverlay,
+      });
+    } catch {
+      // External plugin installs cannot register app overlays; inline DM card still works.
+    }
   });
 }

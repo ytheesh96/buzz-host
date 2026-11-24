@@ -35,6 +35,20 @@ import {
   viewportPageTarget,
 } from "./src/desktop.js";
 import { plain, schedule, titleOf, words } from "./src/attention.js";
+import {
+  INVITE_STATE_KEY,
+  acceptInvite,
+  extractHost,
+  formatInviteMessage,
+  getInviteDecision,
+  isAlreadyConfigured,
+  isInviteForViewer,
+  isOneToOneDm,
+  parseInviteMessage,
+  sendInviteDm,
+  setInviteDecision,
+  subscribeInviteDecisions,
+} from "./src/invite.js";
 import * as remoteAgentsSrc from "./src/index.js";
 import * as remoteAgentsBuilt from "./plugin.js";
 import * as viewportSrc from "../plugins/viewport/src/index.js";
@@ -281,7 +295,7 @@ test("Remote Agents: src and bundled plugin.js expose the same API surface", () 
 
   for (const mod of [remoteAgentsSrc, remoteAgentsBuilt]) {
     const cleanups = [];
-    const registered = { types: [], tabs: [], cards: [] };
+    const registered = { types: [], tabs: [], cards: [], messages: [], overlays: [] };
     try {
       mod.apply({
         react: { createElement: () => null },
@@ -291,6 +305,14 @@ test("Remote Agents: src and bundled plugin.js expose the same API surface", () 
           registerTab: (t) => registered.tabs.push(t),
         },
         settingsCards: { register: (c) => registered.cards.push(c) },
+        inject: (deps, cb) => {
+          if (deps.includes("conversation")) {
+            cb({ conversation: { registerMessage: (m) => registered.messages.push(m) } });
+          }
+          if (deps.includes("pages")) {
+            cb({ pages: { registerOverlay: (o) => registered.overlays.push(o) } });
+          }
+        },
       });
       assert.deepEqual(registered.types.map((t) => t.id), ["omarchy"]);
       assert.equal(registered.types[0].title, "Self-hosted");
@@ -298,10 +320,149 @@ test("Remote Agents: src and bundled plugin.js expose the same API surface", () 
       assert.deepEqual(registered.tabs.map((t) => t.id), ["catalog-sync"]);
       assert.deepEqual(registered.cards.map((c) => c.id), ["server"]);
       assert.equal(registered.cards[0].title, "Remote Agents");
+      assert.deepEqual(registered.messages.map((m) => m.id), ["guest-invite"]);
+      assert.deepEqual(registered.overlays.map((o) => o.id), ["guest-invite"]);
     } finally {
       for (const fn of cleanups) fn?.();
     }
   }
+});
+
+test("DM guest invite helpers format, parse, validate, persist decisions, send DM, and roll back failed accept", async (t) => {
+  const storage = new Map();
+  const prevStorage = globalThis.localStorage;
+  globalThis.localStorage = {
+    getItem: (k) => (storage.has(k) ? storage.get(k) : null),
+    setItem: (k, v) => storage.set(k, String(v)),
+    removeItem: (k) => storage.delete(k),
+  };
+  t.after(() => {
+    if (prevStorage === undefined) delete globalThis.localStorage;
+    else globalThis.localStorage = prevStorage;
+  });
+
+  const owner = "a".repeat(64);
+  const sender = "b".repeat(64);
+  const token = `bhg_${"1".repeat(48)}`;
+  const url = "wss://host.example/_buzz-host";
+
+  assert.equal(extractHost(url), "host.example");
+  assert.equal(extractHost("http://insecure.example"), "");
+
+  const msg = formatInviteMessage({ url: `${url}/#token=ignored`, token, label: "Alex", ownerPubkey: owner.toUpperCase() });
+  assert.ok(msg.includes("```buzz-host-invite"));
+  const parsed = parseInviteMessage(msg);
+  assert.deepEqual(parsed, {
+    v: 1,
+    url,
+    token,
+    host: "host.example",
+    label: "Alex",
+    ownerPubkey: owner,
+  });
+
+  // Reject malformed, non-wss, bad token, wrong version, or invalid ownerPubkey
+  assert.equal(parseInviteMessage("ordinary message"), null);
+  assert.equal(parseInviteMessage("```buzz-host-invite\nnot-json\n```"), null);
+  assert.equal(parseInviteMessage(`\`\`\`buzz-host-invite\n${JSON.stringify({ v: 2, url, token })}\n\`\`\``), null);
+  assert.equal(
+    parseInviteMessage(`\`\`\`buzz-host-invite\n${JSON.stringify({ v: 1, url: "ws://host.example", token })}\n\`\`\``),
+    null,
+  );
+  assert.equal(
+    parseInviteMessage(`\`\`\`buzz-host-invite\n${JSON.stringify({ v: 1, url, token: "bad" })}\n\`\`\``),
+    null,
+  );
+  assert.equal(
+    parseInviteMessage(`\`\`\`buzz-host-invite\n${JSON.stringify({ v: 1, url, token, ownerPubkey: "short" })}\n\`\`\``),
+    null,
+  );
+
+  // 1:1 DM gate & viewer matching
+  assert.equal(isOneToOneDm({ channelType: "dm", participants: [sender] }), true);
+  assert.equal(isOneToOneDm({ channelType: "dm", participants: [sender, "c".repeat(64)] }), false);
+  assert.equal(isOneToOneDm({ channelType: "dm", archived: true, participants: [sender] }), false);
+  assert.equal(isOneToOneDm({ channelType: "stream", participants: [sender] }), false);
+
+  assert.equal(isInviteForViewer(parsed, owner, sender), true);
+  assert.equal(isInviteForViewer(parsed, sender, sender), false);
+  assert.equal(isInviteForViewer(parsed, "c".repeat(64), sender), false);
+  const unbound = parseInviteMessage(formatInviteMessage({ url, token }));
+  assert.equal(isInviteForViewer(unbound, "c".repeat(64), sender), true);
+
+  assert.equal(isAlreadyConfigured(parsed, `${url}/`, token), true);
+  assert.equal(isAlreadyConfigured(parsed, url, `bhg_${"2".repeat(48)}`), false);
+
+  // Decision persistence + listener
+  let ticks = 0;
+  const unsub = subscribeInviteDecisions(() => {
+    ticks++;
+  });
+  assert.equal(getInviteDecision("m1"), undefined);
+  setInviteDecision("m1", "declined");
+  assert.equal(getInviteDecision("m1"), "declined");
+  assert.equal(ticks, 1);
+  assert.ok(storage.has(INVITE_STATE_KEY));
+  unsub();
+
+  // sendInviteDm opens 1:1 DM, sends message, and awaits delivery
+  const sent = [];
+  const dmRes = await sendInviteDm(
+    {
+      directMessages: {
+        open: async (keys) => {
+          sent.push(["open", keys]);
+          return "dm-123";
+        },
+        delivered: async (id, ch) => {
+          sent.push(["delivered", id, ch]);
+        },
+      },
+      messages: {
+        send: (ch, text) => {
+          sent.push(["send", ch, text]);
+          return "evt-999";
+        },
+      },
+    },
+    owner,
+    msg,
+  );
+  assert.deepEqual(dmRes, { channelId: "dm-123", eventId: "evt-999" });
+  assert.deepEqual(sent, [
+    ["open", [owner]],
+    ["send", "dm-123", msg],
+    ["delivered", "evt-999", "dm-123"],
+  ]);
+
+  // acceptInvite saves URL + token, reconnects, calls hello, and records decision
+  const calls = [];
+  const okClient = {
+    reconnect: async () => calls.push("reconnect"),
+    call: async (method) => {
+      calls.push(method);
+      return { role: "guest", label: "Alex" };
+    },
+  };
+  const accepted = await acceptInvite(okClient, parsed, "m2");
+  assert.equal(accepted.hello.label, "Alex");
+  assert.deepEqual(calls, ["reconnect", "hello"]);
+  assert.equal(storedUrl(), url);
+  assert.equal(storedToken(), token);
+  assert.equal(getInviteDecision("m2"), "accepted");
+
+  // acceptInvite restores previous URL + token when hello fails
+  const badInvite = parseInviteMessage(formatInviteMessage({ url: "wss://other.example/_buzz-host", token: `bhg_${"9".repeat(48)}` }));
+  const failClient = {
+    reconnect: async () => {},
+    call: async () => {
+      throw new Error("Invalid guest token");
+    },
+  };
+  await assert.rejects(() => acceptInvite(failClient, badInvite, "m3"), /Invalid guest token/);
+  assert.equal(storedUrl(), url);
+  assert.equal(storedToken(), token);
+  assert.equal(getInviteDecision("m3"), undefined);
 });
 
 test("Viewport route parsing, navigation targets, and no fullscreen/Esc-exit hijack", () => {
