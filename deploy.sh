@@ -15,6 +15,7 @@ SERVER_FILES=(
   attention.mjs
   attention-core.mjs
   buzz-mcp.mjs
+  mcp-server.mjs
   memory.mjs
   nip44.mjs
   attention-relay.mjs
@@ -104,6 +105,28 @@ deploy_local() {
     atomic_copy "$SERVER_DIR/buzz-host-tokens" "$lib_dir/bin/buzz-host-tokens" 0755
   fi
 
+  # Tiny C stdio bridge per agent session (server/buzz-mcp-bridge.c). Compiled
+  # here, atomically, whenever a C compiler is available; without one the
+  # per-agent wrapper keeps starting the buzz-mcp.mjs fallback.
+  local cc_bin=""
+  for c in "${CC:-}" cc gcc clang; do
+    if [ -n "$c" ] && command -v "$c" >/dev/null 2>&1; then
+      cc_bin="$c"
+      break
+    fi
+  done
+  if [ -f "$SERVER_DIR/buzz-mcp-bridge.c" ] && [ -n "$cc_bin" ]; then
+    local bridge_tmp
+    bridge_tmp="$(mktemp "$lib_dir/bin/.buzz-mcp-bridge.tmp.XXXXXX")"
+    if "$cc_bin" -O2 -Wall -Wextra -o "$bridge_tmp" "$SERVER_DIR/buzz-mcp-bridge.c"; then
+      chmod 0755 "$bridge_tmp"
+      mv -f "$bridge_tmp" "$lib_dir/bin/buzz-mcp-bridge"
+    else
+      rm -f "$bridge_tmp"
+      echo "warning: buzz-mcp-bridge.c did not compile; keeping any installed bridge" >&2
+    fi
+  fi
+
   for f in "$SERVER_DIR"/shims/*; do
     [ -f "$f" ] || continue
     atomic_copy "$f" "$lib_dir/shims/$(basename "$f")" 0755
@@ -179,6 +202,28 @@ deploy_ssh() {
   scp -q acp-proxy "$host":.local/lib/buzz-host/bin/
   if [ -f buzz-host-tokens ]; then
     scp -q buzz-host-tokens "$host":.local/lib/buzz-host/bin/
+  fi
+  # Tiny C stdio bridge: compile on the host (it may not be this machine's arch).
+  if [ -f buzz-mcp-bridge.c ]; then
+    scp -q buzz-mcp-bridge.c "$host":.local/lib/buzz-host/
+    ssh "$host" 'set -e
+      src=~/.local/lib/buzz-host/buzz-mcp-bridge.c
+      cc_bin=""
+      for c in cc gcc clang; do
+        if command -v "$c" >/dev/null 2>&1; then cc_bin="$c"; break; fi
+      done
+      if [ -n "$cc_bin" ]; then
+        tmp="$(mktemp ~/.local/lib/buzz-host/bin/.buzz-mcp-bridge.tmp.XXXXXX)"
+        if "$cc_bin" -O2 -Wall -Wextra -o "$tmp" "$src"; then
+          chmod 0755 "$tmp"
+          mv -f "$tmp" ~/.local/lib/buzz-host/bin/buzz-mcp-bridge
+        else
+          rm -f "$tmp"
+          echo "warning: buzz-mcp-bridge.c did not compile; keeping any installed bridge" >&2
+        fi
+      else
+        echo "warning: no C compiler on the host; skipping buzz-mcp-bridge" >&2
+      fi'
   fi
   scp -q shims/* "$host":.local/lib/buzz-host/shims/
   scp -q agent-bin/* "$host":.local/lib/buzz-host/agent-bin/

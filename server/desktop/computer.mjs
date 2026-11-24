@@ -91,7 +91,7 @@ export const instructions = (pubkey) =>
   "screenshot pixel coordinates, and delivery_mode \"foreground\" for keys in a browser. Open a browser with launch_app " +
   `{"launch_path":"${path.join(desktop.desktopDir(pubkey), "bin", "browser")}","urls":[...]}. If a call says a human has taken over, stop and tell your owner what you need.`;
 
-export function createComputer(pubkey) {
+export function createComputer(pubkey, { chat } = {}) {
   const dir = desktop.desktopDir(pubkey);
   let child = null;
   let starting = null;
@@ -177,8 +177,9 @@ export function createComputer(pubkey) {
     const lease = readLease(dir);
     if (lease.holder === HUMAN) return refused(new HumanHasControl().message);
     // The owner's in-chat preview shows while the agent's turn uses these;
-    // acp-proxy labels each session's buzz MCP server with BUZZHOST_CHAT.
-    desktop.recordUse(pubkey, name, process.env.BUZZHOST_CHAT || "");
+    // acp-proxy labels each session's buzz MCP server with BUZZHOST_CHAT. The
+    // shared mcp.sock server passes the session's chat key in directly.
+    desktop.recordUse(pubkey, name, chat ?? process.env.BUZZHOST_CHAT ?? "");
     try {
       await ensure();
       const result = await request("tools/call", { name, arguments: args ?? {} });

@@ -65,6 +65,7 @@ function makeFixture(t) {
     "attention.mjs",
     "attention-core.mjs",
     "buzz-mcp.mjs",
+    "mcp-server.mjs",
     "memory.mjs",
     "nip44.mjs",
     "attention-relay.mjs",

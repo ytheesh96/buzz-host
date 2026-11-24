@@ -16,9 +16,11 @@ import { createHash, generateKeyPairSync, randomBytes } from "node:crypto";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import fs from "node:fs/promises";
+import { constants } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { createAttention } from "./attention.mjs";
+import { createMcpServer } from "./mcp-server.mjs";
 import { createMemory } from "./memory.mjs";
 import { createOrchestrator } from "./orchestrator.mjs";
 import { createRelayWatcher } from "./attention-relay.mjs";
@@ -348,6 +350,21 @@ async function writeRuntimeEnv(pubkey, m) {
 // owner has Attention on; computer tools while the agent has a desktop;
 // orchestrator tools while the owner has Orchestrator on (turning any on or
 // off restarts the agent).
+//
+// The wrapper starts the compiled stdio bridge (server/buzz-mcp-bridge.c,
+// installed as bin/buzz-mcp-bridge) when it is present: that is a few hundred
+// KB per session talking to buzz-host's shared mcp.sock server. Without it the
+// wrapper falls back to the standalone buzz-mcp.mjs Node server.
+const BRIDGE = path.join(BIN, "buzz-mcp-bridge");
+async function hasBridge() {
+  try {
+    await fs.access(BRIDGE, constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function writeBuzzMcp(pubkey) {
   const mcp = path.join(dir(pubkey), "mcp");
   const file = path.join(mcp, "buzz");
@@ -355,12 +372,15 @@ async function writeBuzzMcp(pubkey) {
   const m = await meta(pubkey).catch(() => ({}));
   const withComputer = m.desktop === true;
   const withOrchestrate = m.orchestrate === true;
+  const flags = `${withAttention ? " --attention" : ""}${withComputer ? " --computer" : ""}${withOrchestrate ? " --orchestrate" : ""}`;
+  const command = (await hasBridge())
+    ? `exec ${sq(BRIDGE)} ${pubkey}${flags}`
+    : `exec ${sq(process.execPath)} ${sq(path.join(LIB, "buzz-mcp.mjs"))} ${pubkey}${flags}`;
   await fs.mkdir(mcp, { recursive: true, mode: 0o700 });
   await fs.rm(path.join(mcp, "attention"), { force: true }); // before 2026-11-17
   await writePrivate(
     file,
-    `#!/bin/sh\n# Buzz tools for buzz-host agent ${pubkey} (written by buzz-host).\n` +
-      `exec ${sq(process.execPath)} ${sq(path.join(LIB, "buzz-mcp.mjs"))} ${pubkey}${withAttention ? " --attention" : ""}${withComputer ? " --computer" : ""}${withOrchestrate ? " --orchestrate" : ""}\n`,
+    `#!/bin/sh\n# Buzz tools for buzz-host agent ${pubkey} (written by buzz-host).\n${command}\n`,
   );
   await fs.chmod(file, 0o700);
   return file;
@@ -1406,6 +1426,18 @@ const watcher = createRelayWatcher({
 attention.onChange = (pubkey, record) => watcher.sync(pubkey, record);
 attention.relay = watcher;
 await attention.start();
+// Every agent session's MCP bridge talks to this one server on mcp.sock: the
+// memory, orchestrator and Attention handlers stay in buzz-host, so a session
+// costs the tiny C bridge instead of a Node process per session.
+const mcpServer = createMcpServer({
+  runDir: RUN_DIR,
+  callTool: async (pubkey, name, args) => {
+    const handler = [memory, orchestrator, hermesHostExtra].find((h) => h?.handles?.(name));
+    return handler ? handler.call(pubkey, name, args ?? {}) : attention.callTool(pubkey, name, args);
+  },
+  computerModule: () => import("./desktop/computer.mjs"),
+});
+await mcpServer.start();
 for (const pubkey of await attention.enabledAgents())
   watcher.sync(pubkey, (await attention.load(pubkey)).record);
 const allAgentMetas = [];
@@ -1447,6 +1479,22 @@ for (const m of allAgentMetas) {
     console.log(`agent ${name.slice(0, 8)}: now has the buzz MCP server (memory)`);
   } catch (error) {
     console.error(`agent ${name.slice(0, 8)}: buzz MCP server not set up: ${error.message}`);
+  }
+}
+// Agents whose wrapper still starts the Node buzz-mcp.mjs switch to the C
+// bridge once it is installed. Running sessions keep the process they have;
+// the next session each runtime starts picks the bridge up.
+if (await hasBridge()) {
+  for (const m of allAgentMetas) {
+    if (!m?.activated || isSandboxed(m)) continue;
+    const wrapper = await fs.readFile(path.join(dir(m.pubkey), "mcp", "buzz"), "utf8").catch(() => "");
+    if (!wrapper.includes("buzz-mcp.mjs")) continue;
+    try {
+      await writeBuzzMcp(m.pubkey);
+      console.log(`agent ${m.pubkey.slice(0, 8)}: buzz MCP wrapper now uses the C bridge`);
+    } catch (error) {
+      console.error(`agent ${m.pubkey.slice(0, 8)}: buzz MCP wrapper not refreshed: ${error.message}`);
+    }
   }
 }
 // One request at a time per agent, so retries and edits never interleave.
@@ -1694,6 +1742,7 @@ async function shutdown(signal) {
   if (idleSweepTimer) clearInterval(idleSweepTimer);
   server.close();
   guestServer?.close();
+  await mcpServer.stop().catch(() => {});
   await runnerManager.close().catch(() => {});
   await orchestrator.close().catch(() => {});
   process.exit(0);

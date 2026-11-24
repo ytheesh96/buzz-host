@@ -171,7 +171,7 @@ backup_live() {
       cp -p "$f" "$BACKUP_DIR/lib/"
     fi
   done
-  for f in acp-proxy buzz-host-tokens; do
+  for f in acp-proxy buzz-host-tokens buzz-mcp-bridge; do
     if [ -f "$LIB_DIR/bin/$f" ]; then
       cp -p "$LIB_DIR/bin/$f" "$BACKUP_DIR/lib/bin/"
     fi
@@ -201,7 +201,7 @@ restore_backup() {
       mv -f "$tmp" "$LIB_DIR/$(basename "$f")"
     fi
   done
-  for f in acp-proxy buzz-host-tokens; do
+  for f in acp-proxy buzz-host-tokens buzz-mcp-bridge; do
     if [ -f "$BACKUP_DIR/lib/bin/$f" ]; then
       tmp="$(mktemp "$LIB_DIR/bin/.restore.tmp.XXXXXX")"
       cp -p "$BACKUP_DIR/lib/bin/$f" "$tmp"

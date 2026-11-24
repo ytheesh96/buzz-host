@@ -140,9 +140,13 @@ tabs no way to open a profile.
   Buzz update; `node --test --test-concurrency=1 attention/` tests the service against the
   bundle (catch-up against a fake relay).
 - **Tools.** `runtime.env` sets `BUZZ_ACP_MCP_COMMAND` to the agent's `mcp/buzz` wrapper →
-  `buzz-mcp.mjs` (with `--attention` while Attention is on) → `$XDG_RUNTIME_DIR/buzz-host/attention.sock`
-  (the service owns each agent's `attention.json`). The server is named `buzz`, as Buzz's own,
-  so tools appear as `mcp__buzz__watch_add` (Hermes: `editor_buzz_*`); memory tools are always there.
+  `bin/buzz-mcp-bridge`, the compiled C stdio bridge (with `--attention` while Attention is on)
+  → `$XDG_RUNTIME_DIR/buzz-host/mcp.sock`, buzz-host's shared MCP session server
+  (`server/mcp-server.mjs`): one server for every session, and ~1.8 MB per session instead of a
+  Node process's ~65 MB. Without the compiled bridge (no C compiler at deploy time) the wrapper
+  falls back to `buzz-mcp.mjs`, the standalone server that talks to `attention.sock` (the service
+  owns each agent's `attention.json`). The server is named `buzz`, as Buzz's own, so tools appear
+  as `mcp__buzz__watch_add` (Hermes: `editor_buzz_*`); memory tools are always there.
 - **Wakes.** Timers (Buzz's schedule, one wake per Interest at a time) and event watches
   write a request into the agent's `wake/`; patch 0004 makes buzz-acp run it in that chat
   or thread's session, or as an independent turn, and write `wake/results/<id>.json`.
@@ -172,8 +176,9 @@ Buzz's agent memory for remote agents (2026-11-17), so the owner sees it in the 
 
 - **Tools.** `mem_get`, `mem_set`, `mem_rm`, Buzz's names, descriptions, version checks and
   replies (`server/memory.mjs`, ported from buzz-app `src/buzz-mcp/tools.ts`), served by the
-  `buzz` MCP server whether or not Attention is on. `mem_set`'s `path` is read by
-  `buzz-mcp.mjs` inside the session's folder.
+  `buzz` MCP server whether or not Attention is on. `mem_set`'s `path` is read inside
+  the session's folder: by the shared `mcp.sock` server behind the C bridge, or by
+  `buzz-mcp.mjs` when that is the fallback.
 - **Format.** Kind 30174 from the agent, tags exactly `d` + `p` (owner); `d` is the HMAC of
   `agent-memory/v1/d-tag\0<slug>` under the agent↔owner NIP-44 conversation key; content is
   NIP-44 v2 of `{slug, value}` (`{slug, profile}` for `core`; `value: null` deletes). NIP-44 is
