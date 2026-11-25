@@ -173,32 +173,69 @@ export function createDesktop({ React, client, ctx, uiKit, Btn, Icon, navigation
           const v = await client.call("desktop.view", { pubkey }, { timeoutMs: 60000 });
           if (state.status !== "connecting") return; // disconnected meanwhile
           const { RFB } = novncClient();
-          const baseUrl = (client.urlForAgent?.(pubkey) || storedUrl()).replace(/\/+$/, "");
-          const r = new RFB(screen, `${baseUrl}${v.path}`, { wsProtocols: ["binary"], shared: true });
-          r.viewOnly = true;
-          r.scaleViewport = true;
-          r.resizeSession = false;
-          r.background = "#000";
-          r.addEventListener("connect", () => {
-            if (rfb !== r) return;
-            set({ status: "live" });
-            refit();
-          });
-          r.addEventListener("disconnect", (e) => {
-            if (rfb !== r) return;
-            rfb = null;
-            viewerId = "";
-            set({
-              status: "off",
-              mine: false,
-              error: e.detail?.clean
-                ? ""
-                : "The desktop view closed (the desktop stopped, another viewer took over, or the connection dropped).",
+          const desktopPath = v.ticket ? `/desktop?ticket=${encodeURIComponent(v.ticket)}` : v.path;
+          let candidates = client.resolveUrlsForAgent
+            ? await client.resolveUrlsForAgent(pubkey, desktopPath)
+            : [];
+          if (!candidates.length) {
+            const baseUrl = (client.urlForAgent?.(pubkey) || storedUrl()).replace(/\/+$/, "");
+            if (baseUrl) candidates = [{ routeType: "wss", url: `${baseUrl}${desktopPath}` }];
+          }
+          if (!candidates.length) {
+            throw new Error("No buzz-host server URL configured for this agent desktop.");
+          }
+          if (state.status !== "connecting") return; // disconnected while resolving routes
+
+          const startCandidate = (index) => {
+            const candidate = candidates[index];
+            let connected = false;
+            let r;
+            try {
+              r = new RFB(screen, candidate.url, { wsProtocols: ["binary"], shared: true });
+            } catch (err) {
+              if (index + 1 < candidates.length) {
+                startCandidate(index + 1);
+                return;
+              }
+              throw err;
+            }
+            r.viewOnly = true;
+            r.scaleViewport = true;
+            r.resizeSession = false;
+            r.background = "#000";
+            r.addEventListener("connect", () => {
+              if (rfb !== r) return;
+              connected = true;
+              set({ status: "live" });
+              refit();
             });
-          });
-          rfb = r;
+            r.addEventListener("disconnect", (e) => {
+              if (rfb !== r) return;
+              if (!connected && index + 1 < candidates.length && state.status === "connecting") {
+                rfb = null;
+                try {
+                  startCandidate(index + 1);
+                  return;
+                } catch {}
+              }
+              rfb = null;
+              viewerId = "";
+              set({
+                status: "off",
+                mine: false,
+                error: e.detail?.clean
+                  ? ""
+                  : "The desktop view closed (the desktop stopped, another viewer took over, or the connection dropped).",
+              });
+            });
+            rfb = r;
+          };
+
           viewerId = v.viewer;
+          startCandidate(0);
         } catch (e) {
+          rfb = null;
+          viewerId = "";
           set({ status: "off", error: String(e.message ?? e) });
           throw e;
         } finally {

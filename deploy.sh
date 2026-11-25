@@ -19,6 +19,7 @@ SERVER_FILES=(
   mcp-server.mjs
   memory.mjs
   nip44.mjs
+  discovery.mjs
   attention-relay.mjs
   noble.mjs
   workspace.mjs
@@ -28,6 +29,7 @@ SERVER_FILES=(
   file-lock.mjs
   ws-security.mjs
   service-manager.mjs
+  iroh-supervisor.mjs
 )
 
 atomic_copy() {
@@ -158,6 +160,9 @@ deploy_local() {
   if [ -f "$SERVER_DIR/buzz-host-tokens" ]; then
     atomic_copy "$SERVER_DIR/buzz-host-tokens" "$lib_dir/bin/buzz-host-tokens" 0755
   fi
+  if [ -f "$REPO_ROOT/iroh-bridge/target/release/buzz-host-iroh" ]; then
+    atomic_copy "$REPO_ROOT/iroh-bridge/target/release/buzz-host-iroh" "$lib_dir/bin/buzz-host-iroh" 0755
+  fi
 
   # Tiny C stdio bridge per agent session (server/buzz-mcp-bridge.c). Compiled
   # here, atomically, whenever a C compiler is available; without one the
@@ -261,6 +266,9 @@ deploy_ssh() {
   scp -q acp-proxy "$host":.local/lib/buzz-host/bin/
   if [ -f buzz-host-tokens ]; then
     scp -q buzz-host-tokens "$host":.local/lib/buzz-host/bin/
+  fi
+  if [ -f "$REPO_ROOT/iroh-bridge/target/release/buzz-host-iroh" ]; then
+    scp -q "$REPO_ROOT/iroh-bridge/target/release/buzz-host-iroh" "$host":.local/lib/buzz-host/bin/
   fi
   # Tiny C stdio bridge: compile on the host (it may not be this machine's arch).
   if [ -f buzz-mcp-bridge.c ]; then

@@ -569,7 +569,7 @@ export function createServerCard({ React, client, uiKit, Btn, relay }) {
       h(
         Note,
         null,
-        "Agents of type Self-hosted run on a buzz-host server. Create them in Agents → New agent → Harness → Remote → Self-hosted. In a chat, tag the agent with /model, /effort, /runtime, /new, /stop, /status or /help to control that chat (or thread).",
+        "Agents of type Self-hosted run on a buzz-host server. Create one in Agents → New agent by picking a machine under Run on. In a chat, tag the agent with /model, /effort, /runtime, /new, /stop, /status or /help to control that chat (or thread).",
       ),
       h(
         Row,

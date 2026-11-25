@@ -1,6 +1,8 @@
 // Multi-machine RPC client: manages one pooled WebSocket per configured buzz-host
 // machine, routing calls automatically by `options.machineId`, `params.pubkey`
 // (via the agent-to-machine map), or the active/primary machine.
+// When a machine advertises an `iroh` route and has an access token in Tauri,
+// tries the loopback Iroh tunnel first and falls back automatically to `wss`.
 // When an access token is configured, authenticates with `auth` immediately on
 // WebSocket open before resolving queued RPCs.
 import {
@@ -12,20 +14,28 @@ import {
   activeMachine,
   machineById,
   machineForAgent,
+  machineIrohRoute,
+  machineRoutesKey,
   machineWssUrl,
   mergeStoredAgentHosts,
+  resolveMachineWsCandidates,
   setStoredAgentHost,
   storedMachines,
   storedToken,
   storedUrl,
 } from "./config.js";
 
-function createMachineSocket({ id, url, token, onState }) {
+function createMachineSocket({ machine, onState }) {
+  const id = machine.id;
+  const wssUrl = machineWssUrl(machine);
+  const token = typeof machine.token === "string" ? machine.token.trim() : "";
+  const routeKey = machineRoutesKey(machine);
   let socket;
   let opening;
   let next = 1;
+  let generation = 0;
   const pending = new Map();
-  let state = { id, status: "idle", url, token, error: "", session: null };
+  let state = { id, status: "idle", url: wssUrl, routeType: null, token, error: "", session: null };
 
   const set = (patch) => {
     state = { ...state, ...patch };
@@ -48,7 +58,7 @@ function createMachineSocket({ id, url, token, onState }) {
         pending.delete(reqId);
         reject(new Error(`buzz-host did not answer ${method} in time`));
       }, timeoutMs);
-      pending.set(reqId, { resolve, reject, timer });
+      pending.set(reqId, { resolve, reject, timer, ws });
       signal?.addEventListener(
         "abort",
         () => {
@@ -62,66 +72,31 @@ function createMachineSocket({ id, url, token, onState }) {
     });
   }
 
-  function open() {
-    if (socket && socket.readyState === WebSocket.OPEN) return Promise.resolve(socket);
-    if (opening) return opening;
-    if (!url) {
-      const error = new Error(
-        "No buzz-host server configured yet. Open Settings → Agent setup → Machines and paste your server URL or pairing link.",
-      );
-      set({ status: "idle", url: "", error: error.message, session: null });
-      return Promise.reject(error);
+  function failSocketPending(ws, error) {
+    for (const [reqId, p] of [...pending.entries()]) {
+      if (p.ws !== ws) continue;
+      pending.delete(reqId);
+      clearTimeout(p.timer);
+      p.reject(error);
     }
-    set({ status: "connecting", url, error: "" });
-    opening = new Promise((resolve, reject) => {
+  }
+
+  function dialCandidate(candidate, gen) {
+    return new Promise((resolve, reject) => {
       let settled = false;
       let ws;
       try {
-        ws = new WebSocket(url);
+        ws = new WebSocket(candidate.url);
       } catch (error) {
-        opening = undefined;
-        set({ status: "error", error: String(error.message ?? error), session: null });
-        reject(error);
+        reject(error instanceof Error ? error : new Error(String(error)));
         return;
       }
-      const timer = setTimeout(() => ws.close(), 20000);
-      ws.onopen = async () => {
-        clearTimeout(timer);
-        if (token) {
-          try {
-            const auth = await sendRaw(ws, "auth", { token }, { timeoutMs: 15000 });
-            socket = ws;
-            opening = undefined;
-            settled = true;
-            set({
-              status: "connected",
-              error: "",
-              session: {
-                role: auth.role || "guest",
-                label: auth.label ?? null,
-                ownerPubkey: auth.ownerPubkey ?? null,
-                limits: auth.limits ?? null,
-              },
-            });
-            resolve(ws);
-          } catch (error) {
-            opening = undefined;
-            settled = true;
-            const err = error instanceof Error ? error : new Error(String(error));
-            set({ status: "error", error: err.message, session: null });
-            try {
-              ws.close();
-            } catch {}
-            reject(err);
-          }
-          return;
-        }
-        socket = ws;
-        opening = undefined;
-        settled = true;
-        set({ status: "connected", error: "" });
-        resolve(ws);
-      };
+      const timer = setTimeout(() => {
+        try {
+          ws.close();
+        } catch {}
+      }, 20000);
+
       ws.onmessage = (event) => {
         let message;
         try {
@@ -130,31 +105,131 @@ function createMachineSocket({ id, url, token, onState }) {
           return;
         }
         const p = pending.get(message.id);
-        if (!p) return;
+        if (!p || p.ws !== ws) return;
         pending.delete(message.id);
         clearTimeout(p.timer);
         if (message.error) p.reject(new Error(message.error));
         else p.resolve(message.result);
       };
+
+      ws.onopen = async () => {
+        clearTimeout(timer);
+        if (gen !== generation) {
+          settled = true;
+          try {
+            ws.close();
+          } catch {}
+          reject(new Error("Connection to buzz-host closed"));
+          return;
+        }
+        if (token) {
+          try {
+            const auth = await sendRaw(ws, "auth", { token }, { timeoutMs: 15000 });
+            if (gen !== generation) {
+              settled = true;
+              try {
+                ws.close();
+              } catch {}
+              reject(new Error("Connection to buzz-host closed"));
+              return;
+            }
+            settled = true;
+            resolve({ ws, auth });
+          } catch (error) {
+            settled = true;
+            const err = error instanceof Error ? error : new Error(String(error));
+            try {
+              ws.close();
+            } catch {}
+            reject(err);
+          }
+          return;
+        }
+        settled = true;
+        resolve({ ws, auth: null });
+      };
+
       ws.onclose = () => {
         clearTimeout(timer);
-        const wasOpen = socket === ws;
-        if (wasOpen) socket = undefined;
-        if (!settled && opening && !wasOpen) {
-          opening = undefined;
+        const wasActive = socket === ws;
+        if (wasActive) {
+          socket = undefined;
+          set({ status: "idle" });
+        }
+        if (!settled) {
           settled = true;
           const error = new Error(
             token
-              ? `Could not reach buzz-host at ${url}. Check that the server is up and the pairing URL is correct.`
-              : `Could not reach buzz-host at ${url}. Check that the server is up and this device is on the tailnet.`,
+              ? `Could not reach buzz-host at ${candidate.url}. Check that the server is up and the pairing URL is correct.`
+              : `Could not reach buzz-host at ${candidate.url}. Check that the server is up and this device is on the tailnet.`,
           );
-          set({ status: "error", error: error.message, session: null });
+          failSocketPending(ws, error);
           reject(error);
-        } else if (wasOpen) {
-          set({ status: "idle" });
+          return;
         }
-        fail(new Error("Connection to buzz-host closed"));
+        failSocketPending(ws, new Error("Connection to buzz-host closed"));
       };
+    });
+  }
+
+  function open() {
+    if (socket && socket.readyState === WebSocket.OPEN) return Promise.resolve(socket);
+    if (opening) return opening;
+    const gen = generation;
+    opening = (async () => {
+      const candidates = await resolveMachineWsCandidates(machine);
+      if (gen !== generation) {
+        throw new Error("Connection to buzz-host closed");
+      }
+      if (!candidates.length) {
+        const error = new Error(
+          "No buzz-host server configured yet. Open Settings → Agent setup → Machines and paste your server URL or pairing link.",
+        );
+        set({ status: "idle", url: "", routeType: null, error: error.message, session: null });
+        throw error;
+      }
+      let lastError = null;
+      for (const candidate of candidates) {
+        if (gen !== generation) {
+          throw new Error("Connection to buzz-host closed");
+        }
+        set({ status: "connecting", url: candidate.url, routeType: candidate.routeType, error: "" });
+        try {
+          const { ws, auth } = await dialCandidate(candidate, gen);
+          if (gen !== generation) {
+            try {
+              ws.close();
+            } catch {}
+            throw new Error("Connection to buzz-host closed");
+          }
+          socket = ws;
+          if (auth) {
+            set({
+              status: "connected",
+              url: candidate.url,
+              routeType: candidate.routeType,
+              error: "",
+              session: {
+                role: auth.role || "guest",
+                label: auth.label ?? null,
+                ownerPubkey: auth.ownerPubkey ?? null,
+                limits: auth.limits ?? null,
+              },
+            });
+          } else {
+            set({ status: "connected", url: candidate.url, routeType: candidate.routeType, error: "" });
+          }
+          return ws;
+        } catch (error) {
+          lastError = error instanceof Error ? error : new Error(String(error));
+          if (gen !== generation) throw lastError;
+        }
+      }
+      const err = lastError ?? new Error("Could not reach buzz-host.");
+      set({ status: "error", error: err.message, session: null });
+      throw err;
+    })().finally(() => {
+      if (gen === generation) opening = undefined;
     });
     return opening;
   }
@@ -180,6 +255,7 @@ function createMachineSocket({ id, url, token, onState }) {
   }
 
   function close() {
+    generation += 1;
     const old = socket;
     socket = undefined;
     opening = undefined;
@@ -191,8 +267,10 @@ function createMachineSocket({ id, url, token, onState }) {
 
   return {
     id,
-    url,
+    url: wssUrl,
     token,
+    routeKey,
+    machine,
     call,
     open,
     close,
@@ -206,15 +284,21 @@ export function createClient() {
 
   const fallbackTarget = () => {
     const primary = activeMachine();
-    if (primary) {
-      return { id: primary.id, url: machineWssUrl(primary), token: primary.token || "" };
-    }
-    return { id: "default", url: storedUrl(), token: storedToken() };
+    if (primary) return primary;
+    const url = storedUrl();
+    return {
+      id: "default",
+      name: "Remote machine",
+      url,
+      token: storedToken(),
+      routes: url ? [{ type: "wss", url }] : [],
+    };
   };
 
   let state = {
     status: "idle",
-    url: fallbackTarget().url,
+    url: machineWssUrl(fallbackTarget()),
+    routeType: null,
     machineId: fallbackTarget().id,
     error: "",
     session: null,
@@ -233,18 +317,19 @@ export function createClient() {
   function resolveTarget(params = {}, options = {}) {
     if (options?.machineId) {
       const hit = machineById(options.machineId);
-      if (hit) return { id: hit.id, url: machineWssUrl(hit), token: hit.token || "" };
+      if (hit) return hit;
     }
     if (params && typeof params.pubkey === "string" && params.pubkey) {
       const owner = machineForAgent(params.pubkey);
-      if (owner) return { id: owner.id, url: machineWssUrl(owner), token: owner.token || "" };
+      if (owner) return owner;
     }
     return fallbackTarget();
   }
 
   function getSocket(target) {
     const existing = pool.get(target.id);
-    if (existing && existing.url === target.url && existing.token === target.token) {
+    const key = machineRoutesKey(target);
+    if (existing && existing.routeKey === key) {
       return existing;
     }
     if (existing) {
@@ -252,15 +337,14 @@ export function createClient() {
       pool.delete(target.id);
     }
     const created = createMachineSocket({
-      id: target.id,
-      url: target.url,
-      token: target.token,
+      machine: target,
       onState(nextState) {
         const current = fallbackTarget();
         if (nextState.id === current.id) {
           set({
             status: nextState.status,
             url: nextState.url,
+            routeType: nextState.routeType,
             machineId: nextState.id,
             error: nextState.error,
             session: nextState.session,
@@ -277,7 +361,7 @@ export function createClient() {
     const byId = new Map(machines.map((m) => [m.id, m]));
     for (const [id, conn] of [...pool.entries()]) {
       const fresh = byId.get(id);
-      if (!fresh || machineWssUrl(fresh) !== conn.url || (fresh.token || "") !== conn.token) {
+      if (!fresh || machineRoutesKey(fresh) !== conn.routeKey) {
         conn.close();
         pool.delete(id);
       }
@@ -285,7 +369,8 @@ export function createClient() {
     const primary = fallbackTarget();
     const primaryConn = pool.get(primary.id);
     set({
-      url: primary.url,
+      url: primaryConn?.snapshot().url ?? machineWssUrl(primary),
+      routeType: primaryConn?.snapshot().routeType ?? null,
       machineId: primary.id,
       status: primaryConn?.snapshot().status ?? "idle",
       error: primaryConn?.snapshot().error ?? "",
@@ -317,9 +402,10 @@ export function createClient() {
     if (!machines.length) return { agents: [], errors: [] };
     const settled = await Promise.allSettled(
       machines.map(async (machine) => {
-        const target = { id: machine.id, url: machineWssUrl(machine), token: machine.token || "" };
-        if (!target.url) return { machine, agents: [] };
-        const conn = getSocket(target);
+        const hasWss = Boolean(machineWssUrl(machine));
+        const hasIroh = Boolean(machineIrohRoute(machine) && machine.token);
+        if (!hasWss && !hasIroh) return { machine, agents: [] };
+        const conn = getSocket(machine);
         const res = await conn.call("list", params, options);
         const rawAgents = Array.isArray(res?.agents) ? res.agents : [];
         mergeStoredAgentHosts(
@@ -408,6 +494,10 @@ export function createClient() {
       const machine = machineForAgent(pubkey) ?? activeMachine();
       return (machine && machineWssUrl(machine)) || storedUrl();
     },
+    resolveUrlsForAgent(pubkey, wsPath) {
+      const machine = machineForAgent(pubkey) ?? fallbackTarget();
+      return resolveMachineWsCandidates(machine, wsPath ? { path: wsPath } : undefined);
+    },
     listMachines: () => storedMachines(),
     subscribe(listener) {
       listeners.add(listener);
@@ -427,7 +517,7 @@ export function createClient() {
       for (const conn of pool.values()) conn.close();
       pool.clear();
       const target = fallbackTarget();
-      set({ url: target.url, machineId: target.id, session: null, epoch: state.epoch + 1 });
+      set({ url: machineWssUrl(target), routeType: null, machineId: target.id, session: null, epoch: state.epoch + 1 });
       return getSocket(target).open();
     },
     close() {

@@ -191,6 +191,102 @@ export function machineWssUrl(machine) {
   return typeof machine.url === "string" ? machine.url.trim() : "";
 }
 
+/** First Iroh route on a machine record, or null if none. */
+export function machineIrohRoute(machine) {
+  if (!machine || typeof machine !== "object") return null;
+  if (Array.isArray(machine.routes)) {
+    for (const route of machine.routes) {
+      if (route?.type === "iroh" && typeof route.endpointAddr === "string" && route.endpointAddr.trim()) {
+        return {
+          type: "iroh",
+          endpointAddr: route.endpointAddr.trim(),
+          ...(typeof route.nodeId === "string" && route.nodeId.trim() ? { nodeId: route.nodeId.trim() } : {}),
+        };
+      }
+    }
+  }
+  return null;
+}
+
+/** Join a WebSocket path/query (e.g. `/desktop?ticket=...`) onto a wss:// base URL. */
+export function withWsPath(baseUrl, wsPath) {
+  const cleanBase = typeof baseUrl === "string" ? baseUrl.trim() : "";
+  if (!cleanBase || !wsPath) return cleanBase;
+  try {
+    const base = new URL(cleanBase);
+    const target = new URL(wsPath, "ws://path.invalid");
+    base.pathname = `${base.pathname.replace(/\/+$/, "")}${target.pathname}`;
+    base.search = target.search;
+    return base.toString();
+  } catch {
+    return `${cleanBase.replace(/\/+$/, "")}${wsPath}`;
+  }
+}
+
+/** Stable key for a machine's dialable routes + token so pooled sockets refresh on route updates. */
+export function machineRoutesKey(machine) {
+  if (!machine || typeof machine !== "object") return "";
+  const wss = machineWssUrl(machine);
+  const iroh = machineIrohRoute(machine)?.endpointAddr ?? "";
+  const token = typeof machine.token === "string" ? machine.token.trim() : "";
+  return `${wss}\0${iroh}\0${token}`;
+}
+
+/**
+ * Resolve ordered WebSocket candidates for a machine:
+ *   1. Loopback Iroh tunnel (`ws://127.0.0.1:...`) when the machine has an
+ *      `iroh` route (`endpointAddr`) AND an access token (Iroh lands on the
+ *      token-gated `guestPort`) AND the Tauri bridge is available.
+ *   2. `wss` route (with optional `path` joined), as fallback or primary.
+ */
+export async function resolveMachineWsCandidates(machine, { path } = {}) {
+  const candidates = [];
+  if (!machine || typeof machine !== "object") return candidates;
+  const wssBase = machineWssUrl(machine);
+  const wssUrl = wssBase ? withWsPath(wssBase, path) : "";
+  const iroh = machineIrohRoute(machine);
+  const token = typeof machine.token === "string" ? machine.token.trim() : "";
+
+  if (iroh && token) {
+    let irohUrl = null;
+    const bridge = globalThis.__BUZZ_IROH_TUNNEL__;
+    if (bridge && typeof bridge.resolveUrl === "function") {
+      try {
+        const resolved = await bridge.resolveUrl(machine, path || undefined);
+        if (typeof resolved === "string" && resolved.trim()) {
+          const clean = resolved.trim();
+          if (!wssUrl || clean !== wssUrl) {
+            irohUrl = clean;
+          }
+        }
+      } catch {
+        // Fall back to wss below.
+      }
+    } else if (typeof globalThis.__TAURI_INTERNALS__?.invoke === "function") {
+      try {
+        const resolved = await globalThis.__TAURI_INTERNALS__.invoke("iroh_tunnel_endpoint", {
+          machineId: machine.id,
+          endpointAddr: iroh.endpointAddr,
+          path: path ?? null,
+        });
+        if (typeof resolved === "string" && resolved.trim()) {
+          irohUrl = resolved.trim();
+        }
+      } catch {
+        // Fall back to wss below.
+      }
+    }
+    if (irohUrl) {
+      candidates.push({ routeType: "iroh", url: irohUrl });
+    }
+  }
+
+  if (wssUrl && !candidates.some((c) => c.url === wssUrl)) {
+    candidates.push({ routeType: "wss", url: wssUrl });
+  }
+  return candidates;
+}
+
 function normalizeStoredMachine(entry) {
   if (!entry || typeof entry !== "object") return null;
   const id = typeof entry.id === "string" ? entry.id.trim() : "";

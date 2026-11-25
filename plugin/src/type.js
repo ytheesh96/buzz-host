@@ -84,8 +84,8 @@ export function createType({
   }
 
   /**
-   * Runtime, Hermes profile, Model, Concurrency, Access and Runner rows, for a
-   * SettingsGroup. With `collapsible` (the Create popup), only Runtime and
+   * Harness, Hermes profile, Model, Concurrency, Access and Runner rows, for a
+   * SettingsGroup. With `collapsible` (the Create popup), only Harness and
    * Model show; the rest sit behind a "More options" row whose subtitle names
    * their current values, so the defaults stay visible without crowding.
    */
@@ -126,7 +126,7 @@ export function createType({
       React.Fragment,
       null,
       h(ui.Select, {
-        label: "Runtime",
+        label: "Harness",
         variant: "preference",
         value: effective.runtime,
         disabled,
@@ -140,8 +140,8 @@ export function createType({
         groupByFamily: choice.byFamily,
         value: effective.model,
         allowCustomModel: true,
-        defaultLabel: "Runtime default",
-        defaultDescription: "The model this runtime uses on the server",
+        defaultLabel: "Harness default",
+        defaultDescription: "The model this harness uses on the server",
         loading: models === undefined,
         disabled,
         ...(error ? { description: `Model list unavailable: ${error}` } : {}),
@@ -236,7 +236,7 @@ export function createType({
             s.runner && s.runner !== "host" && s.runner,
             s.respondTo && s.respondTo !== "owner-only" && s.respondTo,
             s.profile && `profile ${s.profile}`,
-            s.model || "runtime default",
+            s.model || "harness default",
           ]
             .filter(Boolean)
             .join(" · ");
@@ -250,7 +250,8 @@ export function createType({
   }
 
   // ----- creation fields -----
-  // New agent: Buzz's Harness row with Runtime, Hermes profile and Model rows
+  // New agent: Harness (this server's harness; Buzz's own Harness row is
+  // hidden once Run on picks a machine), Hermes profile and Model rows
   // (CreateConfiguration), then Instructions (Create), as Buzz's hosted types
   // lay them out. In Buzz's review of an agent's proposed edit (local Buzz
   // patch 0003), only the name and, when proposed, the instructions change,
@@ -365,7 +366,7 @@ export function createType({
       { style: { display: "grid", gap: "var(--space-3)" } },
       h(
         Row,
-        { label: "Runtime", hint: "Runs on the server with buzz-acp; uses that machine's sign-ins." },
+        { label: "Harness", hint: "Runs on the server with buzz-acp; uses that machine's sign-ins." },
         h(Select, {
           value: draft.runtime,
           disabled,
@@ -798,7 +799,7 @@ export function createType({
       ),
       h(
         Row,
-        { label: "Runtime" },
+        { label: "Harness" },
         h(Select, {
           value: draft.runtime,
           disabled: !!busy,

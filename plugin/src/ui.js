@@ -225,7 +225,7 @@ export function modelChoices(models) {
       byFamily: true,
       models: groups.flatMap((g) => g.models.map((m) => ({ id: m.id, label: m.label, family: g.label }))),
     };
-  // The runtime's own "default" entry is the picker's Runtime default.
+  // The runtime's own "default" entry is the picker's Harness default.
   return {
     byFamily: false,
     models: (models ?? []).filter((m) => m.id !== "default").map((m) => ({ id: m.id, label: m.name || m.id })),
@@ -263,7 +263,7 @@ export function ModelField({ React, client, runtime, profile, value, onChange, d
     value,
     disabled,
     placeholder:
-      models === undefined ? "Loading models… (blank = runtime default)" : "Model id (blank = runtime default)",
+      models === undefined ? "Loading models… (blank = harness default)" : "Model id (blank = harness default)",
     onChange: (e) => onChange(e.target.value),
   });
   let body;
@@ -281,7 +281,7 @@ export function ModelField({ React, client, runtime, profile, value, onChange, d
           if (next !== providerOf(value || "")) onChange("");
         },
         options: [
-          { value: "", label: "Provider: runtime default" },
+          { value: "", label: "Provider: harness default" },
           ...groups.map((g) => ({ value: g.key, label: `${g.label} (${g.models.length})` })),
           { value: "__custom", label: "Other model id…" },
         ],
@@ -292,7 +292,7 @@ export function ModelField({ React, client, runtime, profile, value, onChange, d
         onChange,
         options: group
           ? [{ value: "", label: "Choose a model" }, ...group.models.map((m) => ({ value: m.id, label: m.label }))]
-          : [{ value: "", label: value ? value : "Runtime default" }],
+          : [{ value: "", label: value ? value : "Harness default" }],
       }),
     );
   else
@@ -301,7 +301,7 @@ export function ModelField({ React, client, runtime, profile, value, onChange, d
       disabled,
       onChange: (next) => (next === "__custom" ? setTyping(true) : onChange(next)),
       options: [
-        { value: "", label: "Runtime default" },
+        { value: "", label: "Harness default" },
         ...known.map((m) => ({ value: m.id, label: m.name === m.id ? m.id : `${m.name} (${m.id})` })),
         { value: "__custom", label: "Other…" },
       ],

@@ -726,3 +726,201 @@ test("multi-machine client routes RPCs by machineId and agent pubkey, and fans o
     globalThis.WebSocket = prevWs;
   }
 });
+
+test("Iroh -> WSS multi-route resolution and fallback for RPC and Viewport VNC", async () => {
+  const { createClient } = await import("./src/client.js");
+  const { MACHINES_KEY, AGENT_HOSTS_KEY, resolveMachineWsCandidates } = await import("./src/config.js");
+
+  const mem = new Map();
+  const prevStorage = globalThis.localStorage;
+  const prevWs = globalThis.WebSocket;
+  const prevTunnel = globalThis.__BUZZ_IROH_TUNNEL__;
+  const prevTauri = globalThis.__TAURI_INTERNALS__;
+
+  globalThis.localStorage = {
+    getItem: (k) => (mem.has(k) ? mem.get(k) : null),
+    setItem: (k, v) => mem.set(k, String(v)),
+    removeItem: (k) => mem.delete(k),
+  };
+
+  try {
+    const dualMachine = {
+      id: "m-dual",
+      name: "Dual Machine",
+      url: "wss://dual.example.org/_buzz-host",
+      token: "bha_secret",
+      routes: [
+        { type: "iroh", nodeId: "node-1", endpointAddr: "ZW5kcG9pbnQx" },
+        { type: "wss", url: "wss://dual.example.org/_buzz-host" },
+      ],
+    };
+    const tokenlessMachine = {
+      ...dualMachine,
+      id: "m-tailnet",
+      token: "",
+    };
+
+    // 1. No Tauri bridge -> wss only
+    delete globalThis.__BUZZ_IROH_TUNNEL__;
+    delete globalThis.__TAURI_INTERNALS__;
+    assert.deepEqual(await resolveMachineWsCandidates(dualMachine), [
+      { routeType: "wss", url: "wss://dual.example.org/_buzz-host" },
+    ]);
+
+    // 2. __BUZZ_IROH_TUNNEL__.resolveUrl used when token present; skipped when tokenless
+    const bridgeCalls = [];
+    globalThis.__BUZZ_IROH_TUNNEL__ = {
+      async resolveUrl(machine, wsPath) {
+        bridgeCalls.push([machine.id, wsPath ?? null]);
+        return `ws://127.0.0.1:41234/t/sec/${machine.id}${wsPath ?? ""}`;
+      },
+    };
+    assert.deepEqual(await resolveMachineWsCandidates(dualMachine), [
+      { routeType: "iroh", url: "ws://127.0.0.1:41234/t/sec/m-dual" },
+      { routeType: "wss", url: "wss://dual.example.org/_buzz-host" },
+    ]);
+    assert.deepEqual(
+      await resolveMachineWsCandidates(dualMachine, { path: "/desktop?ticket=tok123" }),
+      [
+        { routeType: "iroh", url: "ws://127.0.0.1:41234/t/sec/m-dual/desktop?ticket=tok123" },
+        { routeType: "wss", url: "wss://dual.example.org/_buzz-host/desktop?ticket=tok123" },
+      ],
+    );
+    assert.deepEqual(await resolveMachineWsCandidates(tokenlessMachine), [
+      { routeType: "wss", url: "wss://dual.example.org/_buzz-host" },
+    ]);
+    assert.deepEqual(bridgeCalls, [
+      ["m-dual", null],
+      ["m-dual", "/desktop?ticket=tok123"],
+    ]);
+
+    // 3. __TAURI_INTERNALS__.invoke fallback when __BUZZ_IROH_TUNNEL__ is absent
+    delete globalThis.__BUZZ_IROH_TUNNEL__;
+    const tauriCalls = [];
+    globalThis.__TAURI_INTERNALS__ = {
+      async invoke(cmd, args) {
+        tauriCalls.push([cmd, args]);
+        return `ws://127.0.0.1:45678/t/tok/${args.machineId}${args.path ?? ""}`;
+      },
+    };
+    assert.deepEqual(
+      await resolveMachineWsCandidates(dualMachine, { path: "/desktop?ticket=abc" }),
+      [
+        { routeType: "iroh", url: "ws://127.0.0.1:45678/t/tok/m-dual/desktop?ticket=abc" },
+        { routeType: "wss", url: "wss://dual.example.org/_buzz-host/desktop?ticket=abc" },
+      ],
+    );
+    assert.deepEqual(tauriCalls, [
+      [
+        "iroh_tunnel_endpoint",
+        { machineId: "m-dual", endpointAddr: "ZW5kcG9pbnQx", path: "/desktop?ticket=abc" },
+      ],
+    ]);
+
+    // 4. Client tries Iroh first; falls back to WSS on connect failure AND on auth failure
+    localStorage.setItem(MACHINES_KEY, JSON.stringify([dualMachine]));
+    localStorage.setItem(AGENT_HOSTS_KEY, JSON.stringify({ ["aa".repeat(32)]: "m-dual" }));
+
+    let mode = "iroh-ok";
+    const dialed = [];
+    class FallbackMockWs {
+      static OPEN = 1;
+      readyState = 1;
+      constructor(url) {
+        this.url = url;
+        dialed.push(url);
+        queueMicrotask(() => {
+          if (mode === "iroh-connect-fail" && url.startsWith("ws://127.0.0.1")) {
+            this.readyState = 3;
+            this.onclose?.();
+            return;
+          }
+          this.onopen?.();
+        });
+      }
+      send(raw) {
+        const msg = JSON.parse(raw);
+        if (msg.method === "auth") {
+          if (mode === "iroh-auth-fail" && this.url.startsWith("ws://127.0.0.1")) {
+            this.onmessage?.({ data: JSON.stringify({ id: msg.id, error: "token rejected" }) });
+          } else {
+            this.onmessage?.({ data: JSON.stringify({ id: msg.id, result: { role: "admin" } }) });
+          }
+          return;
+        }
+        if (msg.method === "hello") {
+          this.onmessage?.({ data: JSON.stringify({ id: msg.id, result: { role: "admin", via: this.url } }) });
+        }
+      }
+      close() {
+        this.readyState = 3;
+        this.onclose?.();
+      }
+    }
+    globalThis.WebSocket = FallbackMockWs;
+
+    // 4a. Iroh succeeds directly
+    {
+      dialed.length = 0;
+      mode = "iroh-ok";
+      const client = createClient();
+      try {
+        const res = await client.call("hello");
+        assert.equal(res.via, "ws://127.0.0.1:45678/t/tok/m-dual");
+        assert.equal(client.snapshot().routeType, "iroh");
+        assert.deepEqual(dialed, ["ws://127.0.0.1:45678/t/tok/m-dual"]);
+        // Viewport VNC candidate resolution via client.resolveUrlsForAgent
+        const vncUrls = await client.resolveUrlsForAgent("aa".repeat(32), "/desktop?ticket=t1");
+        assert.deepEqual(vncUrls, [
+          { routeType: "iroh", url: "ws://127.0.0.1:45678/t/tok/m-dual/desktop?ticket=t1" },
+          { routeType: "wss", url: "wss://dual.example.org/_buzz-host/desktop?ticket=t1" },
+        ]);
+      } finally {
+        client.close();
+      }
+    }
+
+    // 4b. Iroh connect failure falls back to WSS
+    {
+      dialed.length = 0;
+      mode = "iroh-connect-fail";
+      const client = createClient();
+      try {
+        const res = await client.call("hello");
+        assert.equal(res.via, "wss://dual.example.org/_buzz-host");
+        assert.equal(client.snapshot().routeType, "wss");
+        assert.deepEqual(dialed, [
+          "ws://127.0.0.1:45678/t/tok/m-dual",
+          "wss://dual.example.org/_buzz-host",
+        ]);
+      } finally {
+        client.close();
+      }
+    }
+
+    // 4c. Iroh auth failure falls back to WSS
+    {
+      dialed.length = 0;
+      mode = "iroh-auth-fail";
+      const client = createClient();
+      try {
+        const res = await client.call("hello");
+        assert.equal(res.via, "wss://dual.example.org/_buzz-host");
+        assert.equal(client.snapshot().routeType, "wss");
+        assert.deepEqual(dialed, [
+          "ws://127.0.0.1:45678/t/tok/m-dual",
+          "wss://dual.example.org/_buzz-host",
+        ]);
+      } finally {
+        client.close();
+      }
+    }
+  } finally {
+    globalThis.localStorage = prevStorage;
+    globalThis.WebSocket = prevWs;
+    if (prevTunnel === undefined) delete globalThis.__BUZZ_IROH_TUNNEL__;
+    else globalThis.__BUZZ_IROH_TUNNEL__ = prevTunnel;
+    if (prevTauri === undefined) delete globalThis.__TAURI_INTERNALS__;
+    else globalThis.__TAURI_INTERNALS__ = prevTauri;
+  }
+});

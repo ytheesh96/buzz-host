@@ -29,6 +29,7 @@ import { createMcpServer } from "./mcp-server.mjs";
 import { createMemory } from "./memory.mjs";
 import { createOrchestrator } from "./orchestrator.mjs";
 import { createRelayWatcher } from "./attention-relay.mjs";
+import { createDiscoveryPublisher, loadMachineId } from "./discovery.mjs";
 import { catalogs, forComposer, formatTarget, parseTarget, resolveChatSettings, toModelList, toModels } from "./catalog.mjs";
 import { proxyControl as routeControl } from "./control.mjs";
 import * as desktop from "./desktop/desktop.mjs";
@@ -57,6 +58,7 @@ import {
   parseListenerConfig,
 } from "./auth.mjs";
 import { createServiceManager, ensurePrivateDir, runDir, runtimeBase } from "./service-manager.mjs";
+import { createIrohSupervisor } from "./iroh-supervisor.mjs";
 import {
   clientIpFromForwardedFor,
   createFragmentBuffer,
@@ -227,6 +229,21 @@ function parseConfig(raw, file = CONFIG) {
     ),
     // Communities agents may join; empty means any wss:// URL.
     allowCommunities: new Set(raw.allowCommunities ?? []),
+    // Machine discovery (discovery.mjs): an encrypted status event per owner
+    // on their relay. `discovery: false` turns it off.
+    discovery: raw.discovery !== false,
+    discoveryIntervalMs:
+      Number.isFinite(raw.discoveryIntervalMs) && raw.discoveryIntervalMs >= 5_000 ? raw.discoveryIntervalMs : 45_000,
+    machineId: typeof raw.machineId === "string" ? raw.machineId : undefined,
+    machineName: typeof raw.machineName === "string" ? raw.machineName : undefined,
+    publicUrl: typeof raw.publicUrl === "string" ? raw.publicUrl : undefined,
+    // Optional Iroh QUIC -> guestPort sidecar (buzz-host-iroh).
+    iroh: raw.iroh !== false,
+    irohBin: typeof raw.irohBin === "string" ? raw.irohBin.trim() : "",
+    irohMaxStreams:
+      Number.isInteger(raw.irohMaxStreams) && raw.irohMaxStreams > 0
+        ? raw.irohMaxStreams
+        : undefined,
   };
 }
 
@@ -776,6 +793,8 @@ const methods = {
     return {
       version: VERSION,
       host: os.hostname(),
+      // Stable across restarts: clients merge manual and discovered machines on it.
+      machineId: MACHINE_ID,
       role: session?.role ?? "admin",
       // Host OS and what it can do, so clients hide what this host lacks.
       platform: process.platform,
@@ -897,6 +916,7 @@ const methods = {
     await saveMeta(pubkey, next);
     await services.enableAndStart(pubkey);
     await services.restart(pubkey);
+    discovery?.notifyChanged();
     return { status: await active(pubkey) };
   },
 
@@ -905,6 +925,7 @@ const methods = {
     const next = { ...m, name: checkName(name), picture: checkPicture(picture) };
     if (m.activated) await publishProfile(pubkey, next.name, next.picture);
     await saveMeta(pubkey, next);
+    discovery?.notifyChanged();
     return {};
   },
 
@@ -1325,6 +1346,7 @@ const methods = {
     await fs.rm(dir(pubkey), { recursive: true, force: true });
     watcher.sync(pubkey, null);
     attention.forget(pubkey);
+    discovery?.notifyChanged();
     return {};
   },
 };
@@ -1402,6 +1424,12 @@ function serveSocket(socket, onText) {
 // ---------- server ----------
 
 const config = await loadConfig();
+const MACHINE_ID = await loadMachineId({
+  file: path.join(HOME, ".local/share/buzz-host/machine-id"),
+  configured: config.machineId,
+});
+/** Machine discovery publisher (set once boot reaches it; null when off). */
+let discovery = null;
 // macOS: the short /tmp base is shared space, so create it 0700 and refuse one
 // another user planted. (Linux's /run/user/<uid> is already private.)
 if (process.platform === "darwin") {
@@ -1526,6 +1554,27 @@ for (const name of (await fs.readdir(DATA).catch(() => [])).filter((n) => HEX64.
   if (m) allAgentMetas.push(m);
 }
 await runnerManager.reconcileOnStartup(allAgentMetas);
+// Machine discovery: this host's status, encrypted to each owner, on their relay.
+discovery = config.discovery
+  ? createDiscoveryPublisher({
+      dataDir: DATA,
+      runDir: RUN_DIR,
+      machineId: MACHINE_ID,
+      intervalMs: config.discoveryIntervalMs,
+      config: () => config,
+      runtimes: async () => {
+        const ids = await Promise.all(
+          Object.entries(RUNTIMES).map(async ([id, r]) => ((await installed(r.command)) ? id : null)),
+        );
+        return ids.filter(Boolean);
+      },
+      capabilities: async () => ({
+        desktop: DESKTOP_SUPPORTED,
+        docker: (await runnerManager.availableRunners()).some((r) => r.id === "docker" && r.available),
+      }),
+    })
+  : null;
+discovery?.start();
 await attention.syncNotes(allAgentMetas.map((m) => m.pubkey));
 // Sync Antigravity PreToolUse guard plugin (denies `schedule` for Buzz agents)
 // into ~/.gemini/config/plugins/buzz-host-guards if bundled under LIB/agy-plugin.
@@ -1687,6 +1736,7 @@ if (server) {
 // guest (bhg_) or admin (bha_) access token. Serves /desktop only for valid,
 // single-use tickets minted by an admin token or a trusted guest token.
 let guestServer = null;
+let irohSupervisor = null;
 if (Number.isInteger(config.guestPort) && config.guestPort > 0) {
   const guestSocketRegistry = createGuestSocketRegistry({
     maxSockets: config.guestMaxSockets,
@@ -1818,9 +1868,16 @@ if (Number.isInteger(config.guestPort) && config.guestPort > 0) {
       } catch {}
     }
   });
-  guestServer.listen(config.guestPort, "127.0.0.1", () =>
-    console.log(`buzz-host guest listening on 127.0.0.1:${config.guestPort}`),
-  );
+  guestServer.listen(config.guestPort, "127.0.0.1", () => {
+    console.log(`buzz-host guest listening on 127.0.0.1:${config.guestPort}`);
+    irohSupervisor = createIrohSupervisor({
+      config,
+      libDir: LIB,
+      configDir: path.dirname(CONFIG),
+      runDir: RUN_DIR,
+    });
+    irohSupervisor.start();
+  });
 }
 
 const idleSweepTimer =
@@ -1840,6 +1897,8 @@ async function shutdown(signal) {
   console.log(`buzz-host shutting down (${signal})`);
   if (idleSweepTimer) clearInterval(idleSweepTimer);
   clearInterval(revokeSweepTimer);
+  await discovery?.stop().catch(() => {});
+  await irohSupervisor?.stop().catch(() => {});
   server?.close();
   guestServer?.close();
   await mcpServer.stop().catch(() => {});

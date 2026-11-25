@@ -68,6 +68,7 @@ function makeFixture(t) {
     "mcp-server.mjs",
     "memory.mjs",
     "nip44.mjs",
+    "discovery.mjs",
     "attention-relay.mjs",
     "noble.mjs",
     "workspace.mjs",
@@ -77,6 +78,7 @@ function makeFixture(t) {
     "file-lock.mjs",
     "ws-security.mjs",
     "service-manager.mjs",
+    "iroh-supervisor.mjs",
   ];
   for (const f of serverFiles) {
     const p = path.join(work, "server", f);
