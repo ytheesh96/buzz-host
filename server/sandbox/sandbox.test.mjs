@@ -17,6 +17,7 @@ import {
 } from "./index.mjs";
 import { createSandboxProxy, parseDotEnvValue } from "./proxy.mjs";
 import { createSandboxMcpBridge, isAllowedSandboxTool } from "./mcp-bridge.mjs";
+import { buildDesktopArgs, containerName as desktopContainerName } from "./desktop-sidecar.mjs";
 import {
   SANDBOX_BRIDGE,
   SANDBOX_FIREWALL_UNIT,
@@ -107,11 +108,12 @@ test("runner and respondTo policy enforces sandbox invariant and allowlist valid
   );
   assert.throws(() => normalizeAllowlist(["not-a-pubkey"]), /Invalid pubkey/);
 
-  // Sandboxed agents cannot enable host desktop or orchestrator.
+  // Sandboxed agents cannot enable orchestration; a desktop is allowed (it
+  // runs in a sidecar container, never on the host).
   assert.equal(isSandboxed({ runner: "host" }), false);
   assert.equal(isSandboxed({ runner: "docker" }), true);
   assert.doesNotThrow(() => assertSandboxRestrictions({ runner: "host", desktop: true, orchestrate: true }));
-  assert.throws(() => assertSandboxRestrictions({ runner: "docker", desktop: true }), /host desktop/);
+  assert.doesNotThrow(() => assertSandboxRestrictions({ runner: "docker", desktop: true }));
   assert.throws(() => assertSandboxRestrictions({ runner: "docker", orchestrate: true }), /host orchestration/);
 });
 
@@ -350,6 +352,155 @@ test("scoped MCP bridge pins pubkey server-side, allows memory/optional attentio
     const res = await unixJsonLine(sockPath, { name: blocked, args: {} });
     assert.match(res.error, /not permitted/, `${blocked} should be blocked`);
   }
+});
+
+test("scoped MCP bridge forwards computer tools only while the agent has a desktop", async (t) => {
+  const tmp = await makeTempDir("buzz-sandbox-mcp-desk-");
+  t.after(() => fs.rm(tmp, { recursive: true, force: true }));
+  let desktopOn = false;
+  const created = [];
+  const calls = [];
+  const computerModule = async () => ({
+    instructions: (pk) => `desk:${pk.slice(0, 4)}`,
+    createComputer(pk, opts) {
+      created.push({ pk, opts });
+      return {
+        tools: async () => [{ name: "click", description: "c", inputSchema: { type: "object" } }],
+        call: async (name, args, o) => {
+          calls.push({ name, args, chat: o?.chat });
+          return { content: [{ type: "text", text: `did ${name}` }] };
+        },
+        close() {},
+      };
+    },
+  });
+  const bridge = createSandboxMcpBridge({
+    runDir: path.join(tmp, "run"),
+    isAttentionEnabled: async () => false,
+    isDesktopEnabled: async () => desktopOn,
+    computerModule,
+    callTool: async (pubkey, name) => `ok:${name}`,
+    log: { warn() {} },
+  });
+  t.after(() => bridge.close());
+  const { sockPath } = await bridge.ensureAgent(PUBKEY_A);
+
+  // No desktop: no tools, and computer names are refused like any host tool.
+  assert.match((await unixJsonLine(sockPath, { op: "computer.tools" })).error, /no desktop/);
+  assert.match((await unixJsonLine(sockPath, { name: "click", args: {} })).error, /not permitted/);
+  assert.equal(created.length, 0);
+
+  desktopOn = true;
+  const listed = await unixJsonLine(sockPath, { op: "computer.tools" });
+  assert.deepEqual(listed.result.tools.map((x) => x.name), ["click"]);
+  assert.equal(listed.result.instructions, `desk:${PUBKEY_A.slice(0, 4)}`);
+  // Always a sidecar desktop for the socket's own agent, never another pubkey.
+  assert.deepEqual(created, [{ pk: PUBKEY_A, opts: { sandboxed: true } }]);
+
+  const chat = "61ace2b8-1160-44c8-ad2b-6efd96b816af";
+  const res = await unixJsonLine(sockPath, { pubkey: PUBKEY_B, name: "click", args: { x: 1 }, chat });
+  assert.equal(res.computer.content[0].text, "did click");
+  assert.deepEqual(calls.at(-1), { name: "click", args: { x: 1 }, chat });
+  // A malformed chat key is dropped, not passed through.
+  await unixJsonLine(sockPath, { name: "click", args: {}, chat: "../../etc" });
+  assert.equal(calls.at(-1).chat, "");
+  // Memory still goes to buzz-host's own handler; orchestrator stays blocked.
+  assert.equal((await unixJsonLine(sockPath, { name: "mem_get", args: {} })).result, "ok:mem_get");
+  assert.match((await unixJsonLine(sockPath, { name: "orch_delegate", args: {} })).error, /not permitted/);
+
+  desktopOn = false;
+  assert.match((await unixJsonLine(sockPath, { name: "click", args: {} })).error, /not permitted/);
+});
+
+test("container MCP lists and forwards computer tools through the scoped bridge", async (t) => {
+  const tmp = await makeTempDir("buzz-sandbox-cmcp-");
+  t.after(() => fs.rm(tmp, { recursive: true, force: true }));
+  const calls = [];
+  const bridge = createSandboxMcpBridge({
+    runDir: path.join(tmp, "run"),
+    isAttentionEnabled: async () => false,
+    isDesktopEnabled: async () => true,
+    computerModule: async () => ({
+      instructions: () => "Your computer: test desktop",
+      createComputer: () => ({
+        tools: async () => [{ name: "click", description: "c", inputSchema: { type: "object" } }],
+        call: async (name, args, o) => {
+          calls.push({ name, args, chat: o.chat });
+          return { content: [{ type: "text", text: "clicked" }] };
+        },
+        close() {},
+      }),
+    }),
+    callTool: async (pubkey, name) => `mem:${name}`,
+    log: { warn() {} },
+  });
+  t.after(() => bridge.close());
+  const { sockPath } = await bridge.ensureAgent(PUBKEY_A);
+  const chat = "61ace2b8-1160-44c8-ad2b-6efd96b816af";
+  const { spawn } = await import("node:child_process");
+  const readline = (await import("node:readline")).default;
+  const child = spawn(process.execPath, [path.join(import.meta.dirname, "container-mcp.mjs")], {
+    env: { ...process.env, BUZZ_HOST_MCP_SOCK: sockPath, BUZZ_SANDBOX_COMPUTER: "1", BUZZHOST_CHAT: chat },
+    stdio: ["pipe", "pipe", "ignore"],
+  });
+  t.after(() => child.kill());
+  const waiting = new Map();
+  readline.createInterface({ input: child.stdout }).on("line", (l) => {
+    const m = JSON.parse(l);
+    waiting.get(m.id)?.(m);
+  });
+  let id = 0;
+  const rpc = (method, params) =>
+    new Promise((resolve) => {
+      const i = ++id;
+      waiting.set(i, resolve);
+      child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: i, method, params })}\n`);
+    });
+  const init = await rpc("initialize", {});
+  assert.match(init.result.instructions, /Your computer: test desktop/);
+  const names = (await rpc("tools/list", {})).result.tools.map((x) => x.name);
+  assert.ok(names.includes("mem_get") && names.includes("click"));
+  const res = await rpc("tools/call", { name: "click", arguments: { x: 3 } });
+  assert.equal(res.result.content[0].text, "clicked");
+  assert.deepEqual(calls, [{ name: "click", args: { x: 3 }, chat }]);
+  assert.equal((await rpc("tools/call", { name: "mem_get", arguments: {} })).result.content[0].text, "mem:mem_get");
+  assert.equal((await rpc("tools/call", { name: "orch_delegate", arguments: {} })).result.isError, true);
+});
+
+test("desktop sidecar args: hardened, filtered network, only the desktop's own dirs", () => {
+  const dir = `/home/u/.local/share/buzz-host/agents/${PUBKEY_A}/desktop`;
+  const socketDir = `/run/user/1000/buzz-host/desktop/${PUBKEY_A.slice(0, 16)}`;
+  const args = buildDesktopArgs({
+    pubkey: PUBKEY_A,
+    dir,
+    socketDir,
+    launcherDir: "/home/u/.local/lib/buzz-host/desktop",
+    cuaDriver: "/home/u/.local/share/buzz-host/tools/cua/cua-driver",
+    env: { HERMES_BD_DISPLAY_NUM: "1" },
+    uid: 1000,
+    gid: 1000,
+  });
+  const joined = args.join(" ");
+  assert.equal(args[args.indexOf("--name") + 1], desktopContainerName(PUBKEY_A));
+  assert.notEqual(desktopContainerName(PUBKEY_A), containerName(PUBKEY_A));
+  for (const flag of ["--cap-drop=ALL", "--security-opt=no-new-privileges:true", "--read-only", "--init"])
+    assert.ok(args.includes(flag), flag);
+  assert.equal(args[args.indexOf("--network") + 1], "buzz-sandbox");
+  assert.equal(args[args.indexOf("--user") + 1], "1000:1000");
+  assert.ok(args.some((a) => a.startsWith("--memory=")) && args.some((a) => a.startsWith("--pids-limit=")));
+  const mounts = args.flatMap((a, i) => (args[i - 1] === "-v" ? [a] : []));
+  for (const m of mounts) {
+    const [src, dst, mode] = m.split(":");
+    if (dst === "/etc/passwd" || dst === "/etc/group") {
+      assert.equal(mode, "ro");
+      continue;
+    }
+    assert.equal(src, dst, "mounted at its host path");
+    if (mode === "rw") assert.ok([dir, socketDir].includes(src), `only the desktop's own dirs are writable: ${m}`);
+  }
+  // Nothing of the agent's identity, workspace or credentials.
+  assert.doesNotMatch(joined, /sandbox\.env|\/key\b|auth\.json|buzz-agents|proxy\.sock|docker\.sock|\/dev\/uinput/);
+  assert.throws(() => buildDesktopArgs({ pubkey: PUBKEY_A, dir, socketDir, launcherDir: "/x", cuaDriver: "/y", env: { A: "a\nb" } }), /newline/);
 });
 
 test("Docker sandbox config and args harden container and never leak host secrets or meta.json", async (t) => {

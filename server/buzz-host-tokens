@@ -2,7 +2,7 @@
 // CLI for managing buzz-host access tokens directly on the host.
 //
 // Usage:
-//   buzz-host-tokens create --label Alice [--owner <64-hex>] [--max-agents 2] [--max-concurrency 2] [--runtimes hermes,claude,antigravity] [--allow-host-desktop]
+//   buzz-host-tokens create --label Alice [--owner <64-hex>] [--max-agents 2] [--max-concurrency 2] [--runtimes hermes,claude,antigravity] [--allow-host-desktop] [--no-sandbox-desktop]
 //   buzz-host-tokens create-admin --label "My laptop" [--owner <64-hex>] [--url wss://...] [--json]
 //                    (same as: create --role admin ...)
 //   buzz-host-tokens list [--json]
@@ -68,7 +68,7 @@ try {
     throw new Error(`--role must be "guest" or "admin", not "${flags.role}"`);
   }
   if ((cmd === "create" || cmd === "create-admin") && role === "admin") {
-    const guestOnly = ["max-agents", "max-concurrency", "runtimes", "allow-host-desktop", "trusted"].filter((f) => f in flags);
+    const guestOnly = ["max-agents", "max-concurrency", "runtimes", "allow-host-desktop", "no-sandbox-desktop", "trusted"].filter((f) => f in flags);
     if (guestOnly.length) throw new Error(`Admin tokens have no guest caps; drop --${guestOnly.join(", --")}`);
     const { token, record } = await store.createAdmin({ label: flags.label ?? rest[0], ownerPubkey: flags.owner });
     const baseUrl =
@@ -93,6 +93,8 @@ try {
             .filter(Boolean)
         : undefined;
     const allowHostDesktop = Boolean(flags["allow-host-desktop"] || flags.trusted);
+    // A desktop in the agent's own container (on by default); nothing runs on the host as you.
+    const allowSandboxDesktop = !flags["no-sandbox-desktop"];
     const { token, record } = await store.create({
       label: flags.label ?? rest[0],
       ownerPubkey: flags.owner,
@@ -100,6 +102,7 @@ try {
       maxConcurrency: flags["max-concurrency"],
       allowedRuntimes,
       allowHostDesktop,
+      allowSandboxDesktop,
     });
     const baseUrl =
       typeof flags.url === "string" && flags.url.trim() ? flags.url.trim() : await publicGuestUrl();
@@ -109,7 +112,7 @@ try {
     } else {
       console.log(`Created guest token ${record.id} for "${record.label}"`);
       console.log(
-        `Limits: maxAgents=${record.maxAgents}, maxConcurrency=${record.maxConcurrency}, runtimes=${record.allowedRuntimes.join(",")}, hostDesktop=${record.allowHostDesktop ? "yes (trusted)" : "no"}`,
+        `Limits: maxAgents=${record.maxAgents}, maxConcurrency=${record.maxConcurrency}, runtimes=${record.allowedRuntimes.join(",")}, hostDesktop=${record.allowHostDesktop ? "yes (trusted)" : "no"}, sandboxDesktop=${record.allowSandboxDesktop !== false ? "yes" : "no"}`,
       );
       if (record.ownerPubkey) console.log(`Bound owner: ${record.ownerPubkey}`);
       else console.log("Bound owner: (will bind automatically on first agent activation)");
@@ -129,7 +132,7 @@ try {
         const detail =
           t.role === "admin"
             ? "full access"
-            : `caps=${t.maxAgents}a/${t.maxConcurrency}c  runtimes=${t.allowedRuntimes.join(",")}${t.allowHostDesktop ? "  hostDesktop=yes" : ""}`;
+            : `caps=${t.maxAgents}a/${t.maxConcurrency}c  runtimes=${t.allowedRuntimes.join(",")}${t.allowHostDesktop ? "  hostDesktop=yes" : ""}${t.allowSandboxDesktop !== false ? "  sandboxDesktop=yes" : "  sandboxDesktop=no"}`;
         console.log(`${t.id}  ${t.role.padEnd(5)}  ${t.label}  [${status}]  owner=${owner}  ${detail}`);
       }
     }

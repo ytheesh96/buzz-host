@@ -51,11 +51,13 @@ import {
   canAccessAgent,
   createAuthRateLimiter,
   createTokenStore,
+  assertGuestDesktop,
   desktopTicketTokenAllowed,
   enforceGuestSettings,
   findIdleGuestDesktops,
   isValidDesktopTicket,
   parseListenerConfig,
+  sandboxDesktopAllowed,
 } from "./auth.mjs";
 import { createServiceManager, ensurePrivateDir, runDir, runtimeBase } from "./service-manager.mjs";
 import { createIrohSupervisor } from "./iroh-supervisor.mjs";
@@ -759,6 +761,7 @@ const methods = {
       maxConcurrency: record.maxConcurrency,
       allowedRuntimes: record.allowedRuntimes,
       allowHostDesktop: record.allowHostDesktop === true,
+      allowSandboxDesktop: sandboxDesktopAllowed(record),
     };
     session.registerTokenSocket?.(record.id);
     session.onAuthenticated?.();
@@ -798,7 +801,8 @@ const methods = {
       role: session?.role ?? "admin",
       // Host OS and what it can do, so clients hide what this host lacks.
       platform: process.platform,
-      capabilities: { desktop: DESKTOP_SUPPORTED },
+      // sandboxDesktop: Docker agents can have a desktop (in a sidecar container).
+      capabilities: { desktop: DESKTOP_SUPPORTED, sandboxDesktop: DESKTOP_SUPPORTED },
       // Which access token this connection uses (never the secret).
       ...(session?.tokenId ? { tokenId: session.tokenId } : {}),
       ...(isGuest
@@ -1165,7 +1169,10 @@ const methods = {
     const m = await ownedMeta(pubkey, session);
     if (enabled === true) assertDesktopSupported();
     const next = { ...m, desktop: enabled === true };
-    if (next.desktop) assertSandboxRestrictions(next);
+    if (next.desktop) {
+      assertGuestDesktop(session, next);
+      assertSandboxRestrictions(next);
+    }
     await saveMeta(pubkey, next);
     if (!next.desktop) {
       desktopLastActivity.delete(pubkey);
@@ -1181,8 +1188,9 @@ const methods = {
     assertDesktopSupported();
     const m = await ownedMeta(pubkey, session);
     if (m.desktop !== true) throw new Error("This agent has no desktop; turn it on first");
+    assertGuestDesktop(session, m);
     await assertGuestDesktopCapacity(config, pubkey, m);
-    await desktop.start(pubkey);
+    await desktop.start(pubkey, { sandboxed: isSandboxed(m) });
     touchDesktop(pubkey);
     return { enabled: true, ...desktopView(pubkey) };
   },
@@ -1220,8 +1228,9 @@ const methods = {
     assertDesktopSupported();
     const m = await ownedMeta(pubkey, session);
     if (m.desktop !== true) throw new Error("This agent has no desktop; turn it on first");
+    assertGuestDesktop(session, m);
     await assertGuestDesktopCapacity(config, pubkey, m);
-    await desktop.start(pubkey);
+    await desktop.start(pubkey, { sandboxed: isSandboxed(m) });
     touchDesktop(pubkey);
     const now = Date.now();
     for (const [t, v] of viewTickets) if (v.expires < now) viewTickets.delete(t);
@@ -1240,7 +1249,7 @@ const methods = {
   // false = Hand back. Only the viewer that holds it can hand it back.
   async "desktop.lease"(config, { pubkey, viewer, take, reason }, session) {
     assertDesktopSupported();
-    await ownedMeta(pubkey, session);
+    assertGuestDesktop(session, await ownedMeta(pubkey, session));
     if (typeof viewer !== "string" || viewer.length < 16) throw new Error("viewer is required");
     touchDesktop(pubkey);
     const leaseDir = desktop.desktopDir(pubkey);
@@ -1298,7 +1307,10 @@ const methods = {
   },
 
   // Admin-only guest token management (multi-tenant hosting).
-  async "tokens.create"(config, { label, ownerPubkey, maxAgents, maxConcurrency, allowedRuntimes, allowHostDesktop }) {
+  async "tokens.create"(
+    config,
+    { label, ownerPubkey, maxAgents, maxConcurrency, allowedRuntimes, allowHostDesktop, allowSandboxDesktop },
+  ) {
     const { token, record } = await tokenStore.create({
       label,
       ownerPubkey,
@@ -1306,6 +1318,7 @@ const methods = {
       maxConcurrency,
       allowedRuntimes,
       allowHostDesktop: allowHostDesktop === true,
+      allowSandboxDesktop: allowSandboxDesktop !== false,
     });
     return {
       token,
@@ -1523,6 +1536,9 @@ const runnerManager = createRunnerManager({
   homeDir: HOME,
   callTool: (pubkey, name, args) => attention.callTool(pubkey, name, args),
   isAttentionEnabled: async (pubkey) => (await attention.load(pubkey)).record.attentionEnabled,
+  // Computer tools for a Docker agent's own sidecar desktop.
+  isDesktopEnabled: async (pubkey) => DESKTOP_SUPPORTED && (await meta(pubkey).catch(() => ({}))).desktop === true,
+  computerModule: () => import("./desktop/computer.mjs"),
 });
 // Event watches: one relay connection per agent that has any, fed to Attention.
 const watcher = createRelayWatcher({

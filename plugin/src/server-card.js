@@ -31,6 +31,7 @@ export function createServerCard({ React, client, uiKit, Btn, relay }) {
     const [maxAgents, setMaxAgents] = React.useState("2");
     const [maxConcurrency, setMaxConcurrency] = React.useState("2");
     const [allowHostDesktop, setAllowHostDesktop] = React.useState(false);
+    const [allowSandboxDesktop, setAllowSandboxDesktop] = React.useState(true);
     const [busy, setBusy] = React.useState(false);
     const [error, setError] = React.useState("");
     const [created, setCreated] = React.useState(null);
@@ -121,6 +122,7 @@ export function createServerCard({ React, client, uiKit, Btn, relay }) {
           maxAgents: Number(maxAgents) || 2,
           maxConcurrency: Number(maxConcurrency) || 2,
           allowHostDesktop,
+          allowSandboxDesktop,
         });
         setCreated(res);
         if (sendDm && session) {
@@ -375,6 +377,34 @@ export function createServerCard({ React, client, uiKit, Btn, relay }) {
         },
         h("input", {
           type: "checkbox",
+          checked: allowSandboxDesktop,
+          disabled: busy,
+          onChange: (e) => setAllowSandboxDesktop(e.target.checked),
+          style: { marginTop: "3px" },
+        }),
+        h(
+          "div",
+          { style: { display: "grid", gap: "2px" } },
+          h("span", { style: { fontWeight: 500 } }, "Allow a sandboxed desktop"),
+          h(
+            Note,
+            null,
+            "Their agents can have their own desktop (Viewport, computer tools) inside a separate container with internet only. Nothing runs on the host as you. Uses about 2 GB of RAM per running desktop.",
+          ),
+        ),
+      ),
+      h(
+        "label",
+        {
+          style: {
+            display: "flex",
+            gap: "var(--space-2)",
+            alignItems: "flex-start",
+            cursor: busy ? "default" : "pointer",
+          },
+        },
+        h("input", {
+          type: "checkbox",
           checked: allowHostDesktop,
           disabled: busy,
           onChange: (e) => setAllowHostDesktop(e.target.checked),
@@ -492,7 +522,7 @@ export function createServerCard({ React, client, uiKit, Btn, relay }) {
                           }`
                         : `${t.agentCount ?? 0}/${t.maxAgents} agents · max ${t.maxConcurrency} parallel · ${(t.allowedRuntimes ?? []).join(", ")}${
                             t.allowHostDesktop ? " · host desktop (trusted)" : ""
-                          } · ${
+                          }${t.role !== "admin" && t.allowSandboxDesktop !== false && !t.allowHostDesktop ? " · sandboxed desktop" : ""} · ${
                             t.ownerPubkey ? `bound ${t.ownerPubkey.slice(0, 10)}…` : "unbound (binds on first agent)"
                           }`,
                     ),
@@ -632,7 +662,11 @@ export function createServerCard({ React, client, uiKit, Btn, relay }) {
           null,
           (isGuest
             ? `Guest account: ${info.hello.label} · ${info.list.agents.length}/${info.hello.limits?.maxAgents ?? 2} agents · max ${info.hello.limits?.maxConcurrency ?? 2} parallel chats${
-                info.hello.limits?.allowHostDesktop ? " · remote desktop enabled" : ""
+                info.hello.limits?.allowHostDesktop
+                  ? " · remote desktop enabled"
+                  : info.hello.limits?.allowSandboxDesktop
+                    ? " · sandboxed desktop enabled"
+                    : ""
               }\n`
             : "") +
             `Host ${info.hello.host}${info.hello.role ? ` (${info.hello.role})` : ""} · runtimes: ${info.hello.runtimes

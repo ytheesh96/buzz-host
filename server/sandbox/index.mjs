@@ -8,7 +8,9 @@
 // Security invariant:
 //   Any agent with respondTo !== "owner-only" ("allowlist" or "anyone") MUST
 //   run in a sandboxed runner (never "host"), and sandboxed agents cannot
-//   enable host desktop, host orchestrator, or host Hermes profiles.
+//   enable host orchestration or host Hermes profiles. A sandboxed agent may
+//   have a desktop: it runs in its own sidecar container
+//   (desktop-sidecar.mjs), never on the host.
 
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -23,6 +25,7 @@ import {
   writeSandboxEnv,
 } from "./docker.mjs";
 import { openshellRunner } from "./openshell.mjs";
+import { remove as removeDesktopSidecar } from "./desktop-sidecar.mjs";
 
 const HEX64 = /^[0-9a-f]{64}$/;
 export const MAX_ALLOWLIST = 200;
@@ -104,9 +107,6 @@ export function isSandboxed(meta) {
 
 export function assertSandboxRestrictions(meta) {
   if (!isSandboxed(meta)) return;
-  if (meta.desktop === true) {
-    throw new Error("Sandboxed agents cannot enable a host desktop");
-  }
   if (meta.orchestrate === true) {
     throw new Error("Sandboxed agents cannot enable host orchestration");
   }
@@ -121,10 +121,19 @@ export function createRunnerManager({
   dockerImage = DEFAULT_DOCKER_IMAGE,
   callTool,
   isAttentionEnabled,
+  isDesktopEnabled = null,
+  computerModule = null,
   log = console,
 }) {
   const proxy = createSandboxProxy({ dataDir, runDir, homeDir, log });
-  const mcpBridge = createSandboxMcpBridge({ runDir, callTool, isAttentionEnabled, log });
+  const mcpBridge = createSandboxMcpBridge({
+    runDir,
+    callTool,
+    isAttentionEnabled,
+    isDesktopEnabled,
+    computerModule,
+    log,
+  });
 
   const sandboxRunDir = (pubkey) => path.join(runDir, "sandbox", pubkey.slice(0, 16));
   const controlDirFor = (pubkey) => path.join(runDir, `${pubkey.slice(0, 16)}.d`);
@@ -183,6 +192,9 @@ export function createRunnerManager({
     });
 
     const withAttention = isAttentionEnabled ? await isAttentionEnabled(pubkey) : false;
+    // A restart re-lists tools: drop the shared desktop client so the
+    // agent's new sessions see its current desktop setting.
+    mcpBridge.dropComputer(pubkey);
     const envFile = await writeSandboxEnv({
       agentDir,
       sandboxRunDir: runSubdir,
@@ -209,7 +221,7 @@ export function createRunnerManager({
   }
 
   async function cleanupAgent(pubkey) {
-    await stopDockerContainer(pubkey);
+    await Promise.all([stopDockerContainer(pubkey), removeDesktopSidecar(pubkey)]);
     await Promise.all([proxy.removeAgent(pubkey), mcpBridge.removeAgent(pubkey)]);
     await fs.rm(sandboxRunDir(pubkey), { recursive: true, force: true }).catch(() => {});
   }

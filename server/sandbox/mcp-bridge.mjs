@@ -8,7 +8,14 @@
 //   2. Only forwards allowlisted tools:
 //      - Memory tools (mem_get, mem_set, mem_rm) always
 //      - Attention tools (interest_*, watch_*) only when Attention is enabled
-//   3. Explicitly blocks orchestrator, desktop, and host-profile tools
+//      - Computer tools (cua-driver's, desktop/computer.mjs) only while the
+//        agent has a desktop; that desktop runs in its own sidecar container
+//        (sandbox/desktop-sidecar.mjs), never on the host's displays
+//   3. Explicitly blocks orchestrator and host-profile tools
+//
+// Wire format, one JSON line each way: {name, args} -> {result} | {error}.
+// Computer tools: {op: "computer.tools"} -> {result: {tools, instructions}},
+// and {name, args, chat} -> {computer: <MCP tools/call result>}.
 
 import { createServer } from "node:net";
 import fs from "node:fs/promises";
@@ -37,9 +44,58 @@ export function isAllowedSandboxTool(name, { attentionEnabled = false } = {}) {
   return false;
 }
 
-export function createSandboxMcpBridge({ runDir, callTool, isAttentionEnabled, log = console }) {
+const CHAT_KEY = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?:_[0-9a-f]{64})?$/;
+
+export function createSandboxMcpBridge({
+  runDir,
+  callTool,
+  isAttentionEnabled,
+  isDesktopEnabled = null,
+  computerModule = null,
+  log = console,
+}) {
   /** pubkey -> { server, sockPath } */
   const servers = new Map();
+  /** pubkey -> { computer, instructions, names } — one desktop client per agent, shared by its sessions. */
+  const computers = new Map();
+
+  async function computerFor(pubkey) {
+    if (!computerModule || !isDesktopEnabled || !(await isDesktopEnabled(pubkey))) {
+      throw new Error("This agent has no desktop");
+    }
+    let entry = computers.get(pubkey);
+    if (!entry) {
+      const mod = await computerModule();
+      entry = {
+        computer: mod.createComputer(pubkey, { sandboxed: true }),
+        instructions: mod.instructions(pubkey),
+        names: null,
+      };
+      computers.set(pubkey, entry);
+    }
+    return entry;
+  }
+
+  async function computerTools(pubkey) {
+    const entry = await computerFor(pubkey);
+    const tools = await entry.computer.tools();
+    entry.names = new Set(tools.map((t) => t.name));
+    return { tools, instructions: entry.instructions };
+  }
+
+  async function handleComputer(pubkey, req) {
+    if (req?.op === "computer.tools") return { result: await computerTools(pubkey) };
+    const name = req?.name;
+    if (typeof name !== "string" || !computerModule || !isDesktopEnabled) return null;
+    if (MEMORY_TOOL_NAMES.has(name) || ATTENTION_TOOL_NAMES.has(name)) return null;
+    if (!(await isDesktopEnabled(pubkey))) return null;
+    const entry = await computerFor(pubkey);
+    if (!entry.names) await computerTools(pubkey);
+    if (!entry.names.has(name)) return null;
+    const args = req?.args && typeof req.args === "object" ? req.args : {};
+    const chat = typeof req.chat === "string" && CHAT_KEY.test(req.chat) ? req.chat : "";
+    return { computer: await entry.computer.call(name, args, { chat }) };
+  }
 
   const sockPathFor = (pubkey) => path.join(runDir, "sandbox", pubkey.slice(0, 16), "mcp.sock");
 
@@ -65,6 +121,11 @@ export function createSandboxMcpBridge({ runDir, callTool, isAttentionEnabled, l
           let reply;
           try {
             const req = JSON.parse(line);
+            const viaComputer = await handleComputer(pubkey, req);
+            if (viaComputer) {
+              if (!socket.destroyed) socket.write(`${JSON.stringify(viaComputer)}\n`);
+              continue;
+            }
             const name = req?.name;
             const args = req?.args && typeof req.args === "object" ? req.args : {};
             const attentionEnabled = isAttentionEnabled ? await isAttentionEnabled(pubkey) : false;
@@ -92,7 +153,17 @@ export function createSandboxMcpBridge({ runDir, callTool, isAttentionEnabled, l
     return { sockPath };
   }
 
+  /** Drop the agent's desktop client (its desktop was turned off or the agent restarted). */
+  function dropComputer(pubkey) {
+    const c = computers.get(pubkey);
+    computers.delete(pubkey);
+    try {
+      c?.computer.close();
+    } catch {}
+  }
+
   async function removeAgent(pubkey) {
+    dropComputer(pubkey);
     const entry = servers.get(pubkey);
     servers.delete(pubkey);
     if (entry?.server) {
@@ -108,6 +179,7 @@ export function createSandboxMcpBridge({ runDir, callTool, isAttentionEnabled, l
   return {
     ensureAgent,
     removeAgent,
+    dropComputer,
     close,
     sockPathFor,
   };

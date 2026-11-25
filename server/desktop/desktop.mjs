@@ -11,6 +11,12 @@
 // Both the launcher and cua-driver are detached (own session), so the desktop
 // outlives whoever started it; status() and stop() work from any process.
 //
+// Sandboxed (Docker) agents get the same desktop inside a sidecar container
+// instead (start(pubkey, { sandboxed: true }), see sandboxStart below): the
+// launcher and cua-driver run there, and only the two sockets come out
+// through the bind-mounted socket dir, so the Viewport bridge, snapshots,
+// lease and computer tools on this side are unchanged.
+//
 //   node desktop.mjs start|stop|status <agent-pubkey>
 
 import fs from "node:fs";
@@ -19,6 +25,7 @@ import os from "node:os";
 import { spawn, execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { readLease, publicView } from "./lease.mjs";
+import * as sidecar from "../sandbox/desktop-sidecar.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 export const LAUNCHER = path.join(HERE, "launcher.sh");
@@ -156,8 +163,7 @@ function findBrowser() {
 /** Per-desktop browser: its own profile, no keyring prompt, and the desktop's
  *  default for links, so nothing opened elsewhere lands here and the Xfce
  *  "Choose Preferred Application" dialog never appears. */
-function seedBrowser(dir) {
-  const exe = findBrowser();
+function seedBrowser(dir, { exe = findBrowser(), extraArgs = "" } = {}) {
   if (!exe) return null;
   const bin = path.join(dir, "bin");
   fs.mkdirSync(bin, { recursive: true, mode: 0o700 });
@@ -165,7 +171,7 @@ function seedBrowser(dir) {
   const chromish = !/firefox/.test(exe);
   const args = chromish
     ? `--ozone-platform=x11 --password-store=basic --no-first-run --no-default-browser-check --hide-crash-restore-bubble ` +
-      `--force-renderer-accessibility --user-data-dir="${path.join(dir, "browser")}"`
+      `--force-renderer-accessibility ${extraArgs}--user-data-dir="${path.join(dir, "browser")}"`
     : `--profile "${path.join(dir, "browser")}"`;
   fs.writeFileSync(wrapper, `#!/bin/sh\nexec "${exe}" ${args} "$@"\n`, { mode: 0o700 });
   if (!chromish) fs.mkdirSync(path.join(dir, "browser"), { recursive: true, mode: 0o700 });
@@ -282,6 +288,7 @@ export function status(pubkey) {
     rfbSocket: rfbSock(pubkey),
     cuaSocket: cuaSock(pubkey),
     geometry: GEOMETRY,
+    sandboxed: sidecar.isSidecar(dir),
     lease: publicView(readLease(dir)),
   };
 }
@@ -334,11 +341,17 @@ async function startDriver(pubkey) {
   );
 }
 
-/** Start (or reuse) the agent's desktop and its cua-driver. Idempotent. */
-export async function start(pubkey, { waitMs = 20_000 } = {}) {
+/** Start (or reuse) the agent's desktop and its cua-driver. Idempotent.
+ *  `sandboxed`: the agent runs in Docker, so its desktop does too. */
+export async function start(pubkey, { waitMs = 20_000, sandboxed = false } = {}) {
   const dir = desktopDir(pubkey);
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   fs.mkdirSync(socketDir(pubkey), { recursive: true, mode: 0o700 });
+  // A desktop left from the other kind of runner (the owner switched it) goes first.
+  if (sidecar.isSidecar(dir) !== sandboxed && (status(pubkey).running || recordedPid(path.join(dir, "launcher.pid"))))
+    await stop(pubkey);
+  if (sandboxed) return sandboxStart(pubkey, dir, { waitMs: Math.max(waitMs, 60_000) });
+  sidecar.clearMarker(dir);
   if (!status(pubkey).running) {
     await withAllocLock(async () => {
       if (status(pubkey).running) return;
@@ -389,9 +402,80 @@ export async function start(pubkey, { waitMs = 20_000 } = {}) {
   return status(pubkey);
 }
 
+// Container paths equal host paths (dir, socket dir, cua-driver, launcher), so
+// the env file, the browser wrapper and launch_app paths read the same on
+// both sides. The container's init (tini) runs as this user; its host pid is
+// recorded as launcher.pid and cua.pid, so status() needs no docker call.
+const SANDBOX_BROWSER = "/usr/bin/chromium";
+// Needs no display number, so no allocation lock (whose 30 s staleness rule
+// a container start could outlast); concurrent starts in this process share one.
+const sandboxStarting = new Map(); // pubkey -> promise
+function sandboxStart(pubkey, dir, opts) {
+  const st = status(pubkey);
+  if (st.running && st.driver) return Promise.resolve(st);
+  let p = sandboxStarting.get(pubkey);
+  if (!p) {
+    p = sandboxLaunch(pubkey, dir, opts).finally(() => sandboxStarting.delete(pubkey));
+    sandboxStarting.set(pubkey, p);
+  }
+  return p;
+}
+async function sandboxLaunch(pubkey, dir, { waitMs }) {
+  await sidecar.remove(pubkey);
+  for (const f of ["launcher.pid", "cua.pid", path.join(dir, "env"), rfbSock(pubkey), cuaSock(pubkey)])
+    fs.rmSync(path.isAbsolute(f) ? f : path.join(dir, f), { force: true });
+  // Chromium's own sandbox needs user namespaces, which the container
+  // (no capabilities, no-new-privileges) does not have; the container is
+  // the sandbox here.
+  const browser = seedBrowser(dir, { exe: SANDBOX_BROWSER, extraArgs: "--no-sandbox --disable-dev-shm-usage " });
+  sidecar.writeMarker(dir);
+  const pid = await sidecar.run(pubkey, {
+    dir,
+    socketDir: socketDir(pubkey),
+    launcherDir: HERE,
+    cuaDriver: CUA_DRIVER,
+    env: {
+      HERMES_BD_PROFILE: `agent ${pubkey.slice(0, 8)}`,
+      HERMES_BD_DISPLAY_NUM: "1",
+      HERMES_BD_SOCKET: rfbSock(pubkey),
+      HERMES_BD_XAUTH: path.join(dir, "Xauthority"),
+      HERMES_BD_ENV_FILE: path.join(dir, "env"),
+      HERMES_BD_CONFIG_HOME: path.join(dir, "xdg"),
+      HERMES_BD_GEOMETRY: GEOMETRY,
+      BUZZ_DESKTOP_CUA_SOCKET: cuaSock(pubkey),
+      BUZZ_DESKTOP_CUA_LOG: path.join(dir, "cua.log"),
+      ...(browser ? { HERMES_BD_BROWSER_EXEC: browser, HERMES_BD_BROWSER_EXEC_LINE: `Exec="${browser}" %U` } : {}),
+    },
+  });
+  writePid(path.join(dir, "launcher.pid"), pid);
+  writePid(path.join(dir, "cua.pid"), pid);
+  await waitFor(
+    () => {
+      if (!alive(pid)) {
+        const tail = (read(path.join(dir, "launcher.log")) ?? "").slice(-1500);
+        return new Error(`desktop: the desktop container exited:\n${tail}`);
+      }
+      return fs.existsSync(path.join(dir, "env")) && fs.existsSync(rfbSock(pubkey)) && fs.existsSync(cuaSock(pubkey));
+    },
+    waitMs,
+    "the desktop container",
+    () => {
+      sidecar.remove(pubkey).catch(() => {});
+      for (const f of ["launcher.pid", "cua.pid", "env"]) fs.rmSync(path.join(dir, f), { force: true });
+    },
+  );
+  return status(pubkey);
+}
+
 /** Stop the agent's cua-driver and desktop (Xvnc, Xfce, its browser). */
 export async function stop(pubkey) {
   const dir = desktopDir(pubkey);
+  if (sidecar.isSidecar(dir)) {
+    await sidecar.remove(pubkey);
+    for (const f of ["launcher.pid", "cua.pid", "env"]) fs.rmSync(path.join(dir, f), { force: true });
+    for (const f of [rfbSock(pubkey), cuaSock(pubkey)]) fs.rmSync(f, { force: true });
+    return status(pubkey);
+  }
   const pids = ["cua.pid", "launcher.pid"].map((f) => recordedPid(path.join(dir, f))).filter(Boolean);
   // Xvnc is in the launcher's group, but outlives the launcher by a moment
   // (the launcher's EXIT trap kills it): wait for it too.

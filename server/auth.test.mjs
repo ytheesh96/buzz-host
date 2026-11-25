@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 
 import {
   assertAgentAccess,
+  assertGuestDesktop,
   assertMethodAllowed,
   buildInviteUrl,
   canAccessAgent,
@@ -20,6 +21,7 @@ import {
   hashToken,
   isValidDesktopTicket,
   parseListenerConfig,
+  sandboxDesktopAllowed,
   tokenRole,
 } from "./auth.mjs";
 
@@ -506,12 +508,73 @@ test("admin desktop tickets on the token listener need a live admin token", () =
   );
   // Ticket and record must be the same token.
   assert.equal(desktopTicketTokenAllowed(adminTokenTicket, { ...adminRecord, id: "tok_cccccccccccc" }), false);
-  // Guest tickets stay strict: trusted guest tokens only.
-  assert.equal(desktopTicketTokenAllowed(guestTicket, guestRecord), false);
+  // Guest tickets: a desktop flag is required. Sandboxed desktops are on by
+  // default (also for records made before the flag); explicit false is off.
+  assert.equal(desktopTicketTokenAllowed(guestTicket, guestRecord), guestRecord.allowSandboxDesktop !== false);
+  assert.equal(desktopTicketTokenAllowed(guestTicket, { ...guestRecord, allowSandboxDesktop: false }), false);
   assert.equal(desktopTicketTokenAllowed(guestTicket, { ...guestRecord, allowHostDesktop: true }), true);
   assert.equal(desktopTicketTokenAllowed(guestTicket, { ...guestRecord, allowHostDesktop: true, revokedAt: "x" }), false);
   // Legacy guest record without a role.
   assert.equal(desktopTicketTokenAllowed(guestTicket, { id: guestRecord.id, allowHostDesktop: true }), true);
+  // A sandboxed-desktop guest may view too (desktop.view already limited it to sandboxed agents).
+  assert.equal(desktopTicketTokenAllowed(guestTicket, { ...guestRecord, allowSandboxDesktop: true }), true);
+  assert.equal(
+    desktopTicketTokenAllowed(guestTicket, { ...guestRecord, allowSandboxDesktop: true, revokedAt: "x" }),
+    false,
+  );
+});
+
+test("sandboxed-desktop guests: desktop methods only for their sandboxed agents, never a host desktop", async (t) => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "buzz-auth-sbxdesk-"));
+  t.after(() => fs.rm(tmp, { recursive: true, force: true }));
+  const store = createTokenStore({ filePath: path.join(tmp, "tokens.json") });
+  const { record } = await store.create({ label: "Anu", ownerPubkey: OWNER_A, allowSandboxDesktop: true });
+  assert.equal(record.allowSandboxDesktop, true);
+  assert.equal(record.allowHostDesktop, false);
+  const listed = (await store.list()).find((r) => r.id === record.id);
+  assert.equal(listed.allowSandboxDesktop, true);
+  // On by default; only an explicit false turns it off.
+  const plain = await store.create({ label: "Bo", ownerPubkey: OWNER_B });
+  assert.equal(plain.record.allowSandboxDesktop, true);
+  const off = await store.create({ label: "Cy", ownerPubkey: OWNER_B, allowSandboxDesktop: false });
+  assert.equal(off.record.allowSandboxDesktop, false);
+  assert.equal(sandboxDesktopAllowed({}), true);
+  assert.equal(sandboxDesktopAllowed({ allowSandboxDesktop: false }), false);
+
+  const guest = {
+    authenticated: true,
+    role: "guest",
+    tokenId: record.id,
+    ownerPubkey: OWNER_A,
+    limits: { maxAgents: 2, maxConcurrency: 2, allowedRuntimes: ["claude"], allowSandboxDesktop: true },
+  };
+  for (const m of ["desktop.status", "desktop.set", "desktop.start", "desktop.view", "desktop.lease"])
+    assert.doesNotThrow(() => assertMethodAllowed(guest, m));
+  assert.throws(() => assertMethodAllowed(guest, "orchestrator.set"), /not permitted for guest/);
+  // Their agents are still forced into Docker.
+  const s = enforceGuestSettings(guest, {
+    runtime: "claude",
+    model: "",
+    profile: "",
+    concurrency: 1,
+    runner: "",
+    respondTo: "owner-only",
+    respondToAllowlist: [],
+  });
+  assert.equal(s.runner, "docker");
+  assert.throws(
+    () => enforceGuestSettings(guest, { runtime: "claude", concurrency: 1, runner: "host", respondTo: "owner-only" }),
+    /sandboxed runner/,
+  );
+  assert.doesNotThrow(() => assertGuestDesktop(guest, { runner: "docker" }));
+  assert.throws(() => assertGuestDesktop(guest, { runner: "host" }), /not enabled/);
+  assert.throws(() => assertGuestDesktop(guest, {}), /not enabled/);
+  const noDesk = { ...guest, limits: { ...guest.limits, allowSandboxDesktop: false } };
+  assert.throws(() => assertGuestDesktop(noDesk, { runner: "docker" }), /not enabled/);
+  const trusted = { ...guest, limits: { ...guest.limits, allowHostDesktop: true } };
+  assert.doesNotThrow(() => assertGuestDesktop(trusted, { runner: "host" }));
+  assert.doesNotThrow(() => assertGuestDesktop({ role: "admin" }, { runner: "host" }));
+  assert.doesNotThrow(() => assertGuestDesktop(undefined, { runner: "host" }));
 });
 
 test("allowLogins is optional for token-only hosts and unchanged when populated", () => {

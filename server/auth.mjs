@@ -129,10 +129,17 @@ export function publicTokenView(record) {
     maxConcurrency: record.maxConcurrency,
     allowedRuntimes: [...record.allowedRuntimes],
     allowHostDesktop: record.allowHostDesktop === true,
+    allowSandboxDesktop: sandboxDesktopAllowed(record),
     createdAt: record.createdAt,
     lastUsedAt: record.lastUsedAt || null,
     revokedAt: record.revokedAt || null,
   };
+}
+
+/** Guest tokens get a sandboxed desktop unless it was turned off (`false`);
+ *  tokens made before the flag existed count as on. */
+export function sandboxDesktopAllowed(record) {
+  return record?.allowSandboxDesktop !== false;
 }
 
 export function buildInviteUrl(publicUrl, token) {
@@ -176,6 +183,7 @@ export function createTokenStore({ filePath }) {
     maxConcurrency,
     allowedRuntimes,
     allowHostDesktop = false,
+    allowSandboxDesktop = true,
   } = {}) {
     const cleanLabel = checkLabel(label);
     const cleanOwner = checkOptionalPubkey(ownerPubkey);
@@ -183,6 +191,7 @@ export function createTokenStore({ filePath }) {
     const cleanMaxConc = checkCap(maxConcurrency, DEFAULT_GUEST_MAX_CONCURRENCY, 1, 8, "maxConcurrency");
     const cleanRuntimes = checkAllowedRuntimes(allowedRuntimes, DEFAULT_GUEST_RUNTIMES);
     const cleanAllowHostDesktop = allowHostDesktop === true;
+    const cleanAllowSandboxDesktop = allowSandboxDesktop !== false;
 
     const token = `${TOKEN_PREFIXES.guest}${randomBytes(24).toString("hex")}`;
     const record = {
@@ -195,6 +204,9 @@ export function createTokenStore({ filePath }) {
       maxConcurrency: cleanMaxConc,
       allowedRuntimes: cleanRuntimes,
       allowHostDesktop: cleanAllowHostDesktop,
+      // A desktop in the agent's own sidecar container (sandbox/desktop-sidecar.mjs):
+      // a guest agent's desktop without running anything on the host as the owner.
+      allowSandboxDesktop: cleanAllowSandboxDesktop,
       createdAt: new Date().toISOString(),
       lastUsedAt: null,
       revokedAt: null,
@@ -337,7 +349,7 @@ export function assertMethodAllowed(session, methodName) {
   }
   if (session.role === "guest") {
     if (DESKTOP_METHODS.has(methodName)) {
-      if (session.limits?.allowHostDesktop === true) return;
+      if (session.limits?.allowHostDesktop === true || session.limits?.allowSandboxDesktop === true) return;
       throw new Error(`Method "${methodName}" is not permitted for guest accounts`);
     }
     if (ADMIN_ONLY_METHODS.has(methodName)) {
@@ -406,7 +418,8 @@ export function isValidDesktopTicket(view, listenerRole, now = Date.now()) {
 /**
  * Whether the token behind a token-listener desktop ticket still allows the
  * view: it must exist, be unrevoked and have the ticket's role. Admin tokens
- * always may; guest tokens only with `allowHostDesktop`.
+ * always may; guest tokens only with `allowHostDesktop` or `allowSandboxDesktop`
+ * (assertGuestDesktop keeps the latter to sandboxed agents).
  */
 export function desktopTicketTokenAllowed(view, tokenRecord) {
   if (!view || !tokenRecord || tokenRecord.revokedAt) return false;
@@ -414,7 +427,21 @@ export function desktopTicketTokenAllowed(view, tokenRecord) {
   const role = tokenRole(tokenRecord);
   if (role !== view.role) return false;
   if (role === "admin") return true;
-  return tokenRecord.allowHostDesktop === true;
+  return tokenRecord.allowHostDesktop === true || sandboxDesktopAllowed(tokenRecord);
+}
+
+/**
+ * A guest may use an agent's desktop only as its token allows: a host-runner
+ * desktop needs `allowHostDesktop`; a sandboxed agent's sidecar desktop needs
+ * either flag. Admin sessions always may.
+ */
+export function assertGuestDesktop(session, m) {
+  if (session?.role !== "guest") return;
+  const limits = session.limits ?? {};
+  if (limits.allowHostDesktop === true) return;
+  const sandboxed = Boolean(m?.runner && m.runner !== "host");
+  if (sandboxed && limits.allowSandboxDesktop === true) return;
+  throw new Error("Desktops are not enabled for this guest token");
 }
 
 /** Select running guest desktops that have exceeded `idleMs` with no active viewers. */

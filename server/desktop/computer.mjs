@@ -91,7 +91,9 @@ export const instructions = (pubkey) =>
   "screenshot pixel coordinates, and delivery_mode \"foreground\" for keys in a browser. Open a browser with launch_app " +
   `{"launch_path":"${path.join(desktop.desktopDir(pubkey), "bin", "browser")}","urls":[...]}. If a call says a human has taken over, stop and tell your owner what you need.`;
 
-export function createComputer(pubkey, { chat } = {}) {
+/** `sandboxed`: the agent runs in Docker, so its desktop runs in a sidecar
+ *  container (desktop.mjs); this client still runs in buzz-host. */
+export function createComputer(pubkey, { chat, sandboxed = false } = {}) {
   const dir = desktop.desktopDir(pubkey);
   let child = null;
   let starting = null;
@@ -113,7 +115,7 @@ export function createComputer(pubkey, { chat } = {}) {
   async function ensure() {
     if (child) return;
     starting ??= (async () => {
-      const st = await desktop.start(pubkey);
+      const st = await desktop.start(pubkey, { sandboxed });
       const env = { ...desktop.baseEnv(), ...desktop.desktopEnv(dir), XDG_SESSION_TYPE: "x11" };
       const c = spawn(desktop.CUA_DRIVER, ["mcp", "--socket", st.cuaSocket], {
         env,
@@ -172,14 +174,16 @@ export function createComputer(pubkey, { chat } = {}) {
     return prepareTools(list);
   }
 
-  async function call(name, args) {
+  // `opts.chat`: the calling session's chat key, for one client shared by
+  // several sessions (the sandbox MCP bridge).
+  async function call(name, args, opts = {}) {
     const refused = (text) => ({ content: [{ type: "text", text }], isError: true });
     const lease = readLease(dir);
     if (lease.holder === HUMAN) return refused(new HumanHasControl().message);
     // The owner's in-chat preview shows while the agent's turn uses these;
     // acp-proxy labels each session's buzz MCP server with BUZZHOST_CHAT. The
     // shared mcp.sock server passes the session's chat key in directly.
-    desktop.recordUse(pubkey, name, chat ?? process.env.BUZZHOST_CHAT ?? "");
+    desktop.recordUse(pubkey, name, opts.chat ?? chat ?? process.env.BUZZHOST_CHAT ?? "");
     try {
       await ensure();
       const result = await request("tools/call", { name, arguments: args ?? {} });

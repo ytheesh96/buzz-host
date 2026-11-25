@@ -66,6 +66,16 @@ block/buzz desktop amd64 deb; adapters are npm packages in `~/.local/lib/buzz-ho
   (`--remove` to uninstall). `docker-run` refuses to start a sandboxed agent
   while `buzz-sandbox-firewall.service` is inactive, and the Docker runner reports
   itself unavailable.
+- A sandboxed agent can have a desktop too. It runs in a second container per
+  agent (`buzz-desktop-<pubkey16>`, `server/sandbox/desktop-sidecar.mjs`) with the
+  same hardening and network, about 2 GB RAM, Xvnc + Xfce + Chromium +
+  cua-driver. Only its `rfb.sock` (Viewport, previews) and `cua.sock` (computer
+  tools, forwarded through the agent's scoped `mcp.sock`) leave the container.
+  Build the image once with `server/sandbox/build-image.sh --desktop`. Guest
+  tokens get it by default (`--no-sandbox-desktop`, or unticking the invite's
+  "Allow a sandboxed desktop" box, turns it off). `--allow-host-desktop` still
+  means a trusted, unsandboxed host-runner agent; admin tokens always have host
+  desktops.
 
 ## Patched buzz-acp (no fork repo)
 

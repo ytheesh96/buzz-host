@@ -3,7 +3,10 @@
 //
 // Connects ONLY to the agent's host-scoped Unix socket (/run/buzz-sandbox/mcp.sock),
 // which pins the agent's pubkey server-side and allows only Memory tools (+ Attention
-// tools if enabled). Never exposes host desktop or orchestrator tools.
+// tools if enabled). With BUZZ_SANDBOX_COMPUTER=1 it also lists and forwards
+// the computer tools of the agent's own desktop, which runs in a separate
+// sidecar container (never on the host's displays). Never exposes orchestrator
+// tools.
 
 import fs from "node:fs/promises";
 import { createConnection } from "node:net";
@@ -15,7 +18,12 @@ import { MEMORY_TOOLS } from "../memory.mjs";
 const SOCKET = process.env.BUZZ_HOST_MCP_SOCK || "/run/buzz-sandbox/mcp.sock";
 const withAttention = process.env.BUZZ_SANDBOX_ATTENTION === "1";
 const TOOLS = [...MEMORY_TOOLS, ...(withAttention ? ATTENTION_TOOLS : [])];
+const withComputer = process.env.BUZZ_SANDBOX_COMPUTER === "1";
 const CALL_TIMEOUT_MS = 60_000;
+// The desktop starts on first use (up to a minute), and a computer call may
+// itself take up to two minutes (desktop/computer.mjs).
+const COMPUTER_TIMEOUT_MS = 200_000;
+let computer = null; // { tools, instructions } once listed
 
 async function prepareArgs(name, args) {
   if (name === "mem_set" && typeof args.path === "string" && args.path) {
@@ -32,6 +40,16 @@ async function prepareArgs(name, args) {
 }
 
 function call(name, args) {
+  return bridgeRequest({ name, args }).then((reply) => reply.result);
+}
+
+async function computerTools() {
+  if (!withComputer) return null;
+  computer ??= await bridgeRequest({ op: "computer.tools" }, COMPUTER_TIMEOUT_MS).then((reply) => reply.result);
+  return computer;
+}
+
+function bridgeRequest(payload, timeoutMs = CALL_TIMEOUT_MS) {
   return new Promise((resolve, reject) => {
     const sock = createConnection(SOCKET);
     let buf = "";
@@ -45,9 +63,9 @@ function call(name, args) {
     const timer = setTimeout(() => {
       sock.destroy();
       finish(reject, new Error("buzz-host sandbox MCP bridge did not answer"));
-    }, CALL_TIMEOUT_MS);
+    }, timeoutMs);
     sock.setEncoding("utf8");
-    sock.on("connect", () => sock.write(`${JSON.stringify({ name, args })}\n`));
+    sock.on("connect", () => sock.write(`${JSON.stringify(payload)}\n`));
     sock.on("data", (chunk) => {
       buf += chunk;
       const i = buf.indexOf("\n");
@@ -56,7 +74,7 @@ function call(name, args) {
       try {
         const reply = JSON.parse(buf.slice(0, i));
         if (reply.error) finish(reject, new Error(reply.error));
-        else finish(resolve, reply.result);
+        else finish(resolve, reply);
       } catch (error) {
         finish(reject, error);
       }
@@ -80,7 +98,8 @@ const send = (message) => process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0
 async function handle(request) {
   const { id, method, params } = request;
   switch (method) {
-    case "initialize":
+    case "initialize": {
+      const desk = await computerTools().catch(() => null);
       return {
         protocolVersion: params?.protocolVersion ?? "2025-06-18",
         capabilities: { tools: {} },
@@ -92,18 +111,30 @@ async function handle(request) {
                 "Your Attention: Interests you are responsible for, event watches that wake you when a matching message arrives, and timers that wake you on a schedule.",
               ]
             : []),
+          ...(desk?.instructions ? [desk.instructions] : []),
         ].join("\n"),
       };
+    }
     case "ping":
       return {};
-    case "tools/list":
-      return {
-        tools: TOOLS.map(({ name, description, inputSchema }) => ({ name, description, inputSchema })),
-      };
+    case "tools/list": {
+      const own = TOOLS.map(({ name, description, inputSchema }) => ({ name, description, inputSchema }));
+      const ownNames = new Set(own.map((t) => t.name));
+      const desk = await computerTools().catch(() => null);
+      return { tools: [...own, ...(desk?.tools ?? []).filter((t) => !ownNames.has(t.name))] };
+    }
     case "tools/call": {
       const name = params?.name;
       try {
-        if (!TOOLS.some((t) => t.name === name)) throw new Error(`No tool ${name}`);
+        if (!TOOLS.some((t) => t.name === name)) {
+          const desk = await computerTools().catch(() => null);
+          if (!desk?.tools?.some((t) => t.name === name)) throw new Error(`No tool ${name}`);
+          const reply = await bridgeRequest(
+            { name, args: params?.arguments ?? {}, chat: process.env.BUZZHOST_CHAT || "" },
+            COMPUTER_TIMEOUT_MS,
+          );
+          return reply.computer;
+        }
         const prepared = await prepareArgs(name, params?.arguments ?? {});
         const text = await call(name, prepared);
         return { content: [{ type: "text", text }] };

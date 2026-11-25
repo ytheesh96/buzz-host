@@ -233,6 +233,8 @@ export async function writeSandboxEnv({
     BUZZ_SANDBOX_PROXY_SOCK: "/run/buzz-sandbox/proxy.sock",
     BUZZ_SANDBOX_PROXY_PORT: String(proxyPort),
     BUZZ_SANDBOX_ATTENTION: withAttention ? "1" : "0",
+    // Computer tools for the agent's own sidecar desktop (desktop-sidecar.mjs).
+    BUZZ_SANDBOX_COMPUTER: meta.desktop === true ? "1" : "0",
     BUZZ_HOST_ADAPTERS_JSON: adaptersJson,
     BUZZ_RELAY_URL: meta.community,
     BUZZ_PRIVATE_KEY: key,

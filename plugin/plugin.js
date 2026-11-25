@@ -3335,6 +3335,7 @@ function createServerCard({ React, client, uiKit, Btn, relay }) {
 		const [maxAgents, setMaxAgents] = React.useState("2");
 		const [maxConcurrency, setMaxConcurrency] = React.useState("2");
 		const [allowHostDesktop, setAllowHostDesktop] = React.useState(false);
+		const [allowSandboxDesktop, setAllowSandboxDesktop] = React.useState(true);
 		const [busy, setBusy] = React.useState(false);
 		const [error, setError] = React.useState("");
 		const [created, setCreated] = React.useState(null);
@@ -3417,7 +3418,8 @@ function createServerCard({ React, client, uiKit, Btn, relay }) {
 					...cleanPubkey ? { ownerPubkey: cleanPubkey } : {},
 					maxAgents: Number(maxAgents) || 2,
 					maxConcurrency: Number(maxConcurrency) || 2,
-					allowHostDesktop
+					allowHostDesktop,
+					allowSandboxDesktop
 				});
 				setCreated(res);
 				if (sendDm && session) {
@@ -3582,6 +3584,20 @@ function createServerCard({ React, client, uiKit, Btn, relay }) {
 			cursor: busy ? "default" : "pointer"
 		} }, h("input", {
 			type: "checkbox",
+			checked: allowSandboxDesktop,
+			disabled: busy,
+			onChange: (e) => setAllowSandboxDesktop(e.target.checked),
+			style: { marginTop: "3px" }
+		}), h("div", { style: {
+			display: "grid",
+			gap: "2px"
+		} }, h("span", { style: { fontWeight: 500 } }, "Allow a sandboxed desktop"), h(Note, null, "Their agents can have their own desktop (Viewport, computer tools) inside a separate container with internet only. Nothing runs on the host as you. Uses about 2 GB of RAM per running desktop."))), h("label", { style: {
+			display: "flex",
+			gap: "var(--space-2)",
+			alignItems: "flex-start",
+			cursor: busy ? "default" : "pointer"
+		} }, h("input", {
+			type: "checkbox",
 			checked: allowHostDesktop,
 			disabled: busy,
 			onChange: (e) => setAllowHostDesktop(e.target.checked),
@@ -3644,7 +3660,7 @@ function createServerCard({ React, client, uiKit, Btn, relay }) {
 			display: "grid",
 			gap: "2px",
 			minWidth: 0
-		} }, h("strong", null, `${t.label} (${t.id})`), h(Note, null, t.role === "admin" ? `Admin access token · full access to this host${t.ownerPubkey ? ` · owner ${t.ownerPubkey.slice(0, 10)}…` : ""}` : `${t.agentCount ?? 0}/${t.maxAgents} agents · max ${t.maxConcurrency} parallel · ${(t.allowedRuntimes ?? []).join(", ")}${t.allowHostDesktop ? " · host desktop (trusted)" : ""} · ${t.ownerPubkey ? `bound ${t.ownerPubkey.slice(0, 10)}…` : "unbound (binds on first agent)"}`)), h("button", {
+		} }, h("strong", null, `${t.label} (${t.id})`), h(Note, null, t.role === "admin" ? `Admin access token · full access to this host${t.ownerPubkey ? ` · owner ${t.ownerPubkey.slice(0, 10)}…` : ""}` : `${t.agentCount ?? 0}/${t.maxAgents} agents · max ${t.maxConcurrency} parallel · ${(t.allowedRuntimes ?? []).join(", ")}${t.allowHostDesktop ? " · host desktop (trusted)" : ""}${t.role !== "admin" && t.allowSandboxDesktop !== false && !t.allowHostDesktop ? " · sandboxed desktop" : ""} · ${t.ownerPubkey ? `bound ${t.ownerPubkey.slice(0, 10)}…` : "unbound (binds on first agent)"}`)), h("button", {
 			type: "button",
 			disabled: busy,
 			onClick: () => void revoke(t.id)
@@ -3740,7 +3756,7 @@ function createServerCard({ React, client, uiKit, Btn, relay }) {
 				setStoredToken("");
 				setNotice("Access token cleared. Click Save and check to reconnect.");
 			}
-		}, "Clear token")), notice && h(Note, null, notice), h(Note, { tone: error ? "error" : void 0 }, error || `Connection: ${state.status}`), info && h(Note, null, (isGuest ? `Guest account: ${info.hello.label} · ${info.list.agents.length}/${info.hello.limits?.maxAgents ?? 2} agents · max ${info.hello.limits?.maxConcurrency ?? 2} parallel chats${info.hello.limits?.allowHostDesktop ? " · remote desktop enabled" : ""}\n` : "") + `Host ${info.hello.host}${info.hello.role ? ` (${info.hello.role})` : ""} · runtimes: ${info.hello.runtimes.map((r) => `${r.title}${r.available ? "" : " (missing)"}`).join(", ")}` + (Array.isArray(info.hello.runners) ? `\nRunners: ${info.hello.runners.map((r) => `${r.title}${r.available ? "" : " (unavailable)"}`).join(", ")}` : "") + "\n" + (info.list.agents.length ? info.list.agents.map((a) => {
+		}, "Clear token")), notice && h(Note, null, notice), h(Note, { tone: error ? "error" : void 0 }, error || `Connection: ${state.status}`), info && h(Note, null, (isGuest ? `Guest account: ${info.hello.label} · ${info.list.agents.length}/${info.hello.limits?.maxAgents ?? 2} agents · max ${info.hello.limits?.maxConcurrency ?? 2} parallel chats${info.hello.limits?.allowHostDesktop ? " · remote desktop enabled" : info.hello.limits?.allowSandboxDesktop ? " · sandboxed desktop enabled" : ""}\n` : "") + `Host ${info.hello.host}${info.hello.role ? ` (${info.hello.role})` : ""} · runtimes: ${info.hello.runtimes.map((r) => `${r.title}${r.available ? "" : " (missing)"}`).join(", ")}` + (Array.isArray(info.hello.runners) ? `\nRunners: ${info.hello.runners.map((r) => `${r.title}${r.available ? "" : " (unavailable)"}`).join(", ")}` : "") + "\n" + (info.list.agents.length ? info.list.agents.map((a) => {
 			const extra = [a.runner && a.runner !== "host" ? a.runner : "", a.respondTo && a.respondTo !== "owner-only" ? a.respondTo : ""].filter(Boolean).join(" · ");
 			return `• ${a.name} — ${a.runtime}${a.model ? `/${a.model}` : ""}${extra ? ` [${extra}]` : ""} — ${a.status}`;
 		}).join("\n") : "No agents yet.")), isAdmin && h(GuestInvites, { publicGuestUrl: info.hello.publicGuestUrl }));
