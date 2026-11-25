@@ -3,6 +3,15 @@
   "name": "Viewport",
   "apiVersion": 1,
   "description": "In-app Viewport page, live remote desktop preview, and takeover controls for self-hosted agents.",
-  "updates": { "defaultEnabled": true },
-  "discovery": { "category": "agents", "tags": ["desktop", "vnc", "self-hosted"] }
+  "updates": {
+    "defaultEnabled": true
+  },
+  "discovery": {
+    "category": "agent-tools",
+    "tags": [
+      "desktop",
+      "vnc",
+      "self-hosted"
+    ]
+  }
 }

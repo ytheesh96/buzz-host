@@ -3,6 +3,15 @@
   "name": "Hive Watch",
   "apiVersion": 1,
   "description": "Watches, triggers, and scheduled Attention for self-hosted agents on buzz-host.",
-  "updates": { "defaultEnabled": true },
-  "discovery": { "category": "agents", "tags": ["attention", "watches", "self-hosted"] }
+  "updates": {
+    "defaultEnabled": true
+  },
+  "discovery": {
+    "category": "agent-tools",
+    "tags": [
+      "attention",
+      "watches",
+      "self-hosted"
+    ]
+  }
 }

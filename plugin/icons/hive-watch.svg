@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="376" height="376" viewBox="0 0 376 376">
+<defs>
+  <linearGradient id="body" x1="0.15" y1="0.05" x2="0.85" y2="1">
+    <stop offset="0" stop-color="#f3f9ff"/>
+    <stop offset="0.45" stop-color="#c4e0fb"/>
+    <stop offset="1" stop-color="#8ec2f2"/>
+  </linearGradient>
+  <linearGradient id="glyph" x1="0" y1="0" x2="0.3" y2="1">
+    <stop offset="0" stop-color="#ffffff"/>
+    <stop offset="1" stop-color="#e2f0ff"/>
+  </linearGradient>
+  <radialGradient id="shine" cx="0.3" cy="0.25" r="0.6">
+    <stop offset="0" stop-color="#ffffff" stop-opacity="0.85"/>
+    <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
+  </radialGradient>
+  <filter id="soft" x="-20%" y="-20%" width="140%" height="140%"><feGaussianBlur stdDeviation="1.6"/></filter>
+  <filter id="glyphsoft" x="-20%" y="-20%" width="140%" height="140%"><feGaussianBlur stdDeviation="2.2"/></filter>
+  <filter id="shadow" x="-30%" y="-30%" width="160%" height="160%"><feGaussianBlur stdDeviation="9"/></filter>
+</defs>
+<path d="M188 72 L292 132 L292 252 L188 312 L84 252 L84 132 Z" fill="#7fb6ea" opacity="0.35" filter="url(#shadow)" transform="translate(4 8)"/>
+<g filter="url(#soft)">
+  <path d="M188 66 L290 125 Q300 131 300 142 L300 242 Q300 253 290 259 L198 312 Q188 318 178 312 L86 259 Q76 253 76 242 L76 142 Q76 131 86 125 L178 72 Q188 66 188 66 Z" fill="url(#body)"/>
+  <path d="M188 66 L290 125 Q300 131 300 142 L300 242 Q300 253 290 259 L198 312 Q188 318 178 312 L86 259 Q76 253 76 242 L76 142 Q76 131 86 125 L178 72 Q188 66 188 66 Z" fill="url(#shine)"/>
+</g>
+<path d="M112 192 Q188 112 264 192 Q188 272 112 192 Z" fill="url(#glyph)" filter="url(#glyphsoft)"/>
+<circle cx="188" cy="192" r="30" fill="#7cb8ef" filter="url(#soft)"/>
+<circle cx="178" cy="182" r="9" fill="#ffffff" opacity="0.9" filter="url(#soft)"/>
+</svg>
