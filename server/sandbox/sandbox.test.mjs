@@ -17,7 +17,15 @@ import {
 } from "./index.mjs";
 import { createSandboxProxy, parseDotEnvValue } from "./proxy.mjs";
 import { createSandboxMcpBridge, isAllowedSandboxTool } from "./mcp-bridge.mjs";
-import { buildDockerArgs, containerName, prepareSandboxHome, writeSandboxEnv } from "./docker.mjs";
+import {
+  SANDBOX_BRIDGE,
+  SANDBOX_FIREWALL_UNIT,
+  SANDBOX_NETWORK,
+  buildDockerArgs,
+  containerName,
+  prepareSandboxHome,
+  writeSandboxEnv,
+} from "./docker.mjs";
 
 const PUBKEY_A = "a".repeat(64);
 const PUBKEY_B = "b".repeat(64);
@@ -431,6 +439,7 @@ test("Docker sandbox config and args harden container and never leak host secret
   assert.ok(args.includes("--cap-drop=ALL"));
   assert.ok(args.includes("--security-opt=no-new-privileges:true"));
   assert.ok(args.includes("--read-only"));
+  assert.equal(args[args.indexOf("--network") + 1], SANDBOX_NETWORK);
   assert.ok(args.includes("--dns"));
   assert.ok(args.includes("1.1.1.1"));
   assert.ok(args.includes("--dns-search"));
@@ -491,4 +500,33 @@ test("runnerManager prepares and cleans up a docker agent cleanly", async (t) =>
 
   await mgr.cleanupAgent(PUBKEY_A);
   await assert.rejects(() => fs.access(path.join(prepared.sandboxRunDir, "proxy.sock")));
+});
+
+test("egress filter: nft table, systemd unit and docker-run agree on the bridge and unit", async () => {
+  const here = path.dirname(new URL(import.meta.url).pathname);
+  const nft = await fs.readFile(path.join(here, "firewall", "buzz-sandbox.nft"), "utf8");
+  const unit = await fs.readFile(path.join(here, "firewall", SANDBOX_FIREWALL_UNIT), "utf8");
+  const dockerRun = await fs.readFile(path.join(here, "docker-run"), "utf8");
+
+  // Every rule is scoped to the sandbox bridge, which docker-run creates by name.
+  const ifRules = nft.split("\n").filter((l) => /^\s*iifname /.test(l));
+  assert.ok(ifRules.length >= 3);
+  for (const rule of ifRules) assert.match(rule, new RegExp(`iifname "${SANDBOX_BRIDGE}"`));
+  assert.match(dockerRun, new RegExp(`com\\.docker\\.network\\.bridge\\.name=${SANDBOX_BRIDGE}`));
+  assert.match(dockerRun, /enable_icc=false/);
+  assert.match(dockerRun, /--network "\$network"/);
+  assert.match(dockerRun, new RegExp(`network="\\$\\{BUZZ_SANDBOX_NETWORK:-${SANDBOX_NETWORK}\\}"`));
+
+  // Host-bound traffic is dropped on input; LAN, tailnet, link-local and loopback on forward.
+  assert.match(nft, /hook input[^}]*iifname "buzzsbx0" counter drop/s);
+  for (const cidr of ["10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12", "192.168.0.0/16"]) {
+    assert.ok(nft.includes(cidr), `blocked4 must include ${cidr}`);
+  }
+  assert.match(nft, /meta nfproto ipv6 counter drop/);
+
+  // Fail closed: docker-run checks the same unit the installer enables.
+  assert.match(dockerRun, new RegExp(`firewall_unit="${SANDBOX_FIREWALL_UNIT.replace(".", "\\.")}"`));
+  assert.match(dockerRun, /systemctl is-active --quiet "\$firewall_unit"/);
+  assert.match(unit, /ExecStart=\/usr\/bin\/nft -f \/etc\/buzz-host\/buzz-sandbox\.nft/);
+  assert.match(unit, /Before=docker\.service/);
 });

@@ -18,9 +18,29 @@ memory="${BUZZ_SANDBOX_MEMORY:-1536m}"
 cpus="${BUZZ_SANDBOX_CPUS:-2}"
 pids_limit="${BUZZ_SANDBOX_PIDS_LIMIT:-256}"
 cname="buzz-agent-${prefix}"
+network="${BUZZ_SANDBOX_NETWORK:-buzz-sandbox}"
+firewall_unit="buzz-sandbox-firewall.service"
 
 [[ -f "$agent_dir/sandbox.env" ]] || { echo "sandbox.env missing (re-activate or restart buzz-host)" >&2; exit 78; }
 [[ -S "$sandbox_run/proxy.sock" ]] || { echo "sandbox proxy socket missing ($sandbox_run/proxy.sock); is buzz-host running?" >&2; exit 75; }
+
+# Fail closed: the egress filter (root nftables table, see install-firewall.sh)
+# is what keeps the container off this host, the LAN and the tailnet.
+if ! systemctl is-active --quiet "$firewall_unit"; then
+  echo "$firewall_unit is not active; refusing to start a sandboxed agent without the egress filter (run: sudo server/sandbox/install-firewall.sh)" >&2
+  exit 78
+fi
+
+# Dedicated bridge whose name the filter matches; no inter-container traffic.
+if ! docker network inspect "$network" >/dev/null 2>&1; then
+  docker network create --driver bridge \
+    --subnet "${BUZZ_SANDBOX_SUBNET:-172.30.0.0/24}" \
+    -o com.docker.network.bridge.name=buzzsbx0 \
+    -o com.docker.network.bridge.enable_icc=false \
+    "$network" >/dev/null 2>&1 || docker network inspect "$network" >/dev/null
+fi
+bridge="$(docker network inspect -f '{{index .Options "com.docker.network.bridge.name"}}' "$network")"
+[[ "$bridge" == "buzzsbx0" ]] || { echo "docker network $network must use bridge buzzsbx0 (got '$bridge')" >&2; exit 78; }
 
 mkdir -p -m 700 "$control_dir" "$agent_dir/fresh" "$agent_dir/wake/results" "$agent_dir/sandbox-home" "$sandbox_run/agent"
 mkdir -p "$work_dir"
@@ -41,6 +61,7 @@ args=(
   --cap-drop=ALL
   --security-opt=no-new-privileges:true
   --read-only
+  --network "$network"
   --dns 1.1.1.1
   --dns 8.8.8.8
   --dns-search .

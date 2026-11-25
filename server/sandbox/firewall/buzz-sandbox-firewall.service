@@ -1,0 +1,18 @@
+[Unit]
+Description=buzz-host sandbox egress filter (nftables table inet buzz_sandbox)
+Documentation=https://github.com/ytheesh96/buzz-host
+# Load before Docker so no sandbox container ever starts unfiltered. The rules
+# match the bridge by name, so they apply as soon as buzzsbx0 appears.
+Before=docker.service
+Wants=network-pre.target
+After=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/nft -f /etc/buzz-host/buzz-sandbox.nft
+ExecReload=/usr/bin/nft -f /etc/buzz-host/buzz-sandbox.nft
+ExecStop=/usr/bin/nft delete table inet buzz_sandbox
+
+[Install]
+WantedBy=multi-user.target

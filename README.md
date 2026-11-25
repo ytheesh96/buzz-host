@@ -57,6 +57,15 @@ block/buzz desktop amd64 deb; adapters are npm packages in `~/.local/lib/buzz-ho
 - `allowLogins` is optional. Leave it out (or empty) on a token-only host: the
   `Tailscale-User-Login` listener does not start at all.
 - Agents only answer their owner by default (`BUZZ_ACP_RESPOND_TO=owner-only`).
+- Sandboxed (Docker) agents run on their own bridge network `buzz-sandbox`
+  (`buzzsbx0`, 172.30.0.0/24, no container-to-container traffic). A root
+  nftables table (`server/sandbox/firewall/`) drops everything from that bridge
+  to this host and to RFC1918, the tailnet (100.64/10), link-local, loopback,
+  multicast and IPv6. Public internet still works, including the relay through
+  its Funnel name. Install it once with `sudo server/sandbox/install-firewall.sh`
+  (`--remove` to uninstall). `docker-run` refuses to start a sandboxed agent
+  while `buzz-sandbox-firewall.service` is inactive, and the Docker runner reports
+  itself unavailable.
 
 ## Patched buzz-acp (no fork repo)
 

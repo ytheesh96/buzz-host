@@ -8,6 +8,10 @@
 //   - Strictly isolated bind mounts: ONLY this agent's workspace, its isolated
 //     sandbox-home, its per-agent /run/buzz-sandbox sockets/dirs, and read-only
 //     buzz-host runtime tools
+//   - Egress: own bridge network (buzzsbx0, no inter-container traffic) behind a
+//     root nftables table (firewall/) that drops traffic to this host, RFC1918,
+//     the tailnet (100.64/10), link-local and multicast; docker-run refuses to
+//     start while that unit is inactive
 //   - Zero host API keys / OAuth credentials in the container: all LLM traffic
 //     flows through 127.0.0.1:18461 -> /run/buzz-sandbox/proxy.sock -> host proxy
 
@@ -24,6 +28,10 @@ export const CONTAINER_PROXY_PORT = 18461;
 export const DEFAULT_DOCKER_MEMORY = "1536m";
 export const DEFAULT_DOCKER_CPUS = "2";
 export const DEFAULT_DOCKER_PIDS_LIMIT = 256;
+/** Dedicated bridge network; firewall/buzz-sandbox.nft matches its bridge name. */
+export const SANDBOX_NETWORK = "buzz-sandbox";
+export const SANDBOX_BRIDGE = "buzzsbx0";
+export const SANDBOX_FIREWALL_UNIT = "buzz-sandbox-firewall.service";
 
 const CONTAINER_SHIMS = {
   claude: "/opt/buzz-host/sandbox/container-shims/claude-agent-acp",
@@ -295,6 +303,7 @@ export function buildDockerArgs({
   agyBinaryPath = "",
   hasInstructions = false,
   image = DEFAULT_DOCKER_IMAGE,
+  network = SANDBOX_NETWORK,
   memory = DEFAULT_DOCKER_MEMORY,
   cpus = DEFAULT_DOCKER_CPUS,
   pidsLimit = DEFAULT_DOCKER_PIDS_LIMIT,
@@ -312,6 +321,8 @@ export function buildDockerArgs({
     "--cap-drop=ALL",
     "--security-opt=no-new-privileges:true",
     "--read-only",
+    "--network",
+    network,
     "--dns",
     "1.1.1.1",
     "--dns",
@@ -378,18 +389,28 @@ export async function checkDockerAvailability({ image = DEFAULT_DOCKER_IMAGE, fr
       imageOk = false;
     }
   }
+  let firewallOk = false;
+  try {
+    await run("systemctl", ["is-active", "--quiet", SANDBOX_FIREWALL_UNIT], { timeout: 5_000 });
+    firewallOk = true;
+  } catch {
+    firewallOk = false;
+  }
   const value = {
     id: "docker",
     title: "Docker sandbox",
-    available: daemonOk && imageOk,
+    available: daemonOk && imageOk && firewallOk,
     daemonAvailable: daemonOk,
     imageBuilt: imageOk,
+    egressFilter: firewallOk,
     image,
     note: !daemonOk
       ? "Docker daemon is not reachable."
       : !imageOk
         ? `Image ${image} not built yet (run server/sandbox/build-image.sh).`
-        : "Hardened container with host-side credential proxy.",
+        : !firewallOk
+          ? `Egress filter ${SANDBOX_FIREWALL_UNIT} is not active (run: sudo server/sandbox/install-firewall.sh).`
+          : "Hardened container with host-side credential proxy and LAN/tailnet egress filter.",
   };
   dockerAvailCache = { at: Date.now(), value };
   return value;
