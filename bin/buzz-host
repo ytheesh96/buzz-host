@@ -1,0 +1,23 @@
+#!/bin/sh
+# buzz-host CLI entrypoint. In a bundle (install.sh) this runs the bundle's
+# pinned Node; in a checkout it runs the PATH's node. Subcommands live in
+# cli/main.mjs.
+set -e
+self="$0"
+# Resolve symlinks (~/.local/bin/buzz-host -> runtime/current/bin/buzz-host)
+# without readlink -f, which older macOS lacks.
+while [ -L "$self" ]; do
+  link="$(readlink "$self")"
+  case "$link" in
+    /*) self="$link" ;;
+    *) self="$(dirname "$self")/$link" ;;
+  esac
+done
+root="$(cd "$(dirname "$self")/.." && pwd -P)"
+if [ -x "$root/node/bin/node" ]; then
+  node="$root/node/bin/node"
+else
+  node="$(command -v node || true)"
+  [ -n "$node" ] || { echo "buzz-host: node not found (bundles ship one in node/bin)" >&2; exit 1; }
+fi
+exec "$node" "$root/cli/main.mjs" "$@"

@@ -1,0 +1,22 @@
+# Unit tests on every PR and every push to main. The bundle build +
+# smoke test lives in release.yml (it only runs when bundle inputs change).
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "26.12.0"
+      - run: node --test server/ attention/ memory/ plugin/ cli/
+      - run: python3 -m unittest discover -s server -p 'test_*.py'

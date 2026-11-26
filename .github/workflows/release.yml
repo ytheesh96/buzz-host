@@ -1,0 +1,269 @@
+# Portable buzz-host bundles: one tarball per target with the server files,
+# the patched buzz-acp + buzz CLI (upstream block/buzz at bundle/UPSTREAM_REF
+# plus patches/*.patch), buzz-host-iroh, the MCP bridge and a pinned Node.
+#
+# - Push a tag `v<semver>`: build, smoke-test and publish a GitHub Release
+#   with buzz-host-<target>.tar.gz, SHA256SUMS and install.sh.
+# - A PR that changes bundle inputs, a push to main, or a manual run
+#   (workflow_dispatch): build and smoke-test all targets, then a dry-run of
+#   the publish job (SHA256SUMS checked, nothing published). Bundles are kept
+#   as workflow artifacts.
+# - A manual run with `release_tag` set publishes a *draft* prerelease, which
+#   stays private until someone publishes it on GitHub.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+    branches: [main]
+    paths:
+      - ".github/workflows/release.yml"
+      - "bundle/**"
+      - "cli/**"
+      - "bin/**"
+      - "server/**"
+      - "hermes-plugin/**"
+      - "agy-plugin/**"
+      - "install.sh"
+      - "deploy.sh"
+      - "patches/**"
+      - "iroh-bridge/**"
+  pull_request:
+    paths:
+      - ".github/workflows/release.yml"
+      - "bundle/**"
+      - "cli/**"
+      - "bin/**"
+      - "server/**"
+      - "hermes-plugin/**"
+      - "agy-plugin/**"
+      - "install.sh"
+      - "deploy.sh"
+      - "patches/**"
+      - "iroh-bridge/**"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Also publish a DRAFT prerelease with this tag (e.g. v0.1.0-rc.1); empty = build + dry run only"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}-${{ inputs.release_tag || 'build' }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "26.12.0"
+      - run: node --test server/ attention/ memory/ plugin/ cli/
+      - run: python3 -m unittest discover -s server -p 'test_*.py'
+
+  build:
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x64
+            runner: ubuntu-24.04
+            # Debian 12 (glibc 2.36): bundles run on older distros than the runner's.
+            container: rust:1-bookworm
+          - target: linux-arm64
+            runner: ubuntu-24.04-arm
+            container: rust:1-bookworm
+          - target: darwin-arm64
+            runner: macos-15
+            container: ""
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.container || null }}
+    env:
+      CARGO_TERM_COLOR: never
+      CARGO_PROFILE_RELEASE_STRIP: symbols
+    steps:
+      - uses: actions/checkout@v4
+
+      # The github.workspace / runner.temp contexts are host paths inside a container
+      # job, so everything lives under the workspace and paths come from
+      # $GITHUB_WORKSPACE at run time.
+      - name: Paths
+        shell: bash
+        run: |
+          {
+            echo "BUZZ_UPSTREAM_SRC=$GITHUB_WORKSPACE/.upstream/buzz"
+            echo "CARGO_TARGET_DIR=$GITHUB_WORKSPACE/.upstream/target"
+            echo "WORK=$GITHUB_WORKSPACE/.work"
+          } >> "$GITHUB_ENV"
+
+      - name: Version
+        id: version
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            v="${GITHUB_REF#refs/tags/v}"
+          elif [[ -n "${{ inputs.release_tag }}" ]]; then
+            v="${{ inputs.release_tag }}"; v="${v#v}"
+          else
+            v="0.0.0-dev.${GITHUB_RUN_NUMBER}"
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "buzz-host $v for ${{ matrix.target }}"
+
+      - name: Tools (container)
+        if: matrix.container != ''
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends xz-utils zstd >/dev/null
+          echo "/usr/local/cargo/bin" >> "$GITHUB_PATH"
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Cargo cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            /usr/local/cargo/registry
+            /usr/local/cargo/git
+            .upstream/target
+            iroh-bridge/target
+          key: cargo-${{ matrix.target }}-${{ hashFiles('bundle/UPSTREAM_REF', 'patches/*.patch', 'iroh-bridge/Cargo.lock') }}
+          restore-keys: cargo-${{ matrix.target }}-
+
+      - name: Build buzz-acp + buzz (upstream + patches)
+        shell: bash
+        run: bundle/build-upstream.sh "$WORK/bins"
+
+      - name: Build buzz-host-iroh
+        shell: bash
+        run: |
+          cd iroh-bridge
+          rustup toolchain install
+          CARGO_TARGET_DIR="$GITHUB_WORKSPACE/iroh-bridge/target" cargo build --release --locked
+          cd ..
+          install -m 0755 iroh-bridge/target/release/buzz-host-iroh "$WORK/bins/buzz-host-iroh"
+          "$WORK/bins/buzz-host-iroh" --help >/dev/null
+
+      - name: Build buzz-mcp-bridge
+        shell: bash
+        run: cc -O2 -Wall -Wextra -o "$WORK/bins/buzz-mcp-bridge" server/buzz-mcp-bridge.c
+
+      - name: Assemble bundle
+        shell: bash
+        run: |
+          bundle/make-bundle.sh --version "${{ steps.version.outputs.version }}" --target "${{ matrix.target }}" \
+            --bins "$WORK/bins" --out "$WORK/dist"
+          cat "$WORK/dist/"*.sha256
+
+      # Install the bundle into a throwaway HOME with install.sh, run
+      # `buzz-host up --no-service` twice (same token), then start the server
+      # by hand and check /health and an authenticated `hello`.
+      - name: Smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+          export HOME="$WORK/smoke-home" XDG_RUNTIME_DIR="$WORK/smoke-run"
+          mkdir -p "$HOME" "$XDG_RUNTIME_DIR" && chmod 700 "$XDG_RUNTIME_DIR"
+          sh install.sh --bundle "$WORK/dist/buzz-host-${{ matrix.target }}.tar.gz"
+          bh="$HOME/.local/bin/buzz-host"
+          "$bh" version
+          "$bh" up --no-service --no-adapters --guest-port 18467 --port 18457 --json > up1.json
+          "$bh" up --no-service --no-adapters --json > up2.json
+          cat up1.json; cmp up1.json up2.json
+          # The `up --json` contract the Buzz app reads: one object with
+          # string version/url/token (pubkey optional), and nothing else on stdout.
+          node_bin="$HOME/.local/lib/buzz-host/bin/node"
+          "$node_bin" -e '
+            const fs = require("fs");
+            const raw = fs.readFileSync("up1.json", "utf8").trim();
+            const j = JSON.parse(raw);
+            for (const k of ["version", "url", "token"]) {
+              if (typeof j[k] !== "string" || !j[k]) throw new Error(`up --json: missing ${k}: ${raw}`);
+            }
+            if (!/^wss?:\/\//.test(j.url)) throw new Error(`up --json: url is not ws(s): ${j.url}`);
+            const want = fs.readFileSync(process.argv[1], "utf8").trim();
+            if (j.version !== want) throw new Error(`up --json: version ${j.version} != bundle ${want}`);
+            console.log("contract ok:", Object.keys(j).join(","));
+          ' "$HOME/.local/share/buzz-host/runtime/current/VERSION"
+          lib="$HOME/.local/lib/buzz-host"
+          "$lib/bin/buzz-acp" --help >/dev/null
+          "$lib/bin/buzz" --help >/dev/null
+          "$lib/bin/node" --version
+          PATH="$lib/bin:$PATH" "$lib/bin/node" "$lib/buzz-host.mjs" > server.log 2>&1 &
+          pid=$!
+          for i in $(seq 1 60); do curl -fsS http://127.0.0.1:18467/health && break; sleep 0.5; done
+          token="$("$lib/bin/node" -e 'console.log(JSON.parse(require("fs").readFileSync("up1.json")).token)')"
+          "$lib/bin/node" -e '
+            const ws = new WebSocket("ws://127.0.0.1:18467");
+            const t = setTimeout(() => { console.error("timeout"); process.exit(1); }, 15000);
+            let n = 0;
+            ws.onopen = () => ws.send(JSON.stringify({ id: 1, method: "auth", params: { token: process.argv[1] } }));
+            ws.onmessage = (e) => {
+              const m = JSON.parse(e.data);
+              if (m.error) { console.error(m.error); process.exit(1); }
+              if (++n === 1) return ws.send(JSON.stringify({ id: 2, method: "hello", params: {} }));
+              console.log("hello:", m.result.platform, m.result.role); clearTimeout(t); ws.close();
+            };' "$token"
+          kill "$pid"; wait "$pid" || true
+          cat server.log
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bundle-${{ matrix.target }}
+          path: .work/dist/*
+          if-no-files-found: error
+
+  # Always runs after the builds. Without a tag or release_tag it is a dry
+  # run: it assembles and checks SHA256SUMS and lists what would be published.
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bundle-*
+          path: dist
+          merge-multiple: true
+      - name: SHA256SUMS
+        run: |
+          cd dist
+          cat *.tar.gz.sha256 > SHA256SUMS
+          sha256sum -c SHA256SUMS
+          rm *.tar.gz.sha256
+          cp ../install.sh .
+          cat SHA256SUMS
+          ls -l
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          flags=()
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            tag="${GITHUB_REF#refs/tags/}"
+            if [[ "$tag" == *-* ]]; then flags+=(--prerelease); fi
+          elif [[ "$GITHUB_EVENT_NAME" == workflow_dispatch && -n "$RELEASE_TAG" ]]; then
+            # Manual runs only ever make a draft: nothing public until a human publishes it.
+            tag="$RELEASE_TAG"; flags+=(--draft --prerelease)
+          else
+            echo "dry run ($GITHUB_EVENT_NAME $GITHUB_REF): would publish:"; ls -l dist
+            exit 0
+          fi
+          if gh release view "$tag" >/dev/null 2>&1; then
+            if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch && "$(gh release view "$tag" --json isDraft -q .isDraft)" != true ]]; then
+              echo "release $tag is already published; a manual run only updates drafts" >&2; exit 1
+            fi
+            gh release upload "$tag" dist/* --clobber
+          else
+            gh release create "$tag" dist/* --target "$GITHUB_SHA" --title "buzz-host $tag" --generate-notes "${flags[@]}"
+          fi
