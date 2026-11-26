@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { runDoctor } from "./doctor.mjs";
 import { createHost, stdio, UsageError } from "./host.mjs";
 import { runDown, runRestart, runStatus } from "./lifecycle.mjs";
+import { runLinksCommand } from "./links.mjs";
 import { runLogs } from "./logs.mjs";
 import { runPair } from "./pair.mjs";
 import { runTokensCommand } from "./tokens.mjs";
@@ -42,7 +43,8 @@ export const COMMANDS = {
   restart: managed("Restart buzz-host (--agents: and every agent; or restart one agent)", runRestart),
   status: managed("Show buzz-host and agent unit states, URL and version", runStatus),
   pair: managed("Print the URL, token and pairing URL for connecting a device (--qr for a QR code)", runPair),
-  tokens: managed("Manage access tokens: create | create-admin | list | revoke", runTokensCommand),
+  tokens: managed("Manage access tokens: create | create-admin | create-delegate | list | revoke", runTokensCommand),
+  links: managed("Manage peer host links for cross-machine delegation: add | list | test | update | remove", runLinksCommand),
   logs: managed("Show buzz-host's log, or one agent's", runLogs),
   doctor: managed("Check runtimes, sign-ins, ports, linger and install state", runDoctor),
   version: {

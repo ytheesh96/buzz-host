@@ -23,7 +23,10 @@ use iroh::{
     Endpoint, EndpointAddr, RelayMode, RelayUrl, SecretKey, Watcher,
 };
 use serde::{Deserialize, Serialize};
-use tokio::{net::TcpStream, sync::Semaphore};
+use tokio::{
+    net::{TcpListener, TcpStream},
+    sync::{Mutex, Semaphore},
+};
 
 /// ALPN every buzz-host tunnel client must offer.
 pub const ALPN: &[u8] = b"buzz-host/ws/1";
@@ -38,9 +41,11 @@ const ERR_BUSY: u32 = 1;
 const ERR_TARGET: u32 = 2;
 
 pub const USAGE: &str = "\
-usage: buzz-host-iroh --target <127.0.0.1:port|[::1]:port> --key-file <path> --addr-file <path> [--max-streams <n>]
+usage:
+  buzz-host-iroh --target <127.0.0.1:port|[::1]:port> --key-file <path> --addr-file <path> [--max-streams <n>]
+  buzz-host-iroh connect --addr <endpointAddr> --node-id <id> [--listen 127.0.0.1:0] [--max-streams <n>]
 
-Proxies every Iroh QUIC bi-stream on ALPN buzz-host/ws/1 to the loopback target.
+Proxies Iroh QUIC bi-streams on ALPN buzz-host/ws/1 between loopback TCP and a peer endpoint.
 Relays: BUZZ_MESH_IROH_RELAYS=0 (direct only) | unset/1/default (n0 relays) | https://a,https://b (custom)";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,6 +54,93 @@ pub struct Args {
     pub key_file: PathBuf,
     pub addr_file: PathBuf,
     pub max_streams: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectArgs {
+    pub addr: String,
+    pub node_id: String,
+    pub listen: SocketAddr,
+    pub max_streams: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Command {
+    Serve(Args),
+    Connect(ConnectArgs),
+}
+
+/// Parse argv (without the program name), dispatching `connect` vs server mode.
+pub fn parse_command<I, S>(args: I) -> Result<Option<Command>>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    let items: Vec<String> = args.into_iter().map(Into::into).collect();
+    if items.first().map(String::as_str) == Some("connect") {
+        return parse_connect_args(items.into_iter().skip(1)).map(|opt| opt.map(Command::Connect));
+    }
+    parse_args(items).map(|opt| opt.map(Command::Serve))
+}
+
+/// Parse `buzz-host-iroh connect ...` arguments. `Ok(None)` means `--help`.
+pub fn parse_connect_args<I, S>(args: I) -> Result<Option<ConnectArgs>>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    let mut addr = None;
+    let mut node_id = None;
+    let mut listen: SocketAddr = "127.0.0.1:0".parse().expect("loopback literal");
+    let mut max_streams = DEFAULT_MAX_STREAMS;
+    let mut it = args.into_iter().map(Into::into);
+    while let Some(arg) = it.next() {
+        let (flag, inline) = match arg.split_once('=') {
+            Some((f, v)) if f.starts_with("--") => (f.to_string(), Some(v.to_string())),
+            _ => (arg.clone(), None),
+        };
+        if flag == "-h" || flag == "--help" {
+            return Ok(None);
+        }
+        let mut value = || -> Result<String> {
+            match inline.clone() {
+                Some(v) => Ok(v),
+                None => it.next().ok_or_else(|| anyhow!("{flag} needs a value")),
+            }
+        };
+        match flag.as_str() {
+            "--addr" => {
+                let raw = value()?;
+                if raw.trim().is_empty() {
+                    bail!("--addr must not be empty");
+                }
+                addr = Some(raw.trim().to_string());
+            }
+            "--node-id" => {
+                let raw = value()?;
+                if raw.trim().is_empty() {
+                    bail!("--node-id must not be empty");
+                }
+                node_id = Some(raw.trim().to_string());
+            }
+            "--listen" => listen = parse_listen(&value()?)?,
+            "--max-streams" => {
+                let raw = value()?;
+                max_streams = raw
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|n| (1..=65_536).contains(n))
+                    .ok_or_else(|| anyhow!("--max-streams must be 1..=65536, got {raw:?}"))?;
+            }
+            other => bail!("unknown argument {other:?}"),
+        }
+    }
+    Ok(Some(ConnectArgs {
+        addr: addr.ok_or_else(|| anyhow!("--addr is required"))?,
+        node_id: node_id.ok_or_else(|| anyhow!("--node-id is required"))?,
+        listen,
+        max_streams,
+    }))
 }
 
 /// Parse argv (without the program name). `Ok(None)` means `--help`.
@@ -109,19 +201,29 @@ fn non_empty_path(flag: &str, raw: String) -> Result<PathBuf> {
 /// Only `127.0.0.1:<port>` or `[::1]:<port>`: the bridge must never become an
 /// open proxy to other hosts or to non-loopback interfaces.
 pub fn parse_target(raw: &str) -> Result<SocketAddr> {
+    let addr = parse_loopback("--target", raw)?;
+    if addr.port() == 0 {
+        bail!("--target port must not be 0");
+    }
+    Ok(addr)
+}
+
+/// Loopback listen address for `connect` mode; port 0 asks the OS for an ephemeral port.
+pub fn parse_listen(raw: &str) -> Result<SocketAddr> {
+    parse_loopback("--listen", raw)
+}
+
+fn parse_loopback(flag: &str, raw: &str) -> Result<SocketAddr> {
     let addr: SocketAddr = raw
         .trim()
         .parse()
-        .map_err(|_| anyhow!("--target must be 127.0.0.1:<port> or [::1]:<port>, got {raw:?}"))?;
+        .map_err(|_| anyhow!("{flag} must be 127.0.0.1:<port> or [::1]:<port>, got {raw:?}"))?;
     let loopback = match addr {
         SocketAddr::V4(v4) => v4.ip().octets() == [127, 0, 0, 1],
         SocketAddr::V6(v6) => v6.ip().is_loopback() && v6.scope_id() == 0,
     };
     if !loopback {
-        bail!("--target must be 127.0.0.1:<port> or [::1]:<port>, got {raw:?}");
-    }
-    if addr.port() == 0 {
-        bail!("--target port must not be 0");
+        bail!("{flag} must be 127.0.0.1:<port> or [::1]:<port>, got {raw:?}");
     }
     Ok(addr)
 }
@@ -473,5 +575,170 @@ async fn proxy_stream(mut send: SendStream, mut recv: RecvStream, target: Socket
     let mut tcp = tcp;
     let mut quic = tokio::io::join(recv, send);
     tokio::io::copy_bidirectional(&mut quic, &mut tcp).await?;
+    Ok(())
+}
+
+// ---------- client dial mode (`buzz-host-iroh connect`) ----------
+
+const DIAL_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
+pub struct DialerConfig {
+    pub endpoint_addr: EndpointAddr,
+    pub expected_node_id: String,
+    pub listen: SocketAddr,
+    pub relay_mode: RelayMode,
+    pub max_streams: usize,
+}
+
+pub struct Dialer {
+    endpoint: Endpoint,
+    listener: TcpListener,
+    local_addr: SocketAddr,
+    endpoint_addr: EndpointAddr,
+    streams: Arc<Semaphore>,
+}
+
+impl Dialer {
+    /// Verify the pinned node id, bind the loopback TCP listener, and create an
+    /// ephemeral Iroh endpoint for dialing the remote peer.
+    pub async fn bind(config: DialerConfig) -> Result<Self> {
+        let actual_id = config.endpoint_addr.id.to_string();
+        if actual_id != config.expected_node_id.trim() {
+            bail!(
+                "node id mismatch: expected {}, address has {actual_id}",
+                config.expected_node_id.trim()
+            );
+        }
+        let listener = TcpListener::bind(config.listen)
+            .await
+            .with_context(|| format!("bind loopback listener {}", config.listen))?;
+        let local_addr = listener.local_addr()?;
+        let endpoint = Endpoint::builder(presets::Minimal)
+            .secret_key(SecretKey::generate())
+            .relay_mode(config.relay_mode)
+            .bind()
+            .await
+            .map_err(|e| anyhow!("bind iroh dialer endpoint: {e}"))?;
+        Ok(Self {
+            endpoint,
+            listener,
+            local_addr,
+            endpoint_addr: config.endpoint_addr,
+            streams: Arc::new(Semaphore::new(config.max_streams)),
+        })
+    }
+
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+
+    pub fn node_id(&self) -> String {
+        self.endpoint_addr.id.to_string()
+    }
+
+    /// Forward each accepted loopback TCP connection over a bi-stream to the
+    /// pinned remote Iroh endpoint until `shutdown` resolves.
+    pub async fn run(self, shutdown: impl std::future::Future<Output = ()>) -> Result<()> {
+        let shared_conn: Arc<Mutex<Option<Connection>>> = Arc::new(Mutex::new(None));
+        let forward = async {
+            loop {
+                let (tcp, _) = match self.listener.accept().await {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        eprintln!("buzz-host-iroh connect: accept failed: {e}");
+                        break;
+                    }
+                };
+                let Ok(permit) = self.streams.clone().try_acquire_owned() else {
+                    eprintln!("buzz-host-iroh connect: refusing local socket: max streams reached");
+                    drop(tcp);
+                    continue;
+                };
+                let endpoint = self.endpoint.clone();
+                let addr = self.endpoint_addr.clone();
+                let shared = shared_conn.clone();
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    if let Err(e) = dial_and_proxy(tcp, endpoint, addr, shared).await {
+                        eprintln!("buzz-host-iroh connect: stream failed: {e:#}");
+                    }
+                });
+            }
+        };
+        tokio::select! {
+            _ = shutdown => {}
+            _ = forward => {}
+        }
+        if let Some(conn) = shared_conn.lock().await.take() {
+            conn.close(0u32.into(), b"shutdown");
+        }
+        let _ = tokio::time::timeout(Duration::from_secs(3), self.endpoint.close()).await;
+        Ok(())
+    }
+}
+
+async fn get_or_dial(
+    endpoint: &Endpoint,
+    addr: &EndpointAddr,
+    shared: &Arc<Mutex<Option<Connection>>>,
+) -> Result<Connection> {
+    let mut guard = shared.lock().await;
+    if let Some(existing) = guard.as_ref() {
+        if existing.close_reason().is_none() {
+            return Ok(existing.clone());
+        }
+        *guard = None;
+    }
+    let conn = tokio::time::timeout(DIAL_CONNECT_TIMEOUT, endpoint.connect(addr.clone(), ALPN))
+        .await
+        .map_err(|_| anyhow!("dial {} timed out", addr.id.fmt_short()))?
+        .map_err(|e| anyhow!("dial {}: {e}", addr.id.fmt_short()))?;
+    if conn.remote_id() != addr.id {
+        conn.close(0u32.into(), b"node id mismatch");
+        bail!(
+            "node id mismatch after handshake: expected {}, got {}",
+            addr.id,
+            conn.remote_id()
+        );
+    }
+    *guard = Some(conn.clone());
+    Ok(conn)
+}
+
+async fn open_pinned_bi(
+    endpoint: &Endpoint,
+    addr: &EndpointAddr,
+    shared: &Arc<Mutex<Option<Connection>>>,
+) -> Result<(SendStream, RecvStream)> {
+    let conn = get_or_dial(endpoint, addr, shared).await?;
+    match conn.open_bi().await {
+        Ok(pair) => Ok(pair),
+        Err(_) => {
+            // Cached connection may have just dropped; clear and retry once.
+            {
+                let mut guard = shared.lock().await;
+                if guard.as_ref().is_some_and(|c| c.stable_id() == conn.stable_id()) {
+                    *guard = None;
+                }
+            }
+            let fresh = get_or_dial(endpoint, addr, shared).await?;
+            fresh
+                .open_bi()
+                .await
+                .map_err(|e| anyhow!("open bi-stream: {e}"))
+        }
+    }
+}
+
+async fn dial_and_proxy(
+    mut tcp: TcpStream,
+    endpoint: Endpoint,
+    addr: EndpointAddr,
+    shared: Arc<Mutex<Option<Connection>>>,
+) -> Result<()> {
+    let _ = tcp.set_nodelay(true);
+    let (send, recv) = open_pinned_bi(&endpoint, &addr, &shared).await?;
+    let mut quic = tokio::io::join(recv, send);
+    tokio::io::copy_bidirectional(&mut tcp, &mut quic).await?;
     Ok(())
 }

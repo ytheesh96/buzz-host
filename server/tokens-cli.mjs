@@ -14,7 +14,10 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { buildInviteUrl, createTokenStore } from "./auth.mjs";
+import { buildInviteUrl, createTokenStore, isTokenExpired } from "./auth.mjs";
+import { loadMachineId, machineName as resolveMachineName, readRoutes } from "./discovery.mjs";
+import { encodeLinkBlob } from "./links.mjs";
+import { runDir as resolveRunDir } from "./service-manager.mjs";
 
 /** What buzz-host.mjs advertises when config.json has no publicGuestUrl. */
 export const LEGACY_PUBLIC_GUEST_URL = "wss://omarchy.tail65c5a9.ts.net/_buzz-host";
@@ -66,6 +69,8 @@ export function defaultTokenPaths({ env = process.env, home = os.homedir() } = {
   return {
     tokensFile: env.BUZZ_HOST_TOKENS_FILE || path.join(home, ".local/share/buzz-host/tokens.json"),
     configFile: env.BUZZ_HOST_CONFIG || path.join(home, ".config/buzz-host/config.json"),
+    machineIdFile: env.BUZZ_HOST_MACHINE_ID_FILE || path.join(home, ".local/share/buzz-host/machine-id"),
+    runDir: resolveRunDir({ env }),
   };
 }
 
@@ -91,16 +96,78 @@ export async function runTokens(
   const tokensFile =
     typeof flags.file === "string" && flags.file.trim() ? flags.file.trim() : (overrides.tokensFile ?? defaults.tokensFile);
   const configFile = overrides.configFile ?? defaults.configFile;
+  const machineIdFile = overrides.machineIdFile ?? defaults.machineIdFile;
+  const runDirPath = overrides.runDir ?? defaults.runDir;
   const store = createTokenStore({ filePath: tokensFile });
-  const role = cmd === "create-admin" ? "admin" : typeof flags.role === "string" ? flags.role.trim().toLowerCase() : "guest";
+  const role =
+    cmd === "create-admin"
+      ? "admin"
+      : cmd === "create-delegate"
+        ? "delegate"
+        : typeof flags.role === "string"
+          ? flags.role.trim().toLowerCase()
+          : "guest";
   const json = (value) => out(JSON.stringify(value, null, 2));
   const publicUrl = async () => (typeof flags.url === "string" && flags.url.trim() ? flags.url.trim() : resolvePublicUrl(await readConfig(configFile)));
 
   try {
-    if ((cmd === "create" || cmd === "create-admin") && role !== "guest" && role !== "admin") {
-      throw new Error(`--role must be "guest" or "admin", not "${flags.role}"`);
+    if ((cmd === "create" || cmd === "create-admin" || cmd === "create-delegate") && role !== "guest" && role !== "admin" && role !== "delegate") {
+      throw new Error(`--role must be "guest", "admin", or "delegate", not "${flags.role}"`);
     }
-    if ((cmd === "create" || cmd === "create-admin") && role === "admin") {
+    if ((cmd === "create" || cmd === "create-delegate") && role === "delegate") {
+      const allowedRuntimes =
+        typeof flags.runtimes === "string"
+          ? flags.runtimes
+              .split(",")
+              .map((s) => s.trim())
+              .filter(Boolean)
+          : undefined;
+      const workspaces =
+        typeof flags.workspaces === "string"
+          ? flags.workspaces
+              .split(",")
+              .map((s) => s.trim())
+              .filter(Boolean)
+          : undefined;
+      const { token, record } = await store.createDelegate({
+        label: flags.label ?? rest[0],
+        ownerPubkey: flags.owner,
+        peerMachineId: flags["peer-machine-id"],
+        agents: flags.agents ?? "all",
+        allowedRuntimes,
+        access: flags.access ?? "sandboxed",
+        workspaces,
+        maxConcurrency: flags["max-concurrency"],
+        maxTaskMs: flags["max-task-ms"],
+        expiresAt: flags.expires ?? flags["expires-at"],
+      });
+      const cfg = await readConfig(configFile);
+      const machineId = await loadMachineId({ file: machineIdFile, configured: cfg.machineId });
+      const name = resolveMachineName(cfg.machineName);
+      const explicitUrl = typeof flags.url === "string" && flags.url.trim() ? flags.url.trim() : undefined;
+      let routes = await readRoutes(runDirPath, {
+        publicGuestUrl: explicitUrl ?? (typeof cfg.publicGuestUrl === "string" ? cfg.publicGuestUrl : undefined),
+        publicUrl: cfg.publicUrl,
+      });
+      if (!routes.length) {
+        routes = [{ type: "wss", url: explicitUrl || resolvePublicUrl(cfg) }];
+      }
+      const irohNodeId = routes.find((r) => r.type === "iroh")?.nodeId ?? null;
+      const pairingBlob = encodeLinkBlob({ machineId, name, routes, irohNodeId, token });
+      if (flags.json) {
+        json({ token, pairingBlob, routes, machineId, name, irohNodeId, record });
+      } else {
+        out(`Created DELEGATE token ${record.id} for "${record.label}"`);
+        out(
+          `Scope: owner=${record.ownerPubkey}  access=${record.access}  agents=${record.agents === "all" ? "all" : record.agents.length}  runtimes=${record.allowedRuntimes.join(",")}  maxConcurrency=${record.maxConcurrency}  expires=${record.expiresAt}`,
+        );
+        if (record.workspaces.length) out(`Workspaces:              ${record.workspaces.join(", ")}`);
+        out(`\nToken (shown once):      ${token}`);
+        out(`Pairing blob (1-paste):  ${pairingBlob}`);
+        out(`Install on peer host:    buzz-host links add '${pairingBlob}'`);
+        out(`Revoke with:             ${prog} revoke ${record.id}`);
+      }
+    } else if ((cmd === "create" || cmd === "create-admin") && role === "admin") {
       const guestOnly = ["max-agents", "max-concurrency", "runtimes", "allow-host-desktop", "no-sandbox-desktop", "trusted"].filter((f) => f in flags);
       if (guestOnly.length) throw new Error(`Admin tokens have no guest caps; drop --${guestOnly.join(", --")}`);
       const { token, record } = await store.createAdmin({ label: flags.label ?? rest[0], ownerPubkey: flags.owner });
@@ -156,12 +223,18 @@ export async function runTokens(
         out("No access tokens.");
       } else {
         for (const t of tokens) {
-          const status = t.revokedAt ? `REVOKED (${t.revokedAt})` : "active";
+          const status = t.revokedAt
+            ? `REVOKED (${t.revokedAt})`
+            : isTokenExpired(t)
+              ? `EXPIRED (${t.expiresAt})`
+              : "active";
           const owner = t.ownerPubkey ? t.ownerPubkey.slice(0, 12) + "…" : t.role === "admin" ? "-" : "unbound";
           const detail =
             t.role === "admin"
               ? "full access"
-              : `caps=${t.maxAgents}a/${t.maxConcurrency}c  runtimes=${t.allowedRuntimes.join(",")}${t.allowHostDesktop ? "  hostDesktop=yes" : ""}${t.allowSandboxDesktop !== false ? "  sandboxDesktop=yes" : "  sandboxDesktop=no"}`;
+              : t.role === "delegate"
+                ? `access=${t.access}  maxConc=${t.maxConcurrency}  agents=${t.agents === "all" ? "all" : t.agents.length}  runtimes=${t.allowedRuntimes.join(",")}  expires=${t.expiresAt}`
+                : `caps=${t.maxAgents}a/${t.maxConcurrency}c  runtimes=${t.allowedRuntimes.join(",")}${t.allowHostDesktop ? "  hostDesktop=yes" : ""}${t.allowSandboxDesktop !== false ? "  sandboxDesktop=yes" : "  sandboxDesktop=no"}`;
           out(`${t.id}  ${t.role.padEnd(5)}  ${t.label}  [${status}]  owner=${owner}  ${detail}`);
         }
       }
@@ -174,7 +247,7 @@ export async function runTokens(
         out("buzz-host closes connections still using it within about 15 seconds.");
       }
     } else {
-      err(`Usage: ${prog} <create|create-admin|list|revoke> [options]`);
+      err(`Usage: ${prog} <create|create-admin|create-delegate|list|revoke> [options]`);
       return 2;
     }
     return 0;

@@ -290,3 +290,156 @@ export function createIrohSupervisor({
     keyFile,
   };
 }
+
+/**
+ * Supervises one `buzz-host-iroh connect` loopback forwarder for a peer link.
+ * Resolves `waitReady()` with the local `ws://127.0.0.1:<port>` URL once the
+ * child emits its `{"listen":"127.0.0.1:<port>","nodeId":"..."}` ready line.
+ * Rejects immediately with `code = "IDENTITY_MISMATCH"` if the child refuses
+ * the endpoint address due to a pinned node-id mismatch.
+ */
+export function createIrohLinkSupervisor({
+  addr,
+  nodeId,
+  config = {},
+  libDir = "",
+  repoBin = REPO_IROH_BIN,
+  env = process.env,
+  spawn = defaultSpawn,
+  fsImpl = fs,
+  log = console,
+  stopTimeoutMs = DEFAULT_STOP_TIMEOUT_MS,
+} = {}) {
+  let child = null;
+  let stopping = false;
+  let listenUrl = "";
+  let stopPromise = null;
+  let readyPromise = null;
+
+  function start() {
+    if (readyPromise) return readyPromise;
+    const bin = resolveIrohBin({ config, libDir, repoBin, fsImpl });
+    if (!bin) {
+      return Promise.reject(Object.assign(new Error("buzz-host-iroh binary not found"), { code: "NO_IROH_BIN" }));
+    }
+    if (!addr || !nodeId) {
+      return Promise.reject(new Error("addr and nodeId are required for iroh connect"));
+    }
+    stopping = false;
+    const args = ["connect", "--addr", String(addr), "--node-id", String(nodeId), "--listen", "127.0.0.1:0"];
+    if (Number.isInteger(config.irohMaxStreams) && config.irohMaxStreams > 0) {
+      args.push("--max-streams", String(config.irohMaxStreams));
+    }
+    readyPromise = new Promise((resolve, reject) => {
+      let settled = false;
+      let stderrTail = "";
+      const finish = (err, url) => {
+        if (settled) return;
+        settled = true;
+        if (err) reject(err);
+        else resolve(url);
+      };
+      let proc;
+      try {
+        proc = spawn(bin, args, { stdio: ["ignore", "pipe", "pipe"], env });
+      } catch (error) {
+        finish(error);
+        return;
+      }
+      child = proc;
+
+      let outBuf = "";
+      proc.stdout?.setEncoding?.("utf8");
+      proc.stdout?.on("data", (chunk) => {
+        outBuf += chunk;
+        let idx;
+        while ((idx = outBuf.indexOf("\n")) >= 0) {
+          const line = outBuf.slice(0, idx).trim();
+          outBuf = outBuf.slice(idx + 1);
+          if (!line) continue;
+          try {
+            const parsed = JSON.parse(line);
+            if (typeof parsed?.listen === "string" && parsed.listen) {
+              listenUrl = `ws://${parsed.listen}`;
+              finish(null, listenUrl);
+            }
+          } catch {
+            log.log?.(line);
+          }
+        }
+      });
+
+      proc.stderr?.setEncoding?.("utf8");
+      proc.stderr?.on("data", (chunk) => {
+        stderrTail = (stderrTail + chunk).slice(-2048);
+        for (const raw of String(chunk).split("\n")) {
+          const line = raw.trim();
+          if (line) log.log?.(line);
+        }
+      });
+
+      proc.once("error", (error) => {
+        if (child === proc) child = null;
+        finish(error);
+      });
+      proc.once("exit", (code, signal) => {
+        if (child === proc) child = null;
+        if (!settled) {
+          const detail = stderrTail.trim() || (signal ? `signal ${signal}` : `exit code ${code}`);
+          const err = new Error(`buzz-host-iroh connect failed: ${detail}`);
+          if (/node id mismatch/i.test(detail)) err.code = "IDENTITY_MISMATCH";
+          finish(err);
+        }
+      });
+    });
+    return readyPromise;
+  }
+
+  function stop() {
+    if (stopPromise) return stopPromise;
+    stopping = true;
+    const proc = child;
+    if (!proc) return Promise.resolve();
+    stopPromise = new Promise((resolve) => {
+      let done = false;
+      let killTimer = null;
+      const finish = () => {
+        if (done) return;
+        done = true;
+        if (killTimer) clearTimeout(killTimer);
+        if (child === proc) child = null;
+        stopPromise = null;
+        resolve();
+      };
+      if (proc.exitCode !== null || proc.signalCode !== null) {
+        finish();
+        return;
+      }
+      proc.once("exit", finish);
+      proc.once("error", finish);
+      try {
+        proc.kill("SIGTERM");
+      } catch {
+        finish();
+        return;
+      }
+      killTimer = setTimeout(() => {
+        if (done) return;
+        try {
+          proc.kill("SIGKILL");
+        } catch {
+          finish();
+        }
+      }, stopTimeoutMs);
+      killTimer.unref?.();
+    });
+    return stopPromise;
+  }
+
+  return {
+    start,
+    stop,
+    url: () => listenUrl,
+    isRunning: () => !stopping && Boolean(child && child.exitCode === null && child.signalCode === null),
+  };
+}

@@ -131,7 +131,7 @@ test("parseArgs: flags, values, short options and mistakes", () => {
 });
 
 test("the command table lists every management subcommand", () => {
-  for (const name of ["up", "down", "restart", "status", "pair", "tokens", "logs", "doctor", "version"]) {
+  for (const name of ["up", "down", "restart", "status", "pair", "tokens", "links", "logs", "doctor", "version"]) {
     assert.ok(COMMANDS[name], name);
     assert.match(usage(), new RegExp(`^ {2}${name} {2}`, "m"));
   }
@@ -139,7 +139,7 @@ test("the command table lists every management subcommand", () => {
 
 test("every management subcommand has --help", async (t) => {
   const { host, io } = await setup(t);
-  for (const name of ["down", "restart", "status", "pair", "tokens", "logs", "doctor"]) {
+  for (const name of ["down", "restart", "status", "pair", "tokens", "links", "logs", "doctor"]) {
     io.lines.length = 0;
     assert.equal(await COMMANDS[name].run(["--help"], { host, io }), 0, name);
     assert.match(io.text(), new RegExp(`Usage: buzz-host ${name}`), name);
@@ -316,7 +316,7 @@ test("tokens: usage, errors, and the local fallback URL for a host with no publi
   assert.equal(await runTokensCommand([], host, io), 2);
   assert.match(io.text(), /Usage: buzz-host tokens/);
   assert.equal(await runTokensCommand(["bogus"], host, io), 2);
-  assert.match(io.errs.at(-1), /Usage: buzz-host tokens <create\|create-admin\|list\|revoke>/);
+  assert.match(io.errs.at(-1), /Usage: buzz-host tokens <create\|create-admin\|create-delegate\|list\|revoke>/);
   assert.equal(await runTokensCommand(["revoke", "tok_000000000000"], host, io), 1);
   assert.match(io.errs.at(-1), /^Error: /);
   assert.equal(await runTokensCommand(["create-admin", "--label", "x", "--max-agents", "3"], host, io), 1);

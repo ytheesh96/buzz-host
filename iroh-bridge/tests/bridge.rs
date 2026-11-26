@@ -6,8 +6,9 @@ use std::{
 };
 
 use buzz_host_iroh::{
-    decode_endpoint_addr, encode_endpoint_addr, load_or_create_key, parse_args, parse_target,
-    relay_mode_from, write_addr_file, AddrRecord, Bridge, BridgeConfig, ALPN, DEFAULT_MAX_STREAMS,
+    decode_endpoint_addr, encode_endpoint_addr, load_or_create_key, parse_args, parse_command,
+    parse_connect_args, parse_listen, parse_target, relay_mode_from, write_addr_file, AddrRecord,
+    Bridge, BridgeConfig, Command, Dialer, DialerConfig, ALPN, DEFAULT_MAX_STREAMS,
 };
 use iroh::{endpoint::presets, Endpoint, RelayMode, SecretKey};
 use tokio::{
@@ -400,4 +401,154 @@ async fn bridge_enforces_max_streams_cap() {
     let _ = shutdown_tx.send(());
     let _ = tokio::time::timeout(Duration::from_secs(5), bridge_task).await;
     hold_task.abort();
+}
+
+#[test]
+fn parse_connect_args_and_loopback_listen() {
+    let cmd = parse_command([
+        "connect",
+        "--addr",
+        "eyJpZCI6ImFiYyJ9",
+        "--node-id=node123",
+    ])
+    .expect("valid connect args")
+    .expect("some command");
+    match cmd {
+        Command::Connect(c) => {
+            assert_eq!(c.addr, "eyJpZCI6ImFiYyJ9");
+            assert_eq!(c.node_id, "node123");
+            assert_eq!(c.listen, "127.0.0.1:0".parse::<SocketAddr>().unwrap());
+            assert_eq!(c.max_streams, DEFAULT_MAX_STREAMS);
+        }
+        other => panic!("expected Connect, got {other:?}"),
+    }
+
+    let custom = parse_connect_args([
+        "--addr",
+        "abc",
+        "--node-id",
+        "def",
+        "--listen",
+        "[::1]:0",
+        "--max-streams",
+        "16",
+    ])
+    .expect("valid ipv6 listen")
+    .expect("some args");
+    assert_eq!(custom.listen, "[::1]:0".parse::<SocketAddr>().unwrap());
+    assert_eq!(custom.max_streams, 16);
+
+    assert_eq!(parse_command(["connect", "--help"]).expect("help"), None);
+    assert!(parse_connect_args(["--addr", "abc"]).is_err(), "missing node-id");
+    assert!(parse_connect_args(["--node-id", "def"]).is_err(), "missing addr");
+    assert!(parse_listen("0.0.0.0:0").is_err(), "non-loopback rejected");
+    assert!(parse_listen("127.0.0.1:0").is_ok(), "ephemeral loopback allowed");
+}
+
+#[tokio::test]
+async fn dialer_forwards_loopback_tcp_through_bridge_and_enforces_pinned_node_id() {
+    let dir = TempDir::new("dialer");
+    let addr_file = dir.path().join("iroh-addr.json");
+
+    // Loopback echo TCP server behind the bridge.
+    let tcp_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind tcp");
+    let tcp_addr = tcp_listener.local_addr().unwrap();
+    let echo_task = tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = tcp_listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                loop {
+                    match sock.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if sock.write_all(&buf[..n]).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    let bridge = Bridge::bind(BridgeConfig {
+        target: tcp_addr,
+        secret_key: SecretKey::generate(),
+        relay_mode: RelayMode::Disabled,
+        max_streams: 8,
+        addr_file: addr_file.clone(),
+    })
+    .await
+    .expect("bind bridge");
+
+    let (bridge_tx, bridge_rx) = oneshot::channel::<()>();
+    let bridge_task = tokio::spawn(async move {
+        bridge
+            .run(async {
+                let _ = bridge_rx.await;
+            })
+            .await
+            .expect("bridge run");
+    });
+
+    let record = wait_for_addr_file(&addr_file).await;
+    let endpoint_addr = decode_endpoint_addr(&record.endpoint_addr).expect("decode addr");
+
+    // 1. Wrong pinned node id is rejected before binding.
+    let wrong_id = SecretKey::generate().public().to_string();
+    let mismatch = Dialer::bind(DialerConfig {
+        endpoint_addr: endpoint_addr.clone(),
+        expected_node_id: wrong_id,
+        listen: "127.0.0.1:0".parse().unwrap(),
+        relay_mode: RelayMode::Disabled,
+        max_streams: 4,
+    })
+    .await;
+    assert!(mismatch.is_err(), "mismatched pinned node id must fail");
+    assert!(mismatch.err().unwrap().to_string().contains("node id mismatch"));
+
+    // 2. Correct pinned node id forwards loopback TCP -> QUIC -> loopback TCP.
+    let dialer = Dialer::bind(DialerConfig {
+        endpoint_addr,
+        expected_node_id: record.node_id.clone(),
+        listen: "127.0.0.1:0".parse().unwrap(),
+        relay_mode: RelayMode::Disabled,
+        max_streams: 4,
+    })
+    .await
+    .expect("bind dialer");
+    let local_listen = dialer.local_addr();
+    assert_ne!(local_listen.port(), 0);
+
+    let (dialer_tx, dialer_rx) = oneshot::channel::<()>();
+    let dialer_task = tokio::spawn(async move {
+        dialer
+            .run(async {
+                let _ = dialer_rx.await;
+            })
+            .await
+            .expect("dialer run");
+    });
+
+    let mut client = tokio::net::TcpStream::connect(local_listen)
+        .await
+        .expect("connect to dialer");
+    let payload = b"delegate-over-iroh-connect";
+    client.write_all(payload).await.expect("write");
+    client.shutdown().await.expect("shutdown write");
+    let mut got = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut got))
+        .await
+        .expect("read timeout")
+        .expect("read");
+    assert_eq!(got, payload);
+
+    let _ = dialer_tx.send(());
+    let _ = tokio::time::timeout(Duration::from_secs(5), dialer_task).await;
+    let _ = bridge_tx.send(());
+    let _ = tokio::time::timeout(Duration::from_secs(5), bridge_task).await;
+    echo_task.abort();
 }

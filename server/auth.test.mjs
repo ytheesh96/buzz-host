@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 
 import {
   ADMIN_ONLY_METHODS,
+  DELEGATE_ALLOWED_METHODS,
   assertAgentAccess,
   assertGuestDesktop,
   assertMethodAllowed,
@@ -20,7 +21,9 @@ import {
   enforceGuestSettings,
   findIdleGuestDesktops,
   hashToken,
+  isTokenExpired,
   isValidDesktopTicket,
+  parseExpiresAt,
   parseListenerConfig,
   sandboxDesktopAllowed,
   tokenRole,
@@ -461,9 +464,9 @@ test("guest tokens can never escalate to admin", async (t) => {
   await fs.writeFile(filePath, JSON.stringify(disk));
   assert.equal(await store.verify(guest.token), null);
 
-  // Records from before admin tokens (no role) are guests.
+  // Records from before admin tokens (no role) are guests; unknown roles are refused.
   assert.equal(tokenRole({}), "guest");
-  assert.equal(tokenRole({ role: "weird" }), "guest");
+  assert.equal(tokenRole({ role: "weird" }), null);
   assert.equal(tokenRole({ role: "admin" }), "admin");
 
   // Guest sessions keep every guest restriction whatever the token's flags.
@@ -657,4 +660,139 @@ test("fs.* RPCs need a signed-in session but are open to guests (jailed in buzz-
     assert.throws(() => assertMethodAllowed({ authenticated: false, role: "guest" }, method), /Authentication required/);
     assert.throws(() => assertMethodAllowed(undefined, method), /Authentication required/);
   }
+});
+
+test("delegate tokens: bhd_ prefix, required owner & expiry, defaults, expiry check, and no escalation", async (t) => {
+  const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "buzz-auth-delegate-"));
+  t.after(() => fs.rm(tmp, { recursive: true, force: true }));
+  const filePath = path.join(tmp, "tokens.json");
+  const store = createTokenStore({ filePath });
+
+  const now = Date.UTC(2026, 10, 26, 12, 0, 0);
+  // Owner is required (never TOFU-bound).
+  await assert.rejects(() => store.createDelegate({ label: "from omarchy", now }), /ownerPubkey is required/);
+  await assert.rejects(
+    () => store.createDelegate({ label: "bad access", ownerPubkey: OWNER_A, access: "root", now }),
+    /access must be/,
+  );
+  await assert.rejects(
+    () => store.createDelegate({ label: "too long", ownerPubkey: OWNER_A, expiresAt: "366d", now }),
+    /cannot exceed 365 days/,
+  );
+  await assert.rejects(
+    () => store.createDelegate({ label: "in past", ownerPubkey: OWNER_A, expiresAt: new Date(now - 1000).toISOString(), now }),
+    /must be in the future/,
+  );
+  await assert.rejects(
+    () => store.createDelegate({ label: "rel ws", ownerPubkey: OWNER_A, workspaces: ["relative/path"], now }),
+    /absolute or ~\/ path/,
+  );
+
+  // Defaults: 90d expiry, sandboxed access, maxConcurrency 2, agents "all".
+  const { token, record } = await store.createDelegate({
+    label: "from omarchy",
+    ownerPubkey: OWNER_A,
+    peerMachineId: "11111111-2222-3333-4444-555555555555",
+    workspaces: ["~/Work", "/srv/repos"],
+    now,
+  });
+  assert.match(token, /^bhd_[0-9a-f]{48}$/);
+  assert.equal(record.role, "delegate");
+  assert.equal(record.ownerPubkey, OWNER_A);
+  assert.equal(record.access, "sandboxed");
+  assert.equal(record.agents, "all");
+  assert.equal(record.maxConcurrency, 2);
+  assert.equal(record.maxTaskMs, 7_200_000);
+  assert.deepEqual(record.workspaces, ["~/Work", "/srv/repos"]);
+  assert.equal(Date.parse(record.expiresAt) - now, 90 * 86_400_000);
+
+  // Plaintext token never written to disk.
+  const rawDisk = await fs.readFile(filePath, "utf8");
+  assert.ok(!rawDisk.includes(token));
+
+  // Verify works before expiry and fails at/after expiry.
+  const ok = await store.verify(token, { now: now + 1_000 });
+  assert.equal(ok.id, record.id);
+  assert.equal(ok.role, "delegate");
+  assert.equal(isTokenExpired(ok, now + 1_000), false);
+  assert.equal(isTokenExpired(ok, Date.parse(record.expiresAt)), true);
+  assert.equal(await store.verify(token, { now: Date.parse(record.expiresAt) }), null);
+
+  // Cannot bindOwner on delegate token.
+  await assert.rejects(() => store.bindOwner(record.id, OWNER_B), /Only guest tokens/);
+
+  // Explicit tokenRole refuses unknown roles; edited role on disk cannot escalate.
+  assert.equal(tokenRole({ role: "admin" }), "admin");
+  assert.equal(tokenRole({ role: "guest" }), "guest");
+  assert.equal(tokenRole({ role: "delegate" }), "delegate");
+  assert.equal(tokenRole({}), "guest"); // legacy pre-role record
+  assert.equal(tokenRole({ role: "superuser" }), null);
+
+  const tampered = JSON.parse(await fs.readFile(filePath, "utf8"));
+  tampered.tokens[0].role = "admin";
+  await fs.writeFile(filePath, JSON.stringify(tampered));
+  assert.equal(await store.verify(token, { now: now + 1_000 }), null, "bhd_ prefix refuses admin role");
+
+  tampered.tokens[0].role = "unknown";
+  await fs.writeFile(filePath, JSON.stringify(tampered));
+  assert.equal(await store.verify(token, { now: now + 1_000 }), null, "unknown role refused");
+});
+
+test("delegate allow-list refuses every non-delegate method, desktop tickets, and agent access", () => {
+  const delegateSession = {
+    authenticated: true,
+    role: "delegate",
+    tokenId: "tok_dddddddddddd",
+    ownerPubkey: OWNER_A,
+  };
+  for (const method of DELEGATE_ALLOWED_METHODS) {
+    assert.doesNotThrow(() => assertMethodAllowed(delegateSession, method));
+  }
+  for (const forbidden of [
+    "hello",
+    "list",
+    "provision",
+    "activate",
+    "remove",
+    "settings.get",
+    "settings.set",
+    "instructions.get",
+    "instructions.set",
+    "desktop.status",
+    "desktop.view",
+    "fs.read",
+    "orchestrator.tasks",
+    "tokens.create",
+    "tokens.createDelegate",
+    "tokens.list",
+    "tokens.revoke",
+    "links.add",
+    "links.list",
+    "some.future.method",
+  ]) {
+    assert.throws(() => assertMethodAllowed(delegateSession, forbidden), /not permitted for delegate/, forbidden);
+  }
+
+  // Admin and guest cannot call delegate.* directly.
+  const admin = { authenticated: true, role: "admin" };
+  const guest = { authenticated: true, role: "guest", tokenId: "tok_111111111111", ownerPubkey: OWNER_A };
+  assert.throws(() => assertMethodAllowed(admin, "delegate.start"), /requires a delegate token/);
+  assert.throws(() => assertMethodAllowed(guest, "delegate.hello"), /requires a delegate token/);
+
+  // New admin-only RPCs are blocked for guests.
+  for (const adminRpc of ["tokens.createDelegate", "links.add", "links.list", "links.update", "links.remove", "links.test"]) {
+    assert.ok(ADMIN_ONLY_METHODS.has(adminRpc), adminRpc);
+    assert.throws(() => assertMethodAllowed(guest, adminRpc), /not permitted for guest/, adminRpc);
+    assert.doesNotThrow(() => assertMethodAllowed(admin, adminRpc));
+  }
+
+  // Delegate can never access agents via canAccessAgent or open desktop tickets.
+  assert.equal(canAccessAgent(delegateSession, { pubkey: "1".repeat(64), owner: OWNER_A, activated: true }), false);
+  const ticket = { pubkey: "1".repeat(64), viewer: "v".repeat(24), expires: Date.now() + 60_000, role: "delegate", tokenId: "tok_dddddddddddd" };
+  assert.equal(isValidDesktopTicket(ticket, "guest"), false);
+  assert.equal(isValidDesktopTicket(ticket, "admin"), false);
+  assert.equal(
+    desktopTicketTokenAllowed(ticket, { id: "tok_dddddddddddd", role: "delegate", revokedAt: null, expiresAt: parseExpiresAt("1d") }),
+    false,
+  );
 });

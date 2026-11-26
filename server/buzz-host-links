@@ -1,0 +1,10 @@
+#!/usr/bin/env node
+// Compatibility shim: `buzz-host-links <cmd>` is `buzz-host links <cmd>`.
+// The commands live in links-cli.mjs (next to this file in a checkout, one
+// directory up once deployed to <lib>/bin). See `buzz-host links --help`.
+
+import { existsSync } from "node:fs";
+
+const modPath = existsSync(new URL("./links-cli.mjs", import.meta.url)) ? "./links-cli.mjs" : "../links-cli.mjs";
+const { runLinks } = await import(modPath);
+process.exitCode = await runLinks(process.argv.slice(2), { prog: "buzz-host-links" });

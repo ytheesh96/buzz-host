@@ -20,6 +20,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { signEvent } from "./attention-relay.mjs";
 import { proxyControl } from "./control.mjs";
+import { buildDelegateAuthEvent } from "./delegate-executor.mjs";
 import { updateJsonLocked } from "./file-lock.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -79,18 +80,19 @@ const tool = (name, description, properties, required = []) => ({
 export const ORCHESTRATOR_TOOLS = [
   tool(
     "orch_capabilities",
-    "Runtimes, models, effort levels, and Omarchy agents (including yourself) available for Solo-chat workers, plus active tasks.",
+    "Runtimes, models, effort levels, local Omarchy agents (including yourself), paired remote hosts (`hosts`), and active tasks available for Solo-chat workers.",
     {
       retry: { type: "boolean" },
     },
   ),
   tool(
     "orch_delegate",
-    "Delegate work to a real Solo-chat worker on another runtime (claude, codex, hermes, antigravity). Runs on yourself by default, or on any other Omarchy agent named by `agent`. The worker sees no parent chat history: `prompt` must be a self-contained brief, and `context` (optional) carries background such as decisions, constraints, or findings so far. The worker chat links back to the owner's message here. Returns workerChannelId and a buzz://message link you can share in chat, then call orch_wait for the answer.",
+    "Delegate work to a real Solo-chat worker on another runtime (claude, codex, hermes, antigravity). Runs on yourself by default, on any other local Omarchy agent named by `agent`, or on a paired remote machine named by `host` (name, machineId, or linkId from orch_capabilities.hosts). The worker sees no parent chat history: `prompt` must be a self-contained brief, and `context` (optional) carries background such as decisions, constraints, or findings so far. The worker chat links back to the owner's message here. Returns workerChannelId and a buzz://message link you can share in chat, then call orch_wait for the answer.",
     {
       runtime: str,
       prompt: str,
       context: str,
+      host: str,
       agent: str,
       model: str,
       effort: str,
@@ -677,6 +679,9 @@ export function createOrchestrator({
   stateDir = path.join(os.homedir(), ".local/share/buzz-host/orchestrator"),
   shimsDir = path.join(HERE, "shims"),
   runDir = path.join(process.env.XDG_RUNTIME_DIR || `/run/user/${process.getuid()}`, "buzz-host"),
+  machineId = "",
+  links = null,
+  signDelegateAuth = null,
   catalog,
   ensureHermes,
   relay: customRelay,
@@ -733,6 +738,11 @@ export function createOrchestrator({
   const drivers = new Map();
   // Active solo-chat tasks keyed by workerChannelId -> driver handle
   const soloByChannel = new Map();
+  // Active remote tasks keyed by remoteRef -> driver handle
+  const remoteByRef = new Map();
+  // Queued remote cancels/releases when a peer link was down: linkId -> Set<ref>
+  const pendingRemoteCancels = new Map();
+  const pendingRemoteReleases = new Map();
   // Tasks currently inside async startSoloWorker setup (before driver registers)
   const startingCancelled = new Set();
   // Waiters for task completion: taskId -> Set<(outcome: { closed?: boolean }) => void>
@@ -789,6 +799,48 @@ export function createOrchestrator({
     return rec;
   }
 
+  function runtimeFailKey(runtime, hostMachineId = "") {
+    return hostMachineId ? `${hostMachineId}:${runtime}` : runtime;
+  }
+
+  function queuePendingRemoteOp(map, linkId, ref) {
+    if (!linkId || !ref) return;
+    let set = map.get(linkId);
+    if (!set) {
+      set = new Set();
+      map.set(linkId, set);
+    }
+    set.add(ref);
+  }
+
+  async function releaseRemoteRef(linkId, ref) {
+    if (!links || !linkId || !ref) return;
+    links.untrackRef(linkId, ref);
+    try {
+      await links.call(linkId, "delegate.release", { ref });
+      pumpAllLoaded();
+    } catch {
+      queuePendingRemoteOp(pendingRemoteReleases, linkId, ref);
+    }
+  }
+
+  async function createSignedStartAuth({ pubkey, targetMachineId, ref, channelId, workerPubkey }) {
+    if (typeof signDelegateAuth === "function") {
+      return signDelegateAuth({ pubkey, targetMachineId, ref, channelId, workerPubkey });
+    }
+    const dir = path.join(dataDir, pubkey);
+    const key = (await fs.readFile(path.join(dir, "key"), "utf8")).trim();
+    const authTag = JSON.parse(await fs.readFile(path.join(dir, "auth.json"), "utf8"));
+    return buildDelegateAuthEvent({
+      secretKey: key,
+      authTag,
+      targetMachineId,
+      ref,
+      channelId,
+      workerPubkey,
+    });
+  }
+
   async function loadAgent(pubkey) {
     if (loaded.has(pubkey)) return loaded.get(pubkey);
     const p = (async () => {
@@ -796,11 +848,14 @@ export function createOrchestrator({
       const tasks = new Map();
       const order = [];
       let dirty = false;
+      const interruptedRemote = [];
       const now = Date.now();
       for (const raw of Array.isArray(saved?.tasks) ? saved.tasks : []) {
         if (!raw || typeof raw.taskId !== "string") continue;
         const rec = {
           ...raw,
+          host: raw.host ?? null,
+          remoteRef: raw.remoteRef ?? "",
           transcript: Array.isArray(raw.transcript) ? raw.transcript : [],
           steerQueued: Number(raw.steerQueued) || 0,
         };
@@ -811,6 +866,9 @@ export function createOrchestrator({
           rec.steerQueued = 0;
           rec.error = rec.error || "host restarted";
           appendTranscript(rec, "status", "Interrupted: buzz-host restarted while task was active.");
+          if (rec.host?.linkId && rec.remoteRef) {
+            interruptedRemote.push({ linkId: rec.host.linkId, ref: rec.remoteRef });
+          }
           dirty = true;
         }
         tasks.set(rec.taskId, rec);
@@ -818,6 +876,9 @@ export function createOrchestrator({
       }
       const state = { tasks, order, queue: [] };
       if (dirty) await persistNow(pubkey, state);
+      for (const item of interruptedRemote) {
+        void releaseRemoteRef(item.linkId, item.ref);
+      }
       return state;
     })().catch((err) => {
       loaded.delete(pubkey);
@@ -987,19 +1048,71 @@ export function createOrchestrator({
     const next = prev.then(async () => {
       if (closed || forgetting.has(pubkey)) return;
       const state = await loadAgent(pubkey);
+      const deferred = [];
+      const busyRemoteLinks = new Set();
       while (state.queue.length > 0 && liveCount(state) < maxLive) {
         if (closed || forgetting.has(pubkey)) return;
         const nextId = state.queue.shift();
         const task = state.tasks.get(nextId);
         if (!task || task.status !== "queued") continue;
+        if (task.host?.linkId && busyRemoteLinks.has(task.host.linkId)) {
+          deferred.push(nextId);
+          continue;
+        }
         // Claim the live slot synchronously before any await so concurrent
         // delegate/pumpQueue calls never overshoot maxLive or race with cancel.
         task.status = "starting";
         task.updatedAt = Date.now();
         const orchMeta = await readJson(agentMetaFile(pubkey), null);
-        const { worker, error } = orchMeta
-          ? await resolveTargetAgent(pubkey, orchMeta, task.workerPubkey || "")
-          : { worker: null, error: "Orchestrator agent metadata missing." };
+        if (closed || forgetting.has(pubkey) || startingCancelled.has(task.taskId) || task.status !== "starting") {
+          startingCancelled.delete(task.taskId);
+          if (!TERMINAL_STATUSES.has(task.status)) {
+            await finishTask(pubkey, state, task, { status: "cancelled", stopReason: "cancelled" });
+          }
+          continue;
+        }
+        if (!orchMeta) {
+          await finishTask(pubkey, state, task, { status: "failed", error: "Orchestrator agent metadata missing." });
+          continue;
+        }
+        if (task.host?.linkId) {
+          const link = links ? await links.resolveHost(task.host.linkId) : null;
+          if (!link) {
+            await finishTask(pubkey, state, task, {
+              status: "failed",
+              error: `Peer link "${task.host.name}" was removed.`,
+            });
+            continue;
+          }
+          if (link.status === "revoked" || link.status === "expired") {
+            await finishTask(pubkey, state, task, {
+              status: "failed",
+              error: `Host ${link.name} delegate token ${link.status}.`,
+            });
+            continue;
+          }
+          try {
+            const outcome = await startRemoteWorker(
+              pubkey,
+              orchMeta,
+              link,
+              { pubkey: task.workerPubkey, name: task.workerName },
+              state,
+              task,
+            );
+            if (outcome?.requeued) {
+              busyRemoteLinks.add(link.id);
+              deferred.push(nextId);
+            }
+          } catch (err) {
+            await finishTask(pubkey, state, task, {
+              status: "failed",
+              error: String(err?.message ?? err),
+            });
+          }
+          continue;
+        }
+        const { worker, error } = await resolveTargetAgent(pubkey, orchMeta, task.workerPubkey || "");
         if (closed || forgetting.has(pubkey) || startingCancelled.has(task.taskId) || task.status !== "starting") {
           startingCancelled.delete(task.taskId);
           if (!TERMINAL_STATUSES.has(task.status)) {
@@ -1019,6 +1132,9 @@ export function createOrchestrator({
             error: String(err?.message ?? err),
           });
         }
+      }
+      if (deferred.length > 0) {
+        state.queue.unshift(...deferred);
       }
     });
     const safe = next.catch((e) => log.error?.(`orchestrator: pumpQueue ${pubkey.slice(0, 8)} failed: ${e.message}`));
@@ -1521,6 +1637,480 @@ export function createOrchestrator({
     }
   }
 
+  async function startRemoteWorker(pubkey, orchMeta, link, worker, state, task) {
+    const owner = String(orchMeta.owner ?? "").toLowerCase();
+    const channelId = task.workerChannelId || randomUUID();
+    const chatTitle = soloChatName(task.label, task.runtime);
+    const ref = task.remoteRef;
+    const failKey = runtimeFailKey(task.runtime, link.machineId);
+    const isAbortedBeforeStart = () =>
+      closed || forgetting.has(pubkey) || startingCancelled.has(task.taskId) || TERMINAL_STATUSES.has(task.status);
+
+    // 1. Create the private ephemeral Buzz Solo chat (only once per task, so retries
+    //    after MAX_CONCURRENCY never create duplicate Solo chats).
+    const alreadyCreatedChat = Boolean(task.workerChannelId);
+    if (!alreadyCreatedChat) {
+      await relay.createSoloChat({
+        pubkey,
+        ownerPubkey: owner,
+        workerPubkey: worker.pubkey,
+        channelId,
+        name: chatTitle,
+        ttlSeconds: soloTtlSecs,
+      });
+
+      if (isAbortedBeforeStart()) {
+        startingCancelled.delete(task.taskId);
+        await finishTask(pubkey, state, task, { status: "cancelled", stopReason: "cancelled" });
+        return { requeued: false };
+      }
+
+      task.mode = "solo";
+      task.workerPubkey = worker.pubkey;
+      task.workerName = worker.name;
+      task.workerChannelId = channelId;
+      task.status = "starting";
+      task.updatedAt = Date.now();
+      appendTranscript(task, "status", `Opened Solo chat "${chatTitle}" with ${worker.name} on ${link.name}.`);
+    }
+
+    const promptQueue = [];
+    const seenMessageIds = new Set();
+    if (task.promptEventId) seenMessageIds.add(task.promptEventId);
+    let turnTimer = null;
+    let cancelTimer = null;
+    let cancelling = false;
+    let timedOut = false;
+    let finished = false;
+    let settlePromise = null;
+    let turnStartedSec = Math.floor(Date.now() / 1000);
+    let turnMessages = [];
+    let allOutputs = [];
+    let unwatch = () => {};
+    let followSeq = 0;
+
+    const clearTimers = () => {
+      if (turnTimer) {
+        clearTimeout(turnTimer);
+        turnTimer = null;
+      }
+      if (cancelTimer) {
+        clearTimeout(cancelTimer);
+        cancelTimer = null;
+      }
+    };
+
+    const resetTurnTimer = () => {
+      if (turnTimer) clearTimeout(turnTimer);
+      const budget = taskTimeouts.get(task.taskId) ?? defaultTimeoutMs;
+      turnTimer = setTimeout(() => {
+        if (finished || closed) return;
+        timedOut = true;
+        cancelling = true;
+        promptQueue.length = 0;
+        task.steerQueued = 0;
+        if (!links.isConnected(link.id)) {
+          queuePendingRemoteOp(pendingRemoteCancels, link.id, ref);
+          const msg = `${link.name} unreachable; ${link.name} stops the worker within 10 min`;
+          appendTranscript(task, "status", `Timed out while ${link.name} was unreachable.`);
+          void settle({ status: "timed_out", stopReason: task.stopReason || "cancelled", error: msg });
+          return;
+        }
+        appendTranscript(task, "status", `Timed out after ${Math.round(budget / 1000)}s; stopping remote worker on ${link.name}.`);
+        void links.call(link.id, "delegate.cancel", { ref }).catch(() => {
+          queuePendingRemoteOp(pendingRemoteCancels, link.id, ref);
+        });
+        cancelTimer = setTimeout(() => {
+          cancelTimer = null;
+          void settle({
+            status: "timed_out",
+            stopReason: task.stopReason || "cancelled",
+            error: `Worker timed out after ${budget}ms`,
+          });
+        }, cancelGraceMs);
+        cancelTimer.unref?.();
+      }, budget);
+      turnTimer.unref?.();
+    };
+
+    const combinedOutput = (extraFallback = "") => {
+      const chunks = [...allOutputs];
+      if (turnMessages.length > 0) {
+        chunks.push(turnMessages.map((m) => m.content).filter(Boolean).join("\n\n"));
+      } else if (extraFallback) {
+        chunks.push(extraFallback);
+      }
+      const joined = chunks.filter(Boolean).join("\n\n");
+      const bytes = Buffer.byteLength(joined, "utf8");
+      const text = bytes > MAX_RESULT_BYTES ? clipBytes(joined, MAX_RESULT_BYTES) : joined;
+      return { text, bytes };
+    };
+
+    const settle = ({ status, stopReason, error, output, outputBytes, skipRelease = false }) => {
+      if (settlePromise) return settlePromise;
+      finished = true;
+      clearTimers();
+      remoteByRef.delete(ref);
+      soloByChannel.delete(channelId);
+      try {
+        unwatch();
+      } catch {}
+      const out = output !== undefined ? { text: output, bytes: outputBytes } : combinedOutput();
+      settlePromise = (async () => {
+        if (!skipRelease) {
+          await releaseRemoteRef(link.id, ref);
+        } else {
+          links.untrackRef(link.id, ref);
+        }
+        await finishTask(pubkey, state, task, {
+          status,
+          stopReason,
+          error,
+          output: out.text,
+          outputBytes: out.bytes,
+        });
+      })();
+      return settlePromise;
+    };
+
+    const isPromptEvent = (ev) =>
+      Array.isArray(ev?.tags) &&
+      ev.tags.some((t) => Array.isArray(t) && t.length >= 2 && t[0] === "t" && t[1] === "buzz.orch.prompt");
+
+    const recordWorkerMessage = (ev) => {
+      if (finished || !ev || !ev.id) return;
+      if (isPromptEvent(ev)) return;
+      if (seenMessageIds.has(ev.id)) return;
+      seenMessageIds.add(ev.id);
+      const content = String(ev.content ?? "");
+      turnMessages.push({ id: ev.id, content, createdAt: ev.created_at || 0 });
+      task.replyEventId = ev.id;
+      task.link = buzzMessageLink(channelId, ev.id);
+      const now = Date.now();
+      task.latestStep = { kind: "message", title: snippet(content), at: now };
+      task.updatedAt = now;
+      appendTranscript(task, "message", content);
+      persistSoon(pubkey, state);
+    };
+
+    const postVisiblePrompt = async (promptText) => {
+      turnStartedSec = Math.floor(Date.now() / 1000);
+      turnMessages = [];
+      const sent = await relay.postMessage({
+        pubkey,
+        channelId,
+        content: promptText,
+        extraTags: [["t", "buzz.orch.prompt"]],
+      });
+      if (sent?.eventId) {
+        seenMessageIds.add(sent.eventId);
+        if (!task.promptEventId) {
+          task.promptEventId = sent.eventId;
+          task.link = buzzMessageLink(channelId, sent.eventId);
+        }
+      }
+      appendTranscript(task, "user", promptText);
+      task.updatedAt = Date.now();
+      void persistNow(pubkey, state);
+      return sent;
+    };
+
+    const driver = {
+      channelId,
+      orchestratorPubkey: pubkey,
+      workerPubkey: worker.pubkey,
+      linkId: link.id,
+      remoteRef: ref,
+      task,
+
+      onTurnStart({ model, effort } = {}) {
+        if (finished) return;
+        const now = Date.now();
+        if (task.status === "starting") {
+          task.status = "running";
+          task.startedAt = now;
+        }
+        if (model && !task.model) task.model = String(model);
+        if (effort && !task.effort) task.effort = String(effort);
+        task.updatedAt = now;
+        persistSoon(pubkey, state);
+      },
+
+      async onTurnDone({ stopReason = "", error = "", model = "", effort = "", finalText = "", fallbackPosted = false } = {}) {
+        if (finished || closed) return;
+        if (turnTimer) {
+          clearTimeout(turnTimer);
+          turnTimer = null;
+        }
+        if (model && !task.model) task.model = String(model);
+        if (effort && !task.effort) task.effort = String(effort);
+        if (stopReason) task.stopReason = String(stopReason);
+
+        if (error) {
+          if (isAuthError(error)) await recordRuntimeFailure(failKey, error);
+          await settle({ status: "failed", stopReason: task.stopReason || "", error });
+          return;
+        }
+        if (timedOut) {
+          await settle({
+            status: "timed_out",
+            stopReason: task.stopReason || "cancelled",
+            error: `Worker timed out after ${taskTimeouts.get(task.taskId) ?? defaultTimeoutMs}ms`,
+          });
+          return;
+        }
+        if (cancelling || stopReason === "cancelled") {
+          await settle({ status: "cancelled", stopReason: "cancelled" });
+          return;
+        }
+
+        if (turnMessages.length === 0) {
+          const fetchReply = async () => {
+            try {
+              const msgs = await relay.getMessages({
+                pubkey,
+                channelId,
+                authorPubkey: worker.pubkey,
+                since: Math.max(0, turnStartedSec - 2),
+              });
+              for (const m of msgs) {
+                if ((m.created_at || 0) >= turnStartedSec - 2) recordWorkerMessage(m);
+              }
+            } catch {}
+          };
+          await fetchReply();
+          if (finished || closed) return;
+          if (turnMessages.length === 0 && fallbackPosted) {
+            await sleep(150);
+            if (finished || closed) return;
+            await fetchReply();
+          }
+        }
+        if (finished || closed) return;
+        if (timedOut || cancelling) {
+          await settle({
+            status: timedOut ? "timed_out" : "cancelled",
+            stopReason: "cancelled",
+            ...(timedOut ? { error: `Worker timed out after ${taskTimeouts.get(task.taskId) ?? defaultTimeoutMs}ms` } : {}),
+          });
+          return;
+        }
+
+        const turnText =
+          turnMessages.length > 0
+            ? turnMessages.map((m) => m.content).filter(Boolean).join("\n\n")
+            : String(finalText || "").trim();
+
+        const refusal = runtimeRefusal(turnText);
+        if (refusal) {
+          await settle({
+            status: "failed",
+            stopReason: task.stopReason || "end_turn",
+            error: refusal,
+            output: turnText,
+            outputBytes: Buffer.byteLength(turnText, "utf8"),
+          });
+          return;
+        }
+
+        if (turnText) allOutputs.push(turnText);
+        turnMessages = [];
+
+        if (promptQueue.length > 0) {
+          const nextPrompt = promptQueue.shift();
+          task.steerQueued = promptQueue.length;
+          try {
+            await postVisiblePrompt(nextPrompt);
+            if (finished || cancelling || timedOut) return;
+            await links.call(link.id, "delegate.followup", { ref, prompt: nextPrompt, seq: ++followSeq });
+            if (!finished && !cancelling && !timedOut) resetTurnTimer();
+          } catch (err) {
+            await settle({ status: "failed", error: `Failed to send remote follow-up: ${err.message ?? err}` });
+          }
+          return;
+        }
+
+        await clearRuntimeFailure(failKey);
+        const finalOut = combinedOutput();
+        await settle({
+          status: "completed",
+          stopReason: task.stopReason || "end_turn",
+          output: finalOut.text,
+          outputBytes: finalOut.bytes,
+        });
+      },
+
+      async onRemoteEnded({ reason = "ended", error = "" } = {}) {
+        if (finished || closed) return;
+        if (reason === "interrupted") {
+          await settle({
+            status: "interrupted",
+            stopReason: "",
+            error: error || `${link.name} restarted`,
+            skipRelease: true,
+          });
+          return;
+        }
+        if (reason === "max_task_timeout") {
+          await settle({
+            status: "timed_out",
+            stopReason: "cancelled",
+            error: error || `${link.name} hit maxTaskMs ceiling`,
+            skipRelease: true,
+          });
+          return;
+        }
+        await settle({
+          status: "failed",
+          stopReason: "",
+          error: error || `Remote host ${link.name} ended task (${reason})`,
+          skipRelease: true,
+        });
+      },
+
+      onLinkDisconnect() {
+        if (finished) return;
+        appendTranscript(task, "status", `link to ${link.name} lost; reconnecting`);
+        task.updatedAt = Date.now();
+        persistSoon(pubkey, state);
+      },
+
+      steer(nextPrompt) {
+        if (finished || cancelling) throw new Error("Cannot steer a task that is ending or finished.");
+        if (promptQueue.length >= maxSteers) {
+          throw new Error(`Steer queue is full (max ${maxSteers} follow-ups per task).`);
+        }
+        promptQueue.push(nextPrompt);
+        task.steerQueued = promptQueue.length;
+        task.updatedAt = Date.now();
+        void persistNow(pubkey, state);
+      },
+
+      async cancel() {
+        if (settlePromise) return settlePromise;
+        if (finished) return;
+        cancelling = true;
+        promptQueue.length = 0;
+        task.steerQueued = 0;
+        appendTranscript(task, "status", "Cancellation requested.");
+        if (links.isConnected(link.id)) {
+          void links.call(link.id, "delegate.cancel", { ref }).catch(() => {
+            queuePendingRemoteOp(pendingRemoteCancels, link.id, ref);
+          });
+        } else {
+          queuePendingRemoteOp(pendingRemoteCancels, link.id, ref);
+        }
+        await new Promise((resolve) => {
+          if (settlePromise) return void settlePromise.then(resolve);
+          if (finished) return resolve();
+          const done = () => {
+            clearTimeout(grace);
+            resolve();
+          };
+          let set = waiters.get(task.taskId);
+          if (!set) waiters.set(task.taskId, (set = new Set()));
+          set.add(done);
+          const grace = setTimeout(() => {
+            set.delete(done);
+            if (set.size === 0) waiters.delete(task.taskId);
+            void settle({ status: "cancelled", stopReason: "cancelled" }).then(resolve);
+          }, cancelGraceMs);
+          grace.unref?.();
+        });
+      },
+
+      async forceClose() {
+        finished = true;
+        cancelling = true;
+        clearTimers();
+        remoteByRef.delete(ref);
+        soloByChannel.delete(channelId);
+        links.untrackRef(link.id, ref);
+        try {
+          unwatch();
+        } catch {}
+      },
+    };
+
+    drivers.set(task.taskId, driver);
+    remoteByRef.set(ref, driver);
+    soloByChannel.set(channelId, driver);
+
+    try {
+      const brief = composeWorkerBrief({
+        prompt: task.prompt,
+        context: task.context,
+        parentLink: buzzMessageLink(task.channelId, task.originEventId),
+      });
+      if (!alreadyCreatedChat) {
+        await postVisiblePrompt(brief);
+        if (isAbortedBeforeStart()) {
+          startingCancelled.delete(task.taskId);
+          await settle({ status: "cancelled", stopReason: "cancelled", skipRelease: true });
+          return { requeued: false };
+        }
+      }
+
+      unwatch = await relay.watchChannel({
+        pubkey,
+        channelId,
+        authorPubkey: worker.pubkey,
+        onMessage: recordWorkerMessage,
+      });
+
+      if (isAbortedBeforeStart()) {
+        startingCancelled.delete(task.taskId);
+        await settle({ status: "cancelled", stopReason: "cancelled", skipRelease: true });
+        return { requeued: false };
+      }
+
+      const auth = await createSignedStartAuth({
+        pubkey,
+        targetMachineId: link.machineId,
+        ref,
+        channelId,
+        workerPubkey: worker.pubkey,
+      });
+
+      links.trackRef(link.id, ref, 0);
+      const started = await links.call(link.id, "delegate.start", {
+        ref,
+        auth,
+        workerPubkey: worker.pubkey,
+        channelId,
+        runtime: task.runtime,
+        ...(task.model ? { model: task.model } : {}),
+        ...(task.effort ? { effort: task.effort } : {}),
+        ...(task.workspace ? { workspace: task.workspace } : {}),
+        label: task.label,
+        prompt: brief,
+      });
+      if (started?.workspace) {
+        task.workspace = started.workspace;
+        persistSoon(pubkey, state);
+      }
+      if (!finished && !cancelling && !timedOut) resetTurnTimer();
+      return { requeued: false };
+    } catch (error) {
+      soloByChannel.delete(channelId);
+      remoteByRef.delete(ref);
+      drivers.delete(task.taskId);
+      links.untrackRef(link.id, ref);
+      clearTimers();
+      try {
+        unwatch();
+      } catch {}
+      if (/MAX_CONCURRENCY/i.test(String(error?.message ?? error))) {
+        task.status = "queued";
+        task.updatedAt = Date.now();
+        appendTranscript(task, "status", `Queued waiting for a free slot on ${link.name}.`);
+        await persistNow(pubkey, state);
+        return { requeued: true };
+      }
+      throw error;
+    }
+  }
+
   async function finishTask(pubkey, state, task, { status, stopReason, error, output, outputBytes }) {
     if (TERMINAL_STATUSES.has(task.status)) return;
     drivers.delete(task.taskId);
@@ -1638,6 +2228,84 @@ export function createOrchestrator({
       .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
     const active = activeTasks.filter((t) => LIVE_STATUSES.has(t.status)).length;
     const queued = activeTasks.filter((t) => t.status === "queued").length;
+
+    let hosts = [];
+    if (links) {
+      const { links: savedLinks } = await links.list();
+      hosts = await Promise.all(
+        savedLinks.map(async (link) => {
+          const applyHostFailures = async (rawRuntimes) => {
+            if (!Array.isArray(rawRuntimes)) return [];
+            return Promise.all(
+              rawRuntimes.map(async (rt) => {
+                const fail = await activeAuthFailure(runtimeFailKey(rt.id, link.machineId));
+                if (fail) {
+                  return { ...rt, available: false, reason: fail.reason };
+                }
+                return rt;
+              }),
+            );
+          };
+          if (link.status === "revoked" || link.status === "expired" || link.status === "identity_mismatch") {
+            const cached = link.lastCapabilities;
+            return {
+              host: link.name,
+              machineId: link.machineId,
+              linkId: link.id,
+              online: false,
+              lastSeenAt: link.lastSeenAt,
+              limits: cached?.limits ?? null,
+              agents: cached?.agents ?? [],
+              runtimes: await applyHostFailures(cached?.runtimes),
+              error: link.status,
+            };
+          }
+          try {
+            let timer;
+            const res = await Promise.race([
+              links.hello(link.id, { timeoutMs: catalogBudgetMs }),
+              new Promise((_, reject) => {
+                timer = setTimeout(() => reject(Object.assign(new Error("timeout"), { code: "TIMEOUT" })), catalogBudgetMs);
+                timer.unref?.();
+              }),
+            ]).finally(() => {
+              if (timer) clearTimeout(timer);
+            });
+            return {
+              host: link.name,
+              machineId: link.machineId,
+              linkId: link.id,
+              online: true,
+              lastSeenAt: new Date().toISOString(),
+              limits: res.limits ?? null,
+              agents: Array.isArray(res.agents) ? res.agents : [],
+              runtimes: await applyHostFailures(res.runtimes),
+            };
+          } catch (err) {
+            const freshLink = (await links.resolveHost(link.id)) ?? link;
+            const cached = freshLink.lastCapabilities;
+            const errCode =
+              err?.code === "TOKEN_REVOKED" || freshLink.status === "revoked"
+                ? "revoked"
+                : err?.code === "TOKEN_EXPIRED" || freshLink.status === "expired"
+                  ? "expired"
+                  : "unreachable";
+            return {
+              host: freshLink.name,
+              machineId: freshLink.machineId,
+              linkId: freshLink.id,
+              online: false,
+              lastSeenAt: freshLink.lastSeenAt,
+              limits: cached?.limits ?? null,
+              agents: cached?.agents ?? [],
+              runtimes: await applyHostFailures(cached?.runtimes),
+              error: errCode,
+            };
+          }
+        }),
+      );
+    }
+
     return {
       mode: "solo",
       defaultAgent: defaultAgent
@@ -1656,6 +2324,7 @@ export function createOrchestrator({
         self: a.self,
       })),
       runtimes,
+      hosts,
       limit: maxLive,
       maxDepth: MAX_DEPTH,
       active,
@@ -1664,11 +2333,36 @@ export function createOrchestrator({
     };
   }
 
+  function resolveRemoteAgent(linkName, agents, specRaw) {
+    const list = Array.isArray(agents) ? agents : [];
+    const spec = typeof specRaw === "string" ? specRaw.trim() : "";
+    if (!spec) {
+      if (list.length === 1) return list[0];
+      if (list.length === 0) throw new Error(`Host ${linkName} has no eligible agents for this delegate token.`);
+      throw new Error(
+        `Host ${linkName} has multiple eligible agents (${list.map((a) => a.name).join(", ")}); specify \`agent\`.`,
+      );
+    }
+    const lower = spec.toLowerCase();
+    if (HEX64.test(lower)) {
+      const hit = list.find((a) => a.pubkey.toLowerCase() === lower);
+      if (!hit) throw new Error(`Agent ${lower.slice(0, 8)} is not eligible on host ${linkName}.`);
+      return hit;
+    }
+    const cleanName = lower.replace(/^@/, "");
+    const matches = list.filter((a) => String(a.name || "").toLowerCase() === cleanName);
+    if (matches.length === 1) return matches[0];
+    if (matches.length > 1) {
+      throw new Error(`Multiple eligible agents on ${linkName} are named "${spec}". Pass the agent's 64-hex pubkey.`);
+    }
+    throw new Error(
+      `Unknown agent "${spec}" on host ${linkName}. Eligible agents: ${list.map((a) => a.name).join(", ") || "none"}.`,
+    );
+  }
+
   async function delegate(rawPubkey, args = {}) {
     const pubkey = checkPubkey(rawPubkey);
     const { meta: orchMeta, originEventId } = await requireOwnerChat(pubkey, args.chat);
-    const { worker, error: workerError } = await resolveTargetAgent(pubkey, orchMeta, args.agent);
-    if (!worker) throw new Error(workerError);
 
     const runtime = String(args.runtime ?? "").trim();
     if (!Object.hasOwn(RUNTIMES, runtime)) {
@@ -1680,6 +2374,133 @@ export function createOrchestrator({
     if (Buffer.byteLength(prompt, "utf8") + Buffer.byteLength(context, "utf8") > MAX_PROMPT_BYTES) {
       throw new Error("prompt + context exceed 60 KiB limit");
     }
+
+    const hostSpec = typeof args.host === "string" ? args.host.trim() : "";
+    const isRemote = Boolean(hostSpec) && hostSpec.toLowerCase() !== "local";
+
+    if (isRemote) {
+      if (!links) throw new Error("Cross-machine delegation is not configured on this host.");
+      const link = await links.resolveHost(hostSpec);
+      if (!link) {
+        const { links: allLinks } = await links.list();
+        const names = allLinks.map((l) => l.name).join(", ") || "none";
+        throw new Error(`Unknown host "${hostSpec}". Paired hosts: ${names}.`);
+      }
+      if (link.status === "revoked" || link.status === "expired") {
+        throw new Error(`Host ${link.name} delegate token is ${link.status}; pair again.`);
+      }
+      if (link.status === "identity_mismatch") {
+        throw new Error(`${link.name}'s identity changed; pair again.`);
+      }
+
+      const fail = await activeAuthFailure(runtimeFailKey(runtime, link.machineId));
+      if (fail) {
+        throw new Error(
+          `Runtime ${runtime} on ${link.name} is unavailable (${fail.reason}). Run orch_capabilities with retry:true to retry.`,
+        );
+      }
+
+      // Fail fast when B is unreachable (do not queue remotely).
+      const hello = await links.hello(link.id);
+      const worker = resolveRemoteAgent(link.name, hello.agents, args.agent);
+      const rtEntry = Array.isArray(hello.runtimes) ? hello.runtimes.find((r) => r.id === runtime) : null;
+      if (!rtEntry) {
+        throw new Error(`Runtime "${runtime}" is not permitted on host ${link.name}.`);
+      }
+      if (rtEntry.available === false) {
+        throw new Error(`Runtime "${runtime}" is unavailable on host ${link.name}: ${rtEntry.reason || "unavailable"}`);
+      }
+
+      const state = await loadAgent(pubkey);
+      const live = liveCount(state);
+      if (live >= maxLive && state.queue.length >= maxQueue) {
+        throw new Error(`Worker queue is full (${maxLive} active, ${maxQueue} queued).`);
+      }
+
+      const now = Date.now();
+      const taskId = `task-${now.toString(36)}-${randomBytes(3).toString("hex")}`;
+      const remoteRef = `${machineId || "local"}:${taskId}`;
+      const chatInfo = parseChat(args.chat);
+      const reqTimeout = Number(args.timeoutMs);
+      const timeoutMs = Number.isFinite(reqTimeout)
+        ? Math.min(Math.max(Math.round(reqTimeout), minTimeoutMs), maxTimeoutMs)
+        : defaultTimeoutMs;
+      const labelRaw = typeof args.label === "string" ? args.label.trim().slice(0, 120) : "";
+      const remoteWs = typeof args.workspace === "string" ? args.workspace.trim() : "";
+
+      const task = {
+        taskId,
+        mode: "solo",
+        host: { machineId: link.machineId, name: link.name, linkId: link.id },
+        remoteRef,
+        agentPubkey: pubkey,
+        workerPubkey: worker.pubkey,
+        workerName: worker.name,
+        workerChannelId: "",
+        promptEventId: "",
+        replyEventId: "",
+        link: "",
+        chat: chatInfo.chat,
+        channelId: chatInfo.channelId,
+        threadRootId: chatInfo.threadRootId,
+        originEventId,
+        runtime,
+        model: typeof args.model === "string" ? args.model.trim() : "",
+        effort: typeof args.effort === "string" ? args.effort.trim() : "",
+        label: labelRaw || defaultLabel(prompt),
+        prompt,
+        context,
+        workspace: remoteWs,
+        status: "queued",
+        createdAt: now,
+        startedAt: 0,
+        updatedAt: now,
+        endedAt: 0,
+        latestStep: null,
+        stopReason: "",
+        steerQueued: 0,
+        error: "",
+        result: null,
+        transcript: [],
+      };
+
+      taskTimeouts.set(taskId, timeoutMs);
+      state.tasks.set(taskId, task);
+      state.order.push(taskId);
+      const remoteAtCap =
+        hello.limits && Number.isInteger(hello.limits.maxConcurrency) && hello.limits.live >= hello.limits.maxConcurrency;
+      if (live < maxLive && !remoteAtCap) {
+        task.status = "starting";
+        try {
+          const outcome = await startRemoteWorker(pubkey, orchMeta, link, worker, state, task);
+          if (outcome?.requeued) {
+            state.queue.push(taskId);
+          }
+        } catch (err) {
+          startingCancelled.delete(taskId);
+          await finishTask(pubkey, state, task, {
+            status: "failed",
+            error: String(err?.message ?? err),
+          });
+          throw err;
+        }
+      } else {
+        state.queue.push(taskId);
+        appendTranscript(
+          task,
+          "status",
+          remoteAtCap
+            ? `Queued waiting for a free slot on ${link.name}.`
+            : "Queued waiting for an available worker slot.",
+        );
+        await persistNow(pubkey, state);
+      }
+      return toFullView(task, { includeTranscript: false });
+    }
+
+    const { worker, error: workerError } = await resolveTargetAgent(pubkey, orchMeta, args.agent);
+    if (!worker) throw new Error(workerError);
+
     const fail = await activeAuthFailure(runtime);
     if (fail) {
       throw new Error(
@@ -1716,6 +2537,8 @@ export function createOrchestrator({
     const task = {
       taskId,
       mode: "solo",
+      host: null,
+      remoteRef: "",
       agentPubkey: pubkey,
       workerPubkey: worker.pubkey,
       workerName: worker.name,
@@ -1978,6 +2801,82 @@ export function createOrchestrator({
     await Promise.all([...saveChains.values()].map((p) => p.catch(() => {})));
   }
 
+  // ---------- peer link event handlers ----------
+
+  function pumpAllLoaded() {
+    for (const pk of loaded.keys()) {
+      void pumpQueue(pk);
+    }
+  }
+
+  function handleDelegateEvent(linkId, evt) {
+    if (!evt || typeof evt.ref !== "string") return;
+    const driver = remoteByRef.get(evt.ref);
+    if (!driver || driver.linkId !== linkId) {
+      if (evt.type === "turn_done" || evt.type === "ended") pumpAllLoaded();
+      return;
+    }
+    if (evt.type === "turn_start") {
+      driver.onTurnStart(evt);
+    } else if (evt.type === "turn_done") {
+      void driver.onTurnDone(evt).finally(() => pumpAllLoaded());
+    } else if (evt.type === "ended") {
+      void driver.onRemoteEnded(evt).finally(() => pumpAllLoaded());
+    }
+  }
+
+  function handleLinkDisconnect(linkId) {
+    for (const driver of remoteByRef.values()) {
+      if (driver.linkId === linkId) driver.onLinkDisconnect?.();
+    }
+  }
+
+  async function handleLinkReconnect(linkId) {
+    if (!links) return;
+    const cancels = pendingRemoteCancels.get(linkId);
+    if (cancels) {
+      pendingRemoteCancels.delete(linkId);
+      for (const ref of cancels) {
+        await links.call(linkId, "delegate.cancel", { ref }).catch(() => {
+          queuePendingRemoteOp(pendingRemoteCancels, linkId, ref);
+        });
+      }
+    }
+    const releases = pendingRemoteReleases.get(linkId);
+    if (releases) {
+      pendingRemoteReleases.delete(linkId);
+      for (const ref of releases) {
+        await links.call(linkId, "delegate.release", { ref }).catch(() => {
+          queuePendingRemoteOp(pendingRemoteReleases, linkId, ref);
+        });
+      }
+    }
+    pumpAllLoaded();
+  }
+
+  async function handleLinkRevoked(link, reason = "revoked") {
+    const linkId = link?.id;
+    if (!linkId) return;
+    const msg = `Host ${link.name || linkId} delegate token ${reason}.`;
+    for (const [pk, statePromise] of loaded) {
+      const state = await statePromise.catch(() => null);
+      if (!state) continue;
+      for (const tid of [...state.queue]) {
+        const t = state.tasks.get(tid);
+        if (t && t.status === "queued" && t.host?.linkId === linkId) {
+          const idx = state.queue.indexOf(tid);
+          if (idx >= 0) state.queue.splice(idx, 1);
+          await finishTask(pk, state, t, { status: "failed", error: msg });
+        }
+      }
+    }
+    for (const driver of [...remoteByRef.values()]) {
+      if (driver.linkId === linkId) {
+        await driver.onRemoteEnded?.({ reason, error: msg });
+      }
+    }
+  }
+
   return {
     handles: (name) => /^orch_/.test(String(name ?? "")) || name === "_acp_turn_start" || name === "_acp_turn_done",
     async call(rawPubkey, name, args = {}) {
@@ -1997,6 +2896,10 @@ export function createOrchestrator({
       if (!Object.hasOwn(table, name)) throw new Error(`No tool ${name}`);
       return JSON.stringify(await table[name]());
     },
+    handleDelegateEvent,
+    handleLinkDisconnect,
+    handleLinkReconnect,
+    handleLinkRevoked,
     capabilities,
     tasks,
     cancel,

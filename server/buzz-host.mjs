@@ -29,7 +29,9 @@ import { createMcpServer } from "./mcp-server.mjs";
 import { createMemory } from "./memory.mjs";
 import { createOrchestrator } from "./orchestrator.mjs";
 import { createRelayWatcher } from "./attention-relay.mjs";
-import { createDiscoveryPublisher, loadMachineId } from "./discovery.mjs";
+import { createDelegateExecutor } from "./delegate-executor.mjs";
+import { createDiscoveryPublisher, loadMachineId, readRoutes } from "./discovery.mjs";
+import { createLinkManager } from "./links.mjs";
 import { catalogs, forComposer, formatTarget, parseTarget, resolveChatSettings, toModelList, toModels } from "./catalog.mjs";
 import {
   createDirectory as createHostDirectory,
@@ -65,6 +67,7 @@ import {
   desktopTicketTokenAllowed,
   enforceGuestSettings,
   findIdleGuestDesktops,
+  isTokenExpired,
   isValidDesktopTicket,
   parseListenerConfig,
   sandboxDesktopAllowed,
@@ -644,6 +647,12 @@ const UNSERIALIZED = new Set([
   "desktop.snapshot",
   "orchestrator.tasks",
   "orchestrator.cancel",
+  "links.list",
+  "links.test",
+  "delegate.hello",
+  "delegate.cancel",
+  "delegate.release",
+  "delegate.sync",
 ]);
 
 // ---------- agent desktops (desktop/) ----------
@@ -780,6 +789,29 @@ const methods = {
       session.onAuthenticated?.();
       console.log(`admin token authenticated: ${record.label} (${record.id})`);
       return { role: "admin", tokenId: record.id, label: record.label, ownerPubkey: record.ownerPubkey };
+    }
+    if (record.role === "delegate") {
+      session.authenticated = true;
+      session.role = "delegate";
+      session.tokenId = record.id;
+      session.label = record.label;
+      session.ownerPubkey = record.ownerPubkey;
+      session.limits = {
+        access: record.access,
+        maxConcurrency: record.maxConcurrency,
+        maxTaskMs: record.maxTaskMs,
+        expiresAt: record.expiresAt,
+      };
+      session.registerTokenSocket?.(record.id, "delegate");
+      session.onAuthenticated?.();
+      console.log(`delegate token authenticated: ${record.label} (${record.id})`);
+      return {
+        role: "delegate",
+        tokenId: record.id,
+        label: record.label,
+        ownerPubkey: record.ownerPubkey,
+        limits: session.limits,
+      };
     }
     session.authenticated = true;
     session.role = "guest";
@@ -1376,18 +1408,45 @@ const methods = {
       inviteUrl: buildInviteUrl(config.publicGuestUrl, token),
     };
   },
+  async "tokens.createDelegate"(
+    config,
+    { label, ownerPubkey, peerMachineId, agents, runtimes, allowedRuntimes, access, workspaces, maxConcurrency, maxTaskMs, expiresAt },
+  ) {
+    const { token, record } = await tokenStore.createDelegate({
+      label,
+      ownerPubkey,
+      peerMachineId,
+      agents,
+      allowedRuntimes: allowedRuntimes ?? runtimes,
+      access,
+      workspaces,
+      maxConcurrency,
+      maxTaskMs,
+      expiresAt,
+    });
+    const routes = await readRoutes(RUN_DIR, {
+      publicGuestUrl: config.publicGuestUrl,
+      publicUrl: config.publicUrl,
+    });
+    return { token, record, routes, machineId: MACHINE_ID };
+  },
   async "tokens.list"() {
     const [tokens, metas] = await Promise.all([tokenStore.list(), listAllMetas()]);
     return {
       tokens: tokens.map((t) =>
         t.role === "admin"
           ? t
-          : {
-              ...t,
-              agentCount: metas.filter(
-                (m) => (t.ownerPubkey && m.owner === t.ownerPubkey) || (!m.activated && m.createdByTokenId === t.id),
-              ).length,
-            },
+          : t.role === "delegate"
+            ? {
+                ...t,
+                liveTasks: delegateExecutor.liveCount(t.id),
+              }
+            : {
+                ...t,
+                agentCount: metas.filter(
+                  (m) => (t.ownerPubkey && m.owner === t.ownerPubkey) || (!m.activated && m.createdByTokenId === t.id),
+                ).length,
+              },
       ),
     };
   },
@@ -1395,6 +1454,43 @@ const methods = {
     const record = await tokenStore.revoke(id);
     await dropTokenAccess(record);
     return { record };
+  },
+
+  // Admin-only peer host link management (cross-machine delegation, host A).
+  async "links.add"(_config, params) {
+    return linkManager.add(params ?? {});
+  },
+  async "links.list"() {
+    return linkManager.list();
+  },
+  async "links.update"(_config, params) {
+    return linkManager.update(params ?? {});
+  },
+  async "links.remove"(_config, params) {
+    return linkManager.remove(params ?? {});
+  },
+  async "links.test"(_config, { linkId, id, selector } = {}) {
+    return linkManager.test(linkId ?? id ?? selector);
+  },
+
+  // Narrow executor API for peer-host delegate tokens (host B).
+  async "delegate.hello"(config, params, session) {
+    return delegateExecutor.methods["delegate.hello"](config, params, session);
+  },
+  async "delegate.start"(config, params, session) {
+    return delegateExecutor.methods["delegate.start"](config, params, session);
+  },
+  async "delegate.followup"(config, params, session) {
+    return delegateExecutor.methods["delegate.followup"](config, params, session);
+  },
+  async "delegate.cancel"(config, params, session) {
+    return delegateExecutor.methods["delegate.cancel"](config, params, session);
+  },
+  async "delegate.release"(config, params, session) {
+    return delegateExecutor.methods["delegate.release"](config, params, session);
+  },
+  async "delegate.sync"(config, params, session) {
+    return delegateExecutor.methods["delegate.sync"](config, params, session);
   },
 
   // Remote files for Buzz Desktop (fs.mjs): admins work in this host's home,
@@ -1529,9 +1625,12 @@ const guestSockets = new Map();
 /** Tokens revoked while this server runs: their sessions refuse every further call. */
 const revokedTokenIds = new Set();
 
-/** Close a revoked token's sockets, drop its desktop tickets, and stop a guest's desktops. */
-async function dropTokenAccess(record) {
+/** Close a revoked/expired token's sockets, stop delegate tasks, drop desktop tickets, and stop guest desktops. */
+async function dropTokenAccess(record, reason = "revoked") {
   revokedTokenIds.add(record.id);
+  if (record.role === "delegate") {
+    await delegateExecutor.dropToken(record.id, reason).catch(() => {});
+  }
   const sockets = guestSockets.get(record.id);
   if (sockets) {
     for (const sock of sockets) {
@@ -1547,9 +1646,8 @@ async function dropTokenAccess(record) {
   for (const [t, v] of viewTickets) {
     if (v.tokenId === record.id) viewTickets.delete(t);
   }
-  // A revoked guest's desktops stop. An admin token's owner keeps theirs:
-  // their agents belong to them, not to the token they used to connect.
-  if (record.role !== "admin" && DESKTOP_SUPPORTED) {
+  // A revoked guest's desktops stop. Admin and delegate tokens never own desktops.
+  if (record.role === "guest" && DESKTOP_SUPPORTED) {
     const metas = await listAllMetas();
     for (const m of metas) {
       if (m.createdByTokenId === record.id || (record.ownerPubkey && m.owner === record.ownerPubkey)) {
@@ -1560,30 +1658,80 @@ async function dropTokenAccess(record) {
   }
 }
 
-// `buzz-host-tokens revoke` only edits tokens.json: catch those revocations
-// (and deleted records) for sockets that are still connected.
+// `buzz-host-tokens revoke` only edits tokens.json: catch those revocations,
+// expired delegate tokens, and deleted records for connected sockets and live tasks.
 const REVOKE_SWEEP_MS = 15_000;
 const revokeSweepTimer = setInterval(() => {
   void (async () => {
+    const checked = new Set();
     for (const tokenId of [...guestSockets.keys()]) {
+      checked.add(tokenId);
       const record = await tokenStore.getById(tokenId);
-      if (record && !record.revokedAt) continue;
-      console.log(`token ${tokenId} revoked or removed: closing its connections`);
-      // A record deleted by hand: stop what that token created, nothing more.
-      await dropTokenAccess(record ?? { id: tokenId, role: "guest", ownerPubkey: null });
+      if (record && !record.revokedAt && !isTokenExpired(record)) continue;
+      const reason = record?.revokedAt ? "revoked" : record && isTokenExpired(record) ? "expired" : "revoked";
+      console.log(`token ${tokenId} ${reason} or removed: closing its connections`);
+      await dropTokenAccess(record ?? { id: tokenId, role: "guest", ownerPubkey: null }, reason);
+    }
+    const allTokens = await tokenStore.list().catch(() => []);
+    for (const record of allTokens) {
+      if (record.role !== "delegate" || checked.has(record.id)) continue;
+      if (delegateExecutor.liveCount(record.id) === 0) continue;
+      if (!record.revokedAt && !isTokenExpired(record)) continue;
+      const reason = record.revokedAt ? "revoked" : "expired";
+      console.log(`delegate token ${record.id} ${reason}: cancelling live tasks`);
+      await dropTokenAccess(record, reason);
     }
   })().catch((error) => console.error(`token revoke sweep failed: ${error.message}`));
 }, REVOKE_SWEEP_MS);
 revokeSweepTimer.unref();
 const memory = createMemory({ dataDir: DATA });
-const orchestrator = createOrchestrator({
+const delegateExecutor = createDelegateExecutor({
+  dataDir: DATA,
+  stateDir: path.join(HOME, ".local/share/buzz-host/delegate"),
+  workDir: WORK,
+  runDir: RUN_DIR,
+  configDir: path.dirname(CONFIG),
+  homeDir: HOME,
+  shimsDir: SHIMS,
+  machineId: MACHINE_ID,
+  config: () => config,
+  tokenStore,
+  catalog: (runtime) => runtimeCatalog(runtime),
+  ensureHermes: (profile) => ensureSessionEnv(profile || ""),
+});
+await delegateExecutor.start();
+let orchestrator;
+const linkManager = createLinkManager({
+  filePath: path.join(path.dirname(CONFIG), "links.json"),
+  config: () => config,
+  libDir: LIB,
+  onDelegateEvent: (linkId, evt) => orchestrator?.handleDelegateEvent(linkId, evt),
+  onLinkDisconnect: (linkId) => orchestrator?.handleLinkDisconnect(linkId),
+  onLinkReconnect: (linkId) => void orchestrator?.handleLinkReconnect(linkId),
+  onLinkRevoked: (link, reason) => void orchestrator?.handleLinkRevoked(link, reason),
+});
+orchestrator = createOrchestrator({
   dataDir: DATA,
   stateDir: path.join(HOME, ".local/share/buzz-host/orchestrator"),
   shimsDir: SHIMS,
   runDir: RUN_DIR,
+  machineId: MACHINE_ID,
+  links: linkManager,
   catalog: (runtime) => runtimeCatalog(runtime),
   ensureHermes: (profile) => ensureSessionEnv(profile || ""),
 });
+// Route _acp_turn_start / _acp_turn_done to delegateExecutor first for channels
+// owned by a cross-machine delegate task, falling through to local orchestrator.
+const turnAndOrchExtra = {
+  handles: (name) => orchestrator.handles(name),
+  async call(pubkey, name, args) {
+    if (name === "_acp_turn_start" || name === "_acp_turn_done") {
+      const delegated = delegateExecutor.onProxyTurnEvent(pubkey, name, args);
+      if (delegated !== null) return delegated;
+    }
+    return orchestrator.call(pubkey, name, args);
+  },
+};
 const hermesHostExtra = {
   handles: (name) => name === "_ensure_hermes_profile",
   async call(_pubkey, _name, args) {
@@ -1598,7 +1746,7 @@ const hermesHostExtra = {
 const attention = createAttention({
   dataDir: DATA,
   runDir: RUN_DIR,
-  extra: [memory, orchestrator, hermesHostExtra],
+  extra: [memory, turnAndOrchExtra, hermesHostExtra],
 });
 const runnerManager = createRunnerManager({
   dataDir: DATA,
@@ -1918,6 +2066,8 @@ if (Number.isInteger(config.guestPort) && config.guestPort > 0) {
       // Public Funnel socket: it must authenticate within the idle window.
       idle.arm();
       let registeredTokenId = null;
+      let registeredDelegateSend = null;
+      const sendFrame = (text) => socket.write(frame(1, Buffer.from(text)));
       const session = {
         authenticated: false,
         role: "guest",
@@ -1932,7 +2082,7 @@ if (Number.isInteger(config.guestPort) && config.guestPort > 0) {
           slot.authenticate();
           idle.cancel();
         },
-        registerTokenSocket(tokenId) {
+        registerTokenSocket(tokenId, role = "guest") {
           // A socket that died while the token was being verified must not be
           // tracked: its close event has already fired.
           if (socket.destroyed) return;
@@ -1943,6 +2093,10 @@ if (Number.isInteger(config.guestPort) && config.guestPort > 0) {
             guestSockets.set(tokenId, set);
           }
           set.add(socket);
+          if (role === "delegate") {
+            registeredDelegateSend = sendFrame;
+            delegateExecutor.registerSocket(tokenId, sendFrame);
+          }
         },
       };
       socket.on("close", () => {
@@ -1950,6 +2104,10 @@ if (Number.isInteger(config.guestPort) && config.guestPort > 0) {
           const set = guestSockets.get(registeredTokenId);
           set?.delete(socket);
           if (set && set.size === 0) guestSockets.delete(registeredTokenId);
+          if (registeredDelegateSend) {
+            delegateExecutor.unregisterSocket(registeredTokenId, registeredDelegateSend);
+            registeredDelegateSend = null;
+          }
         }
       });
       console.log(`guest socket connected: remote=${remoteAddress} origin=${origin ?? "-"}`);
@@ -1996,6 +2154,8 @@ async function shutdown(signal) {
   guestServer?.close();
   await mcpServer.stop().catch(() => {});
   await runnerManager.close().catch(() => {});
+  await linkManager.close().catch(() => {});
+  await delegateExecutor.close().catch(() => {});
   await orchestrator.close().catch(() => {});
   process.exit(0);
 }

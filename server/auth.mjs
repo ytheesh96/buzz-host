@@ -1,14 +1,18 @@
 // Multi-tenant authentication, guest token storage, and per-owner access control for buzz-host.
 //
-// Two caller roles:
+// Three caller roles:
 //   - "admin": authenticated either via Tailscale-User-Login on the tailnet-only listener,
 //              or via an admin access token (`bha_<48hex>`) sent in the `auth` RPC on the
 //              token listener (works over server-only Tailscale Funnel, zrok, or any
 //              wss:// proxy, so client devices need no Tailscale). Full access to host &
-//              sandbox agents, desktops, orchestrator, and guest tokens.
+//              sandbox agents, desktops, orchestrator, links, and tokens.
 //   - "guest": authenticated via a per-friend opaque token (`bhg_<48hex>`) sent in the
 //              initial WebSocket `auth` RPC (never in URL query params). Strictly scoped
 //              to their own Docker-sandboxed agents within per-token caps.
+//   - "delegate": authenticated via a peer-host delegate token (`bhd_<48hex>`), minted by
+//              the owner on B for host A. Uses an explicit allow-list (`auth` and
+//              `delegate.*`), requires a pre-bound ownerPubkey and expiry, and can never
+//              escalate to admin or guest methods.
 //
 // A token's role is fixed when it is minted and stored with its hash. The secret's
 // prefix must match the stored role, so a guest token can never act as an admin one.
@@ -26,14 +30,31 @@ import path from "node:path";
 import { withFileLock } from "./file-lock.mjs";
 
 const HEX64 = /^[0-9a-f]{64}$/;
-export const TOKEN_PREFIXES = { guest: "bhg_", admin: "bha_" };
-const TOKEN_RE = /^(bhg|bha)_[0-9a-f]{48}$/;
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+export const TOKEN_PREFIXES = { guest: "bhg_", admin: "bha_", delegate: "bhd_" };
+const TOKEN_RE = /^(bhg|bha|bhd)_[0-9a-f]{48}$/;
 const TOKEN_ID_RE = /^tok_[0-9a-f]{12}$/;
 
 export const DEFAULT_GUEST_MAX_AGENTS = 2;
 export const DEFAULT_GUEST_MAX_CONCURRENCY = 2;
 export const DEFAULT_GUEST_RUNTIMES = ["hermes", "claude", "antigravity"];
+export const DEFAULT_DELEGATE_RUNTIMES = ["claude", "codex", "hermes", "antigravity"];
+export const DEFAULT_DELEGATE_MAX_CONCURRENCY = 2;
+export const DEFAULT_DELEGATE_MAX_TASK_MS = 7_200_000;
+export const DEFAULT_DELEGATE_EXPIRES_DAYS = 90;
+export const MAX_DELEGATE_EXPIRES_DAYS = 365;
 const VALID_RUNTIMES = new Set(["claude", "codex", "hermes", "antigravity"]);
+const VALID_DELEGATE_ACCESS = new Set(["sandboxed", "host"]);
+
+export const DELEGATE_ALLOWED_METHODS = new Set([
+  "auth",
+  "delegate.hello",
+  "delegate.start",
+  "delegate.followup",
+  "delegate.cancel",
+  "delegate.release",
+  "delegate.sync",
+]);
 
 export const DESKTOP_METHODS = new Set([
   "desktop.status",
@@ -51,8 +72,14 @@ export const ADMIN_ONLY_METHODS = new Set([
   "orchestrator.cancel",
   "hermes.profiles",
   "tokens.create",
+  "tokens.createDelegate",
   "tokens.list",
   "tokens.revoke",
+  "links.add",
+  "links.list",
+  "links.update",
+  "links.remove",
+  "links.test",
 ]);
 
 export function hashToken(token) {
@@ -103,13 +130,115 @@ function checkAllowedRuntimes(value, fallback = DEFAULT_GUEST_RUNTIMES) {
   return out;
 }
 
-/** The stored role; records written before admin tokens existed are guests. */
+/**
+ * Parse a delegate token expiry: ISO timestamp, Unix ms, or shorthand duration
+ * ("90d", "24h", "30m"). Defaults to 90 days; capped at 365 days from `now`.
+ */
+export function parseExpiresAt(
+  value,
+  { now = Date.now(), defaultDays = DEFAULT_DELEGATE_EXPIRES_DAYS, maxDays = MAX_DELEGATE_EXPIRES_DAYS } = {},
+) {
+  const maxMs = maxDays * 86_400_000;
+  let ts;
+  if (value === undefined || value === null || value === "") {
+    ts = now + defaultDays * 86_400_000;
+  } else if (typeof value === "number" && Number.isFinite(value)) {
+    ts = value;
+  } else {
+    const raw = String(value).trim();
+    const dur = /^(\d+)\s*([smhd])$/i.exec(raw);
+    if (dur) {
+      const amount = Number(dur[1]);
+      const unit = { s: 1_000, m: 60_000, h: 3_600_000, d: 86_400_000 }[dur[2].toLowerCase()];
+      if (!Number.isFinite(amount) || amount <= 0) throw new Error(`Invalid expires duration: "${raw}"`);
+      ts = now + amount * unit;
+    } else {
+      ts = Date.parse(raw);
+      if (!Number.isFinite(ts)) throw new Error(`Invalid expiresAt timestamp or duration: "${raw}"`);
+    }
+  }
+  if (ts <= now) throw new Error("expiresAt must be in the future");
+  if (ts - now > maxMs) throw new Error(`expiresAt cannot exceed ${maxDays} days from now`);
+  return new Date(ts).toISOString();
+}
+
+export function isTokenExpired(record, now = Date.now()) {
+  if (!record?.expiresAt) return false;
+  const ts = Date.parse(record.expiresAt);
+  return !Number.isFinite(ts) || ts <= now;
+}
+
+function checkDelegateAgents(agents) {
+  if (agents === undefined || agents === null || agents === "" || agents === "all") return "all";
+  if (typeof agents === "string") {
+    const clean = agents.trim().toLowerCase();
+    if (clean === "all") return "all";
+    const items = clean.split(",").map((s) => s.trim()).filter(Boolean);
+    return checkDelegateAgents(items);
+  }
+  if (!Array.isArray(agents) || agents.length === 0) {
+    throw new Error('agents must be "all" or a non-empty list of 64-hex pubkeys');
+  }
+  const out = [];
+  for (const item of agents) {
+    const pk = String(item ?? "").trim().toLowerCase();
+    if (!HEX64.test(pk)) throw new Error(`Invalid agent pubkey in delegate token: "${item}"`);
+    if (!out.includes(pk)) out.push(pk);
+  }
+  return out;
+}
+
+function checkDelegateAccess(access) {
+  const clean = access === undefined || access === null || access === "" ? "sandboxed" : String(access).trim().toLowerCase();
+  if (!VALID_DELEGATE_ACCESS.has(clean)) {
+    throw new Error(`access must be "sandboxed" or "host", not "${access}"`);
+  }
+  return clean;
+}
+
+function checkDelegateWorkspaces(workspaces) {
+  if (workspaces === undefined || workspaces === null || workspaces === "") return [];
+  const rawList =
+    typeof workspaces === "string"
+      ? workspaces.split(",").map((s) => s.trim()).filter(Boolean)
+      : workspaces;
+  if (!Array.isArray(rawList)) throw new Error("workspaces must be a list of paths");
+  const out = [];
+  for (const item of rawList) {
+    const clean = String(item ?? "").trim();
+    if (!clean || clean.includes("\0")) throw new Error(`Invalid workspace path: "${item}"`);
+    if (!clean.startsWith("/") && clean !== "~" && !clean.startsWith("~/")) {
+      throw new Error(`Workspace prefix must be an absolute or ~/ path: "${clean}"`);
+    }
+    if (!out.includes(clean)) out.push(clean);
+  }
+  return out;
+}
+
+function checkOptionalMachineId(value) {
+  if (value === undefined || value === null || value === "") return null;
+  const clean = String(value).trim().toLowerCase();
+  if (!UUID_RE.test(clean)) throw new Error("peerMachineId must be a valid UUID");
+  return clean;
+}
+
+/**
+ * The stored role: "admin", "guest", or "delegate".
+ * Records written before the role field existed (undefined/null) count as "guest".
+ * Unknown role strings return null and are refused.
+ */
 export function tokenRole(record) {
-  return record?.role === "admin" ? "admin" : "guest";
+  if (!record || typeof record !== "object") return null;
+  if (record.role === undefined || record.role === null) return "guest";
+  if (record.role === "admin" || record.role === "guest" || record.role === "delegate") {
+    return record.role;
+  }
+  return null;
 }
 
 export function publicTokenView(record) {
-  if (tokenRole(record) === "admin") {
+  const role = tokenRole(record);
+  if (role === "admin") {
     return {
       id: record.id,
       label: record.label,
@@ -120,6 +249,26 @@ export function publicTokenView(record) {
       revokedAt: record.revokedAt || null,
     };
   }
+  if (role === "delegate") {
+    return {
+      id: record.id,
+      label: record.label,
+      ownerPubkey: record.ownerPubkey,
+      role: "delegate",
+      peerMachineId: record.peerMachineId || null,
+      agents: record.agents === "all" ? "all" : [...(record.agents || [])],
+      allowedRuntimes: [...(record.allowedRuntimes || [])],
+      access: record.access || "sandboxed",
+      workspaces: [...(record.workspaces || [])],
+      maxConcurrency: record.maxConcurrency,
+      maxTaskMs: record.maxTaskMs,
+      expiresAt: record.expiresAt,
+      createdAt: record.createdAt,
+      lastUsedAt: record.lastUsedAt || null,
+      revokedAt: record.revokedAt || null,
+    };
+  }
+  if (role !== "guest") return null;
   return {
     id: record.id,
     label: record.label,
@@ -240,7 +389,60 @@ export function createTokenStore({ filePath }) {
     return { token, record: publicTokenView(record) };
   }
 
-  async function verify(rawToken) {
+  /** A delegate token (`bhd_`): scoped cross-machine worker execution for one owner. Shown once. */
+  async function createDelegate({
+    label,
+    ownerPubkey,
+    peerMachineId,
+    agents = "all",
+    allowedRuntimes,
+    access = "sandboxed",
+    workspaces = [],
+    maxConcurrency,
+    maxTaskMs,
+    expiresAt,
+    now = Date.now(),
+  } = {}) {
+    const cleanLabel = checkLabel(label);
+    const cleanOwner = checkOptionalPubkey(ownerPubkey);
+    if (!cleanOwner) throw new Error("ownerPubkey is required for delegate tokens");
+    const cleanPeer = checkOptionalMachineId(peerMachineId);
+    const cleanAgents = checkDelegateAgents(agents);
+    const cleanRuntimes = checkAllowedRuntimes(allowedRuntimes, DEFAULT_DELEGATE_RUNTIMES);
+    const cleanAccess = checkDelegateAccess(access);
+    const cleanWorkspaces = checkDelegateWorkspaces(workspaces);
+    const cleanMaxConc = checkCap(maxConcurrency, DEFAULT_DELEGATE_MAX_CONCURRENCY, 1, 8, "maxConcurrency");
+    const cleanMaxTaskMs = checkCap(maxTaskMs, DEFAULT_DELEGATE_MAX_TASK_MS, 10_000, DEFAULT_DELEGATE_MAX_TASK_MS, "maxTaskMs");
+    const cleanExpiresAt = parseExpiresAt(expiresAt, { now });
+
+    const token = `${TOKEN_PREFIXES.delegate}${randomBytes(24).toString("hex")}`;
+    const record = {
+      id: `tok_${randomBytes(6).toString("hex")}`,
+      label: cleanLabel,
+      tokenHash: hashToken(token),
+      ownerPubkey: cleanOwner,
+      role: "delegate",
+      peerMachineId: cleanPeer,
+      agents: cleanAgents,
+      allowedRuntimes: cleanRuntimes,
+      access: cleanAccess,
+      workspaces: cleanWorkspaces,
+      maxConcurrency: cleanMaxConc,
+      maxTaskMs: cleanMaxTaskMs,
+      expiresAt: cleanExpiresAt,
+      createdAt: new Date(now).toISOString(),
+      lastUsedAt: null,
+      revokedAt: null,
+    };
+
+    await mutate((tokens) => {
+      tokens.push(record);
+    });
+
+    return { token, record: publicTokenView(record) };
+  }
+
+  async function verify(rawToken, { now = Date.now() } = {}) {
     if (typeof rawToken !== "string" || !TOKEN_RE.test(rawToken.trim())) return null;
     const clean = rawToken.trim();
     const candidateHash = hashToken(clean);
@@ -252,14 +454,16 @@ export function createTokenStore({ filePath }) {
       }
     }
     if (!matched || matched.revokedAt) return null;
-    // The secret's prefix must agree with the role stored at mint time: an
-    // edited or mixed-up record can never turn a guest secret into an admin.
-    if (!clean.startsWith(TOKEN_PREFIXES[tokenRole(matched)])) return null;
+    const role = tokenRole(matched);
+    // The secret's prefix must agree with the role stored at mint time, and unknown
+    // roles are refused: an edited or mixed-up record can never escalate privilege.
+    if (!role || !clean.startsWith(TOKEN_PREFIXES[role])) return null;
+    if (isTokenExpired(matched, now)) return null;
 
     // Best-effort lastUsedAt update.
     await mutate((list) => {
       const hit = list.find((t) => t.id === matched.id);
-      if (hit && !hit.revokedAt) hit.lastUsedAt = new Date().toISOString();
+      if (hit && !hit.revokedAt) hit.lastUsedAt = new Date(now).toISOString();
     }).catch(() => {});
 
     return publicTokenView(matched);
@@ -293,7 +497,7 @@ export function createTokenStore({ filePath }) {
 
   async function list() {
     const tokens = await readAll();
-    return tokens.map(publicTokenView);
+    return tokens.map(publicTokenView).filter(Boolean);
   }
 
   async function revoke(id) {
@@ -306,7 +510,7 @@ export function createTokenStore({ filePath }) {
     });
   }
 
-  return { create, createAdmin, verify, getById, bindOwner, list, revoke };
+  return { create, createAdmin, createDelegate, verify, getById, bindOwner, list, revoke };
 }
 
 /**
@@ -347,6 +551,15 @@ export function assertMethodAllowed(session, methodName) {
   if (!session?.authenticated) {
     throw new Error("Authentication required");
   }
+  if (session.role === "delegate") {
+    if (!DELEGATE_ALLOWED_METHODS.has(methodName)) {
+      throw new Error(`Method "${methodName}" is not permitted for delegate accounts`);
+    }
+    return;
+  }
+  if (typeof methodName === "string" && methodName.startsWith("delegate.")) {
+    throw new Error(`Method "${methodName}" requires a delegate token`);
+  }
   if (session.role === "guest") {
     if (DESKTOP_METHODS.has(methodName)) {
       if (session.limits?.allowHostDesktop === true || session.limits?.allowSandboxDesktop === true) return;
@@ -355,6 +568,10 @@ export function assertMethodAllowed(session, methodName) {
     if (ADMIN_ONLY_METHODS.has(methodName)) {
       throw new Error(`Method "${methodName}" is not permitted for guest accounts`);
     }
+    return;
+  }
+  if (session.role !== "admin") {
+    throw new Error(`Unknown session role "${session.role}"`);
   }
 }
 
@@ -421,11 +638,11 @@ export function isValidDesktopTicket(view, listenerRole, now = Date.now()) {
  * always may; guest tokens only with `allowHostDesktop` or `allowSandboxDesktop`
  * (assertGuestDesktop keeps the latter to sandboxed agents).
  */
-export function desktopTicketTokenAllowed(view, tokenRecord) {
-  if (!view || !tokenRecord || tokenRecord.revokedAt) return false;
+export function desktopTicketTokenAllowed(view, tokenRecord, now = Date.now()) {
+  if (!view || !tokenRecord || tokenRecord.revokedAt || isTokenExpired(tokenRecord, now)) return false;
   if (tokenRecord.id !== view.tokenId) return false;
   const role = tokenRole(tokenRecord);
-  if (role !== view.role) return false;
+  if (!role || role === "delegate" || role !== view.role) return false;
   if (role === "admin") return true;
   return tokenRecord.allowHostDesktop === true || sandboxDesktopAllowed(tokenRecord);
 }
