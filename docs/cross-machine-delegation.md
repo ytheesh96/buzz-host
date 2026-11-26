@@ -1,15 +1,15 @@
-# Cross-machine delegation (design, issue #47)
+# Cross-machine delegation (design, issue #8)
 
-Status: **design, not implemented**. This note is for owner review before any
-code. It builds on the orchestrator contract (`docs/orchestrator-contract.md`),
-access tokens (PR #37, `server/auth.mjs`), and Nostr discovery plus the iroh
-bridge (PR #38, `server/discovery.mjs`, `server/iroh-supervisor.mjs`,
-`iroh-bridge/`).
+Status: **approved design, ready for implementation**. Owner decisions are
+recorded in §7. It builds on the orchestrator contract
+(`docs/orchestrator-contract.md`), access tokens (PR #37, `server/auth.mjs`),
+and Nostr discovery plus the iroh bridge (PR #38, `server/discovery.mjs`,
+`server/iroh-supervisor.mjs`, `iroh-bridge/`).
 
 ## Goal
 
 An orchestrator agent on **host A** (e.g. omarchy) can run `orch_delegate` on a
-Solo-chat worker that lives on **host B** (e.g. m1, once #44 installs
+Solo-chat worker that lives on **host B** (e.g. m1, once #5 installs
 buzz-host there). Status, wait, steer and cancel keep working, and the worker
 chat still links back to the owner's message. Host B gives host A a scoped
 **delegate token**, not admin access.
@@ -61,21 +61,22 @@ From the owner's Buzz app, which already has admin sessions to both hosts
 (admin tokens from PR #37, machines from discovery in PR #38):
 
 1. App → B (admin): `tokens.createDelegate { label, ownerPubkey, agents,
-   runtimes, access, maxConcurrency, expiresAt, peerMachineId: A }` returns the
-   `bhd_…` secret once and B's current routes (`readRoutes`: iroh first, then
-   `publicGuestUrl` / `publicUrl`).
+   runtimes, access, workspaces?, maxConcurrency, expiresAt, peerMachineId: A }`
+   returns the `bhd_…` secret once and B's current routes (`readRoutes`: iroh
+   first, then `publicGuestUrl` / `publicUrl`).
 2. App → A (admin): `links.add { machineId: B, name, routes, irohNodeId, token }`.
    A saves it to `~/.config/buzz-host/links.json` (0600).
 3. App → A: `links.test { linkId }` connects and calls `delegate.hello`, so
    the owner sees "m1: 3 agents, claude/codex" or the error.
 
-The CLI does the same without the app, for headless setups and for #45:
+The CLI does the same without the app, for headless setups and for #6 (v1 ships
+CLI pairing + host RPCs; 1-click app UI is a follow-up `buzz-app` PR):
 
 ```sh
 # on B (m1)
 buzz-host-tokens create-delegate --label "from omarchy" --owner <hex> \
   --agents all|<pk,…> --runtimes claude,codex --access sandboxed|host \
-  --max-concurrency 2 --expires 30d
+  [--workspaces ~/Work,…] --max-concurrency 2 --expires 90d
 # prints the bhd_… secret once and a pairing blob:
 #   buzz-host-link:v1:<base64url {machineId,name,routes,irohNodeId,token}>
 
@@ -119,8 +120,8 @@ today (never in the URL; the auth rate limiter applies).
   and A rewrites the link.
 - When B is unreachable on every saved route, the owner's app, which still
   sees B's discovery event, can push fresh routes with `links.update`. The app
-  only does this when the iroh node id still matches. (Phase 2; see the open
-  questions.)
+  only does this when the iroh node id still matches. (Deferred to Phase 2; see
+  §7.)
 
 ### Session
 
@@ -144,10 +145,11 @@ with the prefix checked against the role, exactly like today.
   peerMachineId: "<uuid>",       // A's machineId; informational + shown in lists
   agents: ["<pk>", …] | "all",   // "all" = every eligible agent of ownerPubkey, evaluated per call
   allowedRuntimes: ["claude", "codex"],
-  access: "sandboxed" | "host",  // which runners the token may drive (see security)
+  access: "sandboxed" | "host",  // which runners the token may drive (default "sandboxed")
+  workspaces: ["<abs path>", …], // optional allowed workspace prefixes (default []: worker's own dir only)
   maxConcurrency: 2,             // 1..8 live delegated tasks for this token
   maxTaskMs: 7_200_000,          // per-prompt ceiling B enforces itself (≤ 2 h)
-  expiresAt: "<ISO>",            // required; default 30 days, max 365 days
+  expiresAt: "<ISO>",            // required; default 90 days, max 365 days
   createdAt, lastUsedAt, revokedAt
 }
 ```
@@ -209,9 +211,10 @@ fields (`runtime, model, effort, stopReason, error, finalText, fallbackPosted`).
   authTag)` and requires `authTag[1] === token.ownerPubkey === worker meta.owner`.
 - **Workspace:** the default is the worker agent's own work dir on B
   (`~/buzz-agents/<pubkey>`), because A's `cwd` means nothing on B. When A
-  passes a workspace, it must resolve (realpath) under the worker's work dir
-  or under a token `workspaces` prefix list (open question). It is never under
-  `~/buzz-sandboxes/` or the buzz-host data/config dirs.
+  passes a workspace, it must resolve (`realpath`) under the worker's work dir
+  or under one of the token's optional `workspaces` allowed-prefix paths
+  (default: worker's own dir only). It is never under `~/buzz-sandboxes/` or
+  the buzz-host data/config dirs.
 - **Genuine Solo chat:** B's worker agent queries the relay for the channel's
   kind 9007 create event. B requires that it was signed by the orchestrator
   pubkey from `auth`, that it has `t=buzz.solo`, and that it p-tags both the
@@ -422,29 +425,31 @@ fields (`runtime, model, effort, stopReason, error, finalText, fallbackPosted`).
 6. **Tests:** two buzz-host instances in one test process (A and B, fake
    relay, real token store) covering delegate, steer, cancel, link drop and
    resync, revoke and expiry, and every negative security case above.
-7. **Live run:** omarchy → m1 after #44 installs buzz-host on m1.
+7. **Live run:** omarchy → m1 after #5 installs buzz-host on m1.
+8. **Follow-up (`buzz-app` PR):** 1-click pairing UI in Settings (not bundled
+   into #7).
 
 Each step is one PR or part of one. Nothing touches the live omarchy units
 until merge.
 
-## 7. Open questions for the owner
+## 7. Resolved owner decisions
 
-1. **Executor vs. full proxy.** This design keeps the task on A and gives B a
-   narrow executor (decision 1). It is not a proxy to B's whole orchestrator.
-   Is that OK?
-2. **Default access level.** The proposed default is `sandboxed` (Docker
-   workers only), with `host` as an explicit opt-in. Should the
-   owner-to-own-machine case (omarchy → m1) default to `host` instead?
-3. **Revocation of running work.** On revoke or expiry, B cancels live tasks
-   immediately (proposed). The alternative is to let the current turn finish
-   and refuse new ones.
-4. **Workspaces on B.** Should only the worker's own work dir be allowed, or
-   should the token also carry an allowed prefix list (e.g. `~/Work` on m1)?
-5. **Pairing UX.** Should the app flow (mint on B, install on A in one click)
-   be part of #46 (SSH machines in the app), with the CLI blob in this issue?
-   Or does #47 ship both?
-6. **Route refresh when every saved route fails.** Should the app push fresh
-   routes to A (phase 2)? Or should B also publish its routes to a per-link
-   key that A can decrypt, without involving the owner?
-7. **Defaults.** 30-day expiry, `maxConcurrency` 2 and a 10-minute lease are
-   proposed. Should any of them change?
+1. **Executor vs. full proxy:** Keep the narrow executor on B (decision 1).
+   Host A keeps task state, timeouts, steer queues and `orch_*`; B only exposes
+   the narrow `delegate.*` methods and never needs A's keys.
+2. **Default access level:** Keep `sandboxed` as the code default, and opt in
+   to `--access host` when pairing personal host-runner machines (e.g. omarchy
+   ↔ m1).
+3. **Revocation / expiry of running work:** Cancel live tasks immediately on
+   revocation or expiry.
+4. **Workspaces on B:** Support an optional `--workspaces` allowed-prefix list
+   on the delegate token (default: worker's own work dir only), validated with
+   `realpath` and always excluding `~/buzz-sandboxes/` and buzz-host
+   data/config dirs.
+5. **Pairing UX:** Ship CLI pairing + host RPCs (`tokens.createDelegate`,
+   `links.*`) in #8; implement the 1-click app UI in a follow-up `buzz-app` PR
+   (do not bundle into #7).
+6. **Route refresh when every saved route fails:** Defer to Phase 2 (app pushes
+   fresh routes via `links.update`). No per-link Nostr discovery key in v1.
+7. **Defaults:** Keep `maxConcurrency: 2` and the 10-minute lease; bump default
+   token expiry from 30 days to **90 days** (still capped at 365 days).
