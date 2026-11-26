@@ -4,6 +4,12 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { runDoctor } from "./doctor.mjs";
+import { createHost, stdio, UsageError } from "./host.mjs";
+import { runDown, runRestart, runStatus } from "./lifecycle.mjs";
+import { runLogs } from "./logs.mjs";
+import { runPair } from "./pair.mjs";
+import { runTokensCommand } from "./tokens.mjs";
 import { formatHuman, parseUpArgs, up, UP_USAGE } from "./up.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -11,6 +17,12 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 async function bundleVersion() {
   return (await fs.readFile(path.join(root, "VERSION"), "utf8").catch(() => "dev")).trim() || "dev";
 }
+
+/** A management command: `run(argv, host, io)` -> exit code, with the real host and stdio unless `ctx` supplies them. */
+const managed = (summary, run) => ({
+  summary,
+  run: (argv, ctx = {}) => run(argv, ctx.host ?? createHost(), ctx.io ?? stdio()),
+});
 
 export const COMMANDS = {
   up: {
@@ -26,6 +38,13 @@ export const COMMANDS = {
       return 0;
     },
   },
+  down: managed("Stop buzz-host and its agents (or one agent)", runDown),
+  restart: managed("Restart buzz-host (--agents: and every agent; or restart one agent)", runRestart),
+  status: managed("Show buzz-host and agent unit states, URL and version", runStatus),
+  pair: managed("Print the URL, token and pairing URL for connecting a device (--qr for a QR code)", runPair),
+  tokens: managed("Manage access tokens: create | create-admin | list | revoke", runTokensCommand),
+  logs: managed("Show buzz-host's log, or one agent's", runLogs),
+  doctor: managed("Check runtimes, sign-ins, ports, linger and install state", runDoctor),
   version: {
     summary: "Print this bundle's version",
     async run() {
@@ -68,7 +87,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
     (code) => process.exit(code),
     (error) => {
       process.stderr.write(`buzz-host: ${error.message}\n`);
-      process.exit(1);
+      process.exit(error instanceof UsageError ? 2 : 1);
     },
   );
 }

@@ -34,6 +34,7 @@ SERVER_FILES=(
   ws-security.mjs
   service-manager.mjs
   iroh-supervisor.mjs
+  tokens-cli.mjs
 )
 
 atomic_copy() {

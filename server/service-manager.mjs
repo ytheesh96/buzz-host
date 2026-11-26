@@ -6,9 +6,12 @@
 //           <pubkey>.plist) in the user's gui/<uid> domain, logs appended to
 //           ~/Library/Logs/buzz-host/agent-<pubkey>.log.
 //
-// Every backend answers the same calls: enableAndStart, restart,
-// disableAndStop, status (systemd's `is-active` words: active, activating,
-// inactive, failed, unknown) and logs(pubkey, lines).
+// Every backend answers the same calls: enableAndStart, restart, stop (stop
+// but stay installed), disableAndStop, status (systemd's `is-active` words:
+// active, activating, inactive, failed, unknown) and logs(pubkey, lines).
+// Each also has `server`, the same operations for buzz-host itself
+// (buzz-host.service / com.buzz-host.server): status(), start(), stop(),
+// restart(), logs(lines). The `buzz-host` CLI uses these.
 //
 // The run dir (control and MCP sockets) is `$XDG_RUNTIME_DIR/buzz-host`
 // everywhere: agent-run, acp-proxy, the C MCP bridge and docker-run all derive
@@ -33,6 +36,7 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 export const SUPPORTED_PLATFORMS = new Set(["linux", "darwin"]);
 export const AGENT_LABEL_PREFIX = "com.buzz-host.agent.";
 export const SERVER_LABEL = "com.buzz-host.server";
+export const SERVER_UNIT = "buzz-host.service";
 /** Seconds launchd waits before respawning a crashed agent (systemd's RestartSec=10). */
 export const LAUNCHD_THROTTLE_SECONDS = 10;
 /** Cap on how much of a log file `logs` reads from its end. */
@@ -194,6 +198,22 @@ export async function tailFile(file, lines, { fs = nodeFs } = {}) {
 function systemdBackend({ run }) {
   const systemctl = (...args) => run("systemctl", ["--user", ...args], { timeout: 60_000 });
   const unit = (pubkey) => `buzz-agent@${checkPubkey(pubkey)}.service`;
+  async function isActive(name) {
+    try {
+      const { stdout } = await systemctl("is-active", name);
+      return stdout.trim();
+    } catch (error) {
+      return (error.stdout ?? "").trim() || "unknown";
+    }
+  }
+  async function journal(name, lines) {
+    const { stdout } = await run(
+      "journalctl",
+      ["--user", "-u", name, "-n", String(clampLines(lines)), "--no-pager", "-o", "short-iso"],
+      { timeout: 30_000, maxBuffer: 4 << 20 },
+    ).catch((error) => ({ stdout: error.stdout ?? "" }));
+    return stdout;
+  }
   return {
     platform: "linux",
     unit,
@@ -206,22 +226,25 @@ function systemdBackend({ run }) {
     async disableAndStop(pubkey) {
       await systemctl("disable", "--now", unit(pubkey));
     },
-    async status(pubkey) {
-      try {
-        const { stdout } = await systemctl("is-active", unit(pubkey));
-        return stdout.trim();
-      } catch (error) {
-        return (error.stdout ?? "").trim() || "unknown";
-      }
+    // Stop now; the unit stays enabled, so it comes back at the next login.
+    async stop(pubkey) {
+      await systemctl("stop", unit(pubkey));
     },
-    async logs(pubkey, lines = 80) {
-      const n = clampLines(lines);
-      const { stdout } = await run(
-        "journalctl",
-        ["--user", "-u", unit(pubkey), "-n", String(n), "--no-pager", "-o", "short-iso"],
-        { timeout: 30_000, maxBuffer: 4 << 20 },
-      ).catch((error) => ({ stdout: error.stdout ?? "" }));
-      return stdout;
+    status: (pubkey) => isActive(unit(pubkey)),
+    logs: (pubkey, lines = 80) => journal(unit(pubkey), lines),
+    server: {
+      unit: SERVER_UNIT,
+      status: () => isActive(SERVER_UNIT),
+      async start() {
+        await systemctl("start", SERVER_UNIT);
+      },
+      async stop() {
+        await systemctl("stop", SERVER_UNIT);
+      },
+      async restart() {
+        await systemctl("restart", SERVER_UNIT);
+      },
+      logs: (lines = 80) => journal(SERVER_UNIT, lines),
     },
   };
 }
@@ -234,12 +257,28 @@ function launchdBackend({ run, fs, home, libDir, uid, runtimeDir, launchAgentsDi
   const logPath = (pubkey) => path.join(logDir, `agent-${checkPubkey(pubkey)}.log`);
   const launchctl = (...args) => run("launchctl", args, { timeout: 60_000 });
 
-  async function loaded(pubkey) {
+  const serverTarget = `${domain}/${SERVER_LABEL}`;
+  const serverPlist = path.join(launchAgentsDir, `${SERVER_LABEL}.plist`);
+
+  async function loadedAt(name) {
     try {
-      await launchctl("print", target(pubkey));
+      await launchctl("print", name);
       return true;
     } catch {
       return false;
+    }
+  }
+  const loaded = (pubkey) => loadedAt(target(pubkey));
+
+  async function stateOf(name) {
+    try {
+      const { stdout } = await launchctl("print", name);
+      return parseLaunchctlState(stdout);
+    } catch (error) {
+      // Not loaded: launchctl prints "Could not find service" and exits 113.
+      if (error?.code === 113 || /could not find service/i.test(`${error?.stderr ?? ""}${error?.stdout ?? ""}`))
+        return "inactive";
+      return "unknown";
     }
   }
 
@@ -258,10 +297,11 @@ function launchdBackend({ run, fs, home, libDir, uid, runtimeDir, launchAgentsDi
   }
 
   /** bootout returns before the job is gone; wait so a bootstrap or rm that follows is safe. */
-  async function unload(pubkey) {
-    await launchctl("bootout", target(pubkey)).catch(() => {});
-    for (let i = 0; i < unloadPolls && (await loaded(pubkey)); i++) await sleep(unloadPollMs);
+  async function unloadAt(name) {
+    await launchctl("bootout", name).catch(() => {});
+    for (let i = 0; i < unloadPolls && (await loadedAt(name)); i++) await sleep(unloadPollMs);
   }
+  const unload = (pubkey) => unloadAt(target(pubkey));
 
   return {
     platform: "darwin",
@@ -292,19 +332,28 @@ function launchdBackend({ run, fs, home, libDir, uid, runtimeDir, launchAgentsDi
       if (await loaded(pubkey)) await unload(pubkey);
       await fs.rm(plistPath(pubkey), { force: true });
     },
-    async status(pubkey) {
-      try {
-        const { stdout } = await launchctl("print", target(pubkey));
-        return parseLaunchctlState(stdout);
-      } catch (error) {
-        // Not loaded: launchctl prints "Could not find service" and exits 113.
-        if (error?.code === 113 || /could not find service/i.test(`${error?.stderr ?? ""}${error?.stdout ?? ""}`))
-          return "inactive";
-        return "unknown";
-      }
+    // Unload but keep the plist: RunAtLoad starts it again at the next login.
+    async stop(pubkey) {
+      if (await loaded(pubkey)) await unload(pubkey);
     },
-    async logs(pubkey, lines = 80) {
-      return tailFile(logPath(pubkey), clampLines(lines), { fs });
+    status: (pubkey) => stateOf(target(pubkey)),
+    logs: (pubkey, lines = 80) => tailFile(logPath(pubkey), clampLines(lines), { fs }),
+    // buzz-host itself: its plist is installed by deploy.sh / `buzz-host up`.
+    server: {
+      unit: SERVER_LABEL,
+      status: () => stateOf(serverTarget),
+      async start() {
+        if (!(await loadedAt(serverTarget))) await launchctl("bootstrap", domain, serverPlist);
+      },
+      async stop() {
+        if (await loadedAt(serverTarget)) await unloadAt(serverTarget);
+      },
+      async restart() {
+        if (await loadedAt(serverTarget)) await launchctl("kickstart", "-k", serverTarget);
+        else await launchctl("bootstrap", domain, serverPlist);
+      },
+      logPath: path.join(logDir, "server.log"),
+      logs: (lines = 80) => tailFile(path.join(logDir, "server.log"), clampLines(lines), { fs }),
     },
   };
 }

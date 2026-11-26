@@ -393,3 +393,73 @@ test("darwin disableAndStop waits for bootout to finish before removing the plis
   assert.equal(after.filter((c) => c[1] === "print").length, 4, "polled until the job was gone");
   await assert.rejects(() => fs.access(sm.plistPath(PK)));
 });
+
+// ---------- stop + the server unit (used by `buzz-host down/restart/status/logs`) ----------
+
+test("linux: stop keeps the unit enabled; the server unit has start/stop/restart/status/logs", async () => {
+  const { run, calls } = fakeRun((cmd, args) => {
+    if (args.includes("is-active")) return execError(3, { stdout: "inactive\n" });
+    if (cmd === "journalctl") return { stdout: "server line\n" };
+    return {};
+  });
+  const sm = createServiceManager({ platform: "linux", run });
+  await sm.stop(PK);
+  assert.equal(sm.server.unit, "buzz-host.service");
+  await sm.server.start();
+  await sm.server.stop();
+  await sm.server.restart();
+  assert.equal(await sm.server.status(), "inactive");
+  assert.equal(await sm.server.logs(5), "server line\n");
+  assert.deepEqual(calls, [
+    ["systemctl", "--user", "stop", `buzz-agent@${PK}.service`],
+    ["systemctl", "--user", "start", "buzz-host.service"],
+    ["systemctl", "--user", "stop", "buzz-host.service"],
+    ["systemctl", "--user", "restart", "buzz-host.service"],
+    ["systemctl", "--user", "is-active", "buzz-host.service"],
+    ["journalctl", "--user", "-u", "buzz-host.service", "-n", "5", "--no-pager", "-o", "short-iso"],
+  ]);
+});
+
+test("darwin: stop unloads but keeps the plist; the server unit is com.buzz-host.server", async (t) => {
+  const root = await tmpdir(t, "buzz-sm-darwin-server-");
+  const label = `com.buzz-host.agent.${PK}`;
+  const loaded = new Set();
+  const { sm, calls } = darwinManager(t, root, (cmd, args) => {
+    const name = args[1]?.split("/").pop();
+    if (args[0] === "print") return loaded.has(name) ? { stdout: "state = running\n" } : execError(113, { stderr: "Could not find service" });
+    if (args[0] === "bootstrap") loaded.add(path.basename(args[2], ".plist"));
+    if (args[0] === "bootout") loaded.delete(name);
+    if (args[0] === "kickstart") assert.ok(loaded.has(args[2].split("/").pop()));
+    return {};
+  });
+  const agentPlist = path.join(root, "LaunchAgents", `${label}.plist`);
+  await sm.enableAndStart(PK);
+  await sm.stop(PK);
+  await fs.access(agentPlist);
+  assert.equal(await sm.status(PK), "inactive");
+  await sm.stop(PK); // already stopped: harmless
+
+  const serverPlist = path.join(root, "LaunchAgents", "com.buzz-host.server.plist");
+  assert.equal(sm.server.unit, "com.buzz-host.server");
+  assert.equal(await sm.server.status(), "inactive");
+  await sm.server.start(); // not loaded: bootstrap
+  assert.equal(await sm.server.status(), "active");
+  await sm.server.start(); // loaded: nothing
+  await sm.server.restart(); // loaded: kickstart -k
+  await sm.server.stop();
+  await sm.server.stop();
+  await sm.server.restart(); // not loaded: bootstrap
+  assert.deepEqual(
+    calls.filter((c) => c[1] !== "print" && c.join(" ").includes("com.buzz-host.server")),
+    [
+      ["launchctl", "bootstrap", "gui/501", serverPlist],
+      ["launchctl", "kickstart", "-k", "gui/501/com.buzz-host.server"],
+      ["launchctl", "bootout", "gui/501/com.buzz-host.server"],
+      ["launchctl", "bootstrap", "gui/501", serverPlist],
+    ],
+  );
+
+  await fs.mkdir(path.dirname(sm.server.logPath), { recursive: true });
+  await fs.writeFile(sm.server.logPath, "a\nb\nc\n");
+  assert.equal(await sm.server.logs(2), "b\nc\n");
+});
