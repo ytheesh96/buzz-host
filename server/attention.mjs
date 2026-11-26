@@ -115,6 +115,8 @@ export function createAttention({ dataDir, runDir, log = console, extra }) {
   let socketServer;
   /** Called with (pubkey, record) after every saved change (relay watcher). */
   let onChange = () => {};
+  /** Called with (pubkey, wake, result) after a wake's outcome is read. */
+  let onWakeResult = () => {};
   /** The relay watcher: status(pubkey) and query(pubkey, filter). */
   let relay;
 
@@ -359,7 +361,9 @@ export function createAttention({ dataDir, runDir, log = console, extra }) {
     await fs.writeFile(tmp, JSON.stringify(request), { mode: 0o600 });
     await fs.rename(tmp, path.join(wakeDir, `${Date.now()}-${id}.json`));
     const at = seconds();
-    state.wakes[id] = { ...wake, at };
+    // The prompt is kept on the in-flight wake (not in its history entry) so
+    // a limit-resume retry can re-ask it; see resume.mjs's onWakeResult.
+    state.wakes[id] = { ...wake, prompt, at };
     record(state, { id, ...wake, at });
     log.log(`attention: ${pubkey.slice(0, 8)} ${wake.type} ${wake.slug} → wake ${id}`);
   }
@@ -818,6 +822,15 @@ export function createAttention({ dataDir, runDir, log = console, extra }) {
         }
         return record;
       });
+      // Other services react to a wake's outcome (resume.mjs retries a wake
+      // whose turn stopped on a rate/usage limit).
+      if (typeof onWakeResult === "function") {
+        try {
+          await onWakeResult(pubkey, wake, result);
+        } catch (error) {
+          log.warn(`attention: wake result hook for ${pubkey.slice(0, 8)}: ${error.message}`);
+        }
+      }
       await fs.rm(file, { force: true });
       log.log(`attention: ${pubkey.slice(0, 8)} wake ${id} ${result.outcome}`);
     }
@@ -907,7 +920,7 @@ export function createAttention({ dataDir, runDir, log = console, extra }) {
       })),
       watches: watches.map((object) => describe(state.record, object.slug, object, rt, state.history)),
       orphans: orphans.map((object) => core.parseSlug(object.slug).id),
-      inFlight: Object.entries(state.wakes).map(([id, wake]) => ({ id, ...wake })),
+      inFlight: Object.entries(state.wakes).map(([id, { prompt: _prompt, ...wake }]) => ({ id, ...wake })),
       queued: rt.queue.length,
       history: state.history.slice(0, 30),
     };
@@ -1073,6 +1086,9 @@ export function createAttention({ dataDir, runDir, log = console, extra }) {
     },
     set onChange(fn) {
       onChange = fn;
+    },
+    set onWakeResult(fn) {
+      onWakeResult = fn;
     },
     set relay(watcher) {
       relay = watcher;

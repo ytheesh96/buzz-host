@@ -160,6 +160,40 @@ HISTORY_ELLIPSIS = "…"
 # leave the new session with no prior task context at all.
 HISTORY_SKIP_COMMANDS = ("runtime", "profile")
 HISTORY_NOTICE_PREFIXES = ("Runtime for this chat:", "Runtime for this thread:")
+# A turn's limit stop: a rate/usage limit on the runtime itself, not on some
+# tool the agent ran. Only a prompt-level error (or a limit stop reason)
+# counts: tool output mentioning a limit is the agent's business.
+LIMIT_RE = re.compile(
+    r"rate[-_ ]?limit|usage[-_ ]?limit|5-hour limit|too many requests|429|"
+    r"limit (?:has been )?exceeded|rate[_ ]?limited", re.I)
+LIMIT_STOP_REASONS = ("rate_limit", "usage_limit")
+# Per-agent opt-out of auto-resume: "limitResume": false in meta.json.
+limit_resume_off = False
+try:
+    if agent_dir:
+        with open(os.path.join(agent_dir, "meta.json"), "rb") as f:
+            limit_resume_off = json.load(f).get("limitResume") is False
+except (OSError, ValueError):
+    pass
+
+
+def limit_stop(err, err_msg, stop_reason):
+    """The turn end's limit-stop signal, or None. Claude's adapter fails the
+    prompt with error data {errorKind: "rate_limit", rateLimit: {resetsAt}},
+    and every adapter's error text carries the tell-tale wording."""
+    data = err.get("data") if isinstance(err, dict) else None
+    kind = data.get("errorKind") if isinstance(data, dict) else None
+    rate = data.get("rateLimit") if isinstance(data, dict) else None
+    resets_at = ""
+    if isinstance(rate, dict):
+        resets_at = str(rate.get("resetsAt") or rate.get("resetAt") or "")
+    if kind == "rate_limit":
+        return {"errorKind": kind, "resetsAt": resets_at}
+    if stop_reason in LIMIT_STOP_REASONS:
+        return {"errorKind": stop_reason, "resetsAt": resets_at}
+    if err_msg and LIMIT_RE.search(err_msg):
+        return {"errorKind": kind or "limit", "resetsAt": resets_at}
+    return None
 
 
 def hermes_home(profile=""):
@@ -2563,6 +2597,7 @@ def dispatch_client_line(line):
                     "channel": key.split("_", 1)[0],
                     "root": root or "",
                     "runtime": target_rt,
+                    "worker": is_worker_chat,
                 }
         try:
             missed = apply_settings(sid, key, picks) or []
@@ -2759,6 +2794,27 @@ def handle_adapter_line(line, adapter_runtime=None):
                         spawn(reply_fallback, turn)
                 elif done_payload is not None:
                     spawn(notify_host, "_acp_turn_done", done_payload)
+                # Limit resume: a rate/usage-limit stop schedules the agent's
+                # own resumption in buzz-host (resume.mjs); any normal end of a
+                # turn someone asked the agent for clears a pending one (the
+                # chat moved on). Worker chats keep the orchestrator's own
+                # lifecycle, so both signals skip them.
+                if tn and not tn.get("worker"):
+                    stop = limit_stop(err, err_msg, stop_reason)
+                    if stop is None:
+                        if turn is not None:
+                            spawn(notify_host, "_acp_limit_clear", {
+                                "channel": tn["channel"], "root": tn["root"]})
+                    elif not limit_resume_off:
+                        spawn(notify_host, "_acp_limit_stop", {
+                            "channel": tn["channel"],
+                            "root": tn["root"],
+                            "runtime": tn["runtime"],
+                            "error": err_msg[:500],
+                            "errorKind": stop["errorKind"],
+                            "resetsAt": stop["resetsAt"],
+                            "finalText": (turn["text"].strip() if turn else "")[:500],
+                        })
         if save_chat_args is not None:
             save_session_chat(*save_chat_args)
     elif msg.get("method") == "session/update":

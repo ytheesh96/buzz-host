@@ -712,9 +712,10 @@ class ParallelAndMultiRuntime(Base):
         self.new(rid="n1", sid="s1")
         self.p.handle_client_line(prompt_meta("p1", "s1", [ev("hello", OWNER, tags=[("p", AGENT)])]))
         self.p.handle_adapter_line(line({"jsonrpc": "2.0", "id": "p1", "result": {"stopReason": "end_turn"}}))
-        self.assertEqual([name for name, _ in seen], ["_acp_turn_start", "_acp_turn_done"])
+        self.assertEqual([name for name, _ in seen], ["_acp_turn_start", "_acp_turn_done", "_acp_limit_clear"])
         self.assertEqual(seen[0][1]["channel"], CHANNEL)
         self.assertEqual(seen[1][1]["stopReason"], "end_turn")
+        self.assertEqual(seen[2][1]["channel"], CHANNEL)
 
     def test_secondary_adapter_client_request_response_routes_back_to_secondary(self):
         # Secondary adapter (hermes) sends session/request_permission with id=7 and raw sessionId="h1".
@@ -1338,6 +1339,121 @@ class RuntimeSchedulerGuards(Base):
             mod._AGENTS = orig_agents
             mod._WORKSPACE = orig_ws
             mod._state_db = orig_db
+
+
+class LimitResume(Base):
+    """Rate/usage-limit stops: detected on a turn's end and reported to
+    buzz-host as _acp_limit_stop (resume.mjs schedules the agent's own
+    resumption); a normal end reports _acp_limit_clear so a pending resume
+    for that chat is dropped. Worker chats report neither."""
+
+    def notify(self):
+        seen = []
+        self.p.notify_host = lambda name, args: seen.append((name, args))
+        self.p.spawn = lambda fn, *args: fn(*args)
+        self.p.agent_posted = lambda ch, since: True
+        return seen
+
+    def end(self, rid, result=None, error=None):
+        msg = {"jsonrpc": "2.0", "id": rid}
+        if result is not None:
+            msg["result"] = result
+        if error is not None:
+            msg["error"] = error
+        return self.p.handle_adapter_line(line(msg))
+
+    def test_limit_stop_matches_text_and_structured_data(self):
+        self.assertEqual(self.p.limit_stop(None, "", ""), None)
+        self.assertEqual(self.p.limit_stop(None, "tool call failed: not this", ""), None)
+        self.assertEqual(
+            self.p.limit_stop(None, "You've hit your 5-hour limit · resets 2:10am (America/New_York)", ""),
+            {"errorKind": "limit", "resetsAt": ""},
+        )
+        err = {"code": -32603, "message": "Internal error",
+               "data": {"details": "You've hit your 5-hour limit",
+                        "errorKind": "rate_limit",
+                        "rateLimit": {"resetsAt": "2026-11-26T07:10:00.000Z", "resetsInMs": 1}}}
+        self.assertEqual(self.p.limit_stop(err, "x", ""),
+                         {"errorKind": "rate_limit", "resetsAt": "2026-11-26T07:10:00.000Z"})
+        self.assertEqual(self.p.limit_stop(None, "429 too many requests", ""),
+                         {"errorKind": "limit", "resetsAt": ""})
+        self.assertEqual(self.p.limit_stop(None, "", "rate_limit"),
+                         {"errorKind": "rate_limit", "resetsAt": ""})
+        self.assertEqual(self.p.limit_stop(None, "", "end_turn"), None)
+        self.assertEqual(self.p.limit_stop(None, "", "max_tokens"), None)
+
+    def test_limit_error_reports_stop_with_structured_fields(self):
+        self.p.agent_pubkey = AGENT
+        seen = self.notify()
+        self.new(rid="n1", sid="s1")
+        self.p.handle_client_line(prompt_meta("p1", "s1", [ev("work", OWNER, tags=[("p", AGENT)])]))
+        self.end("p1", error={
+            "code": -32603, "message": "Internal error",
+            "data": {"details": "You've hit your 5-hour limit · resets 2:10am (America/New_York)",
+                     "errorKind": "rate_limit",
+                     "rateLimit": {"resetsAt": "2026-11-26T07:10:00.000Z"}}})
+        names = [n for n, _ in seen]
+        self.assertIn("_acp_limit_stop", names)
+        stop = dict(seen)["_acp_limit_stop"]
+        self.assertEqual(stop["channel"], CHANNEL)
+        self.assertEqual(stop["root"], "")
+        self.assertEqual(stop["errorKind"], "rate_limit")
+        self.assertEqual(stop["resetsAt"], "2026-11-26T07:10:00.000Z")
+        self.assertIn("5-hour limit", stop["error"])
+        self.assertNotIn("_acp_limit_clear", names)
+
+    def test_normal_end_reports_clear_but_not_stop(self):
+        self.p.agent_pubkey = AGENT
+        seen = self.notify()
+        self.new(rid="n1", sid="s1")
+        self.p.handle_client_line(prompt_meta("p1", "s1", [ev("work", OWNER, tags=[("p", AGENT)])]))
+        self.end("p1", result={"stopReason": "end_turn"})
+        names = [n for n, _ in seen]
+        self.assertIn("_acp_limit_clear", names)
+        self.assertNotIn("_acp_limit_stop", names)
+        self.assertEqual(dict(seen)["_acp_limit_clear"]["channel"], CHANNEL)
+
+    def test_wake_turn_ending_normally_reports_nothing(self):
+        # A wake turn has no addressed event: no clear (it didn't move the
+        # chat on) and no stop (it ended fine).
+        self.p.agent_pubkey = AGENT
+        seen = self.notify()
+        self.new(rid="n1", sid="s1")
+        self.p.handle_client_line(prompt_meta("p1", "s1", []))
+        self.end("p1", result={"stopReason": "end_turn"})
+        self.assertEqual([n for n, _ in seen], ["_acp_turn_start", "_acp_turn_done"])
+
+    def test_worker_chat_reports_neither_signal(self):
+        self.p.agent_pubkey = AGENT
+        seen = self.notify()
+        self.p.save_settings({CHANNEL: {"noOrchestrate": True}})
+        self.new(rid="n1", sid="s1")
+        self.p.handle_client_line(prompt_meta("p1", "s1", [ev("work", OWNER, tags=[("p", AGENT)])]))
+        self.end("p1", error={"code": -32603, "message": "Internal error",
+                              "data": {"details": "You've hit your 5-hour limit"}})
+        names = [n for n, _ in seen]
+        self.assertNotIn("_acp_limit_stop", names)
+        self.assertNotIn("_acp_limit_clear", names)
+
+    def test_opt_out_agent_never_reports_stop(self):
+        self.p.agent_pubkey = AGENT
+        os.makedirs(os.path.join(self.home, "agent"), exist_ok=True)
+        with open(os.path.join(self.home, "agent", "meta.json"), "w") as f:
+            json.dump({"limitResume": False}, f)
+        fresh = load(self.adapter, self.home)
+        fresh.canvas_workspace = lambda channel, fresh=False: {}
+        self.assertTrue(fresh.limit_resume_off)
+        seen = []
+        fresh.notify_host = lambda name, args: seen.append((name, args))
+        fresh.spawn = lambda fn, *args: fn(*args)
+        fresh.agent_posted = lambda ch, since: True
+        out = json.loads(fresh.handle_client_line(session_new("n1", self.own)))
+        fresh.handle_adapter_line(line({"jsonrpc": "2.0", "id": "n1", "result": {"sessionId": "s1"}}))
+        fresh.handle_client_line(prompt_meta("p1", "s1", [ev("work", OWNER, tags=[("p", AGENT)])]))
+        fresh.handle_adapter_line(line({"jsonrpc": "2.0", "id": "p1", "error": {
+            "code": -32603, "message": "Internal error",
+            "data": {"details": "You've hit your 5-hour limit"}}}))
+        self.assertNotIn("_acp_limit_stop", [n for n, _ in seen])
 
 
 class Shutdown(unittest.TestCase):
