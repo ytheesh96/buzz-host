@@ -161,6 +161,20 @@ Over `attention.sock` (internal only; never listed in `ORCHESTRATOR_TOOLS`):
 - `orchestrator.tasks { pubkey, channelId?, threadRootId?, taskId?, since?, full? }` →
   `{ enabled, tasks, task? }`.
 - `orchestrator.cancel { pubkey, taskId }` → `{ task }`.
+- `tokens.createDelegate` and `links.add | links.list | links.update | links.remove | links.test`
+  (admin-only) manage cross-machine delegation links (`docs/cross-machine-delegation.md`).
+- `delegate.hello | delegate.start | delegate.followup | delegate.cancel | delegate.release | delegate.sync`
+  (delegate token allow-list only) run the narrow executor on peer host B.
+
+## Cross-machine delegation
+
+- `orch_capabilities` includes a `hosts` array of paired peer hosts (fetched in
+  parallel within the 2.5 s catalog budget; offline hosts report cached
+  capabilities with `online: false`).
+- `orch_delegate` accepts an optional `host` (name, machineId, or linkId; omit
+  or pass `"local"` for local execution). Task records carry `host: null |
+  { machineId, name, linkId }` and `remoteRef`. Remote runtime auth failures
+  are isolated per host (`<machineId>:<runtime>` in `runtimes.json`).
 
 ## Persistence
 

@@ -35,6 +35,9 @@ SERVER_FILES=(
   service-manager.mjs
   iroh-supervisor.mjs
   tokens-cli.mjs
+  links.mjs
+  links-cli.mjs
+  delegate-executor.mjs
 )
 
 atomic_copy() {
@@ -165,6 +168,9 @@ deploy_local() {
   if [ -f "$SERVER_DIR/buzz-host-tokens" ]; then
     atomic_copy "$SERVER_DIR/buzz-host-tokens" "$lib_dir/bin/buzz-host-tokens" 0755
   fi
+  if [ -f "$SERVER_DIR/buzz-host-links" ]; then
+    atomic_copy "$SERVER_DIR/buzz-host-links" "$lib_dir/bin/buzz-host-links" 0755
+  fi
   if [ -f "$REPO_ROOT/iroh-bridge/target/release/buzz-host-iroh" ]; then
     atomic_copy "$REPO_ROOT/iroh-bridge/target/release/buzz-host-iroh" "$lib_dir/bin/buzz-host-iroh" 0755
   fi
@@ -280,6 +286,9 @@ deploy_ssh() {
   scp -q acp-proxy "$host":.local/lib/buzz-host/bin/
   if [ -f buzz-host-tokens ]; then
     scp -q buzz-host-tokens "$host":.local/lib/buzz-host/bin/
+  fi
+  if [ -f buzz-host-links ]; then
+    scp -q buzz-host-links "$host":.local/lib/buzz-host/bin/
   fi
   if [ -f "$REPO_ROOT/iroh-bridge/target/release/buzz-host-iroh" ]; then
     scp -q "$REPO_ROOT/iroh-bridge/target/release/buzz-host-iroh" "$host":.local/lib/buzz-host/bin/

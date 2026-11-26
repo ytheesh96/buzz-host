@@ -81,6 +81,9 @@ function makeFixture(t) {
     "service-manager.mjs",
     "iroh-supervisor.mjs",
     "tokens-cli.mjs",
+    "links.mjs",
+    "links-cli.mjs",
+    "delegate-executor.mjs",
   ];
   for (const f of serverFiles) {
     const p = path.join(work, "server", f);
@@ -91,6 +94,8 @@ function makeFixture(t) {
   fs.chmodSync(path.join(work, "server", "acp-proxy"), 0o755);
   fs.writeFileSync(path.join(work, "server", "buzz-host-tokens"), "#!/bin/sh\necho v1\n");
   fs.chmodSync(path.join(work, "server", "buzz-host-tokens"), 0o755);
+  fs.writeFileSync(path.join(work, "server", "buzz-host-links"), "#!/bin/sh\necho v1\n");
+  fs.chmodSync(path.join(work, "server", "buzz-host-links"), 0o755);
   fs.writeFileSync(path.join(work, "server", "desktop", "desktop.mjs"), "// desktop v1\n");
   fs.writeFileSync(path.join(work, "server", "desktop", "desktop.test.mjs"), "// should not deploy\n");
   fs.writeFileSync(path.join(work, "server", "desktop", "launcher.sh"), "#!/bin/sh\n");

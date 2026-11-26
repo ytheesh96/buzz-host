@@ -12,6 +12,9 @@ Commands:
                           Guest token (bhg_): a sandboxed friend account with caps
   create-admin [--label <name>] [--owner <64-hex>] [--url wss://…]
                           Admin token (bha_): full access to this host, like a password
+  create-delegate --label <name> --owner <64-hex> [--agents all|<pk,…>] [--runtimes claude,codex]
+                  [--access sandboxed|host] [--workspaces ~/Work,…] [--max-concurrency 2] [--expires 90d]
+                          Delegate token (bhd_): scoped cross-machine worker execution + pairing blob
   list                    Every token's id, role, label, owner and status (never the secret)
   revoke <tok_…>          Cut a token off; buzz-host drops its connections within ~15 s
 
@@ -31,6 +34,8 @@ export async function runTokensCommand(argv, host, io) {
     home: host.home,
     tokensFile: host.paths.tokens,
     configFile: host.paths.config,
+    machineIdFile: host.paths.machineId,
+    runDir: host.runDir,
     out: io.out,
     err: io.err,
   });

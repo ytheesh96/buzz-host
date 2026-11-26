@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { createIrohSupervisor, readIrohAddrFile, resolveIrohBin } from "./iroh-supervisor.mjs";
+import { createIrohLinkSupervisor, createIrohSupervisor, readIrohAddrFile, resolveIrohBin } from "./iroh-supervisor.mjs";
 
 function makeTempDir(t, prefix = "bh-iroh-sup-") {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -263,4 +263,47 @@ setInterval(() => {}, 1000);
   await sup.stop();
   assert.equal(sup.isRunning(), false);
   assert.ok(lines.some(([lvl, m]) => lvl === "warn" && m.includes("SIGKILL")));
+});
+
+test("link supervisor starts connect subcommand, parses listen URL, and detects node id mismatch", async (t) => {
+  const dir = makeTempDir(t);
+  const okScript = writeExecutable(
+    path.join(dir, "fake-iroh-connect"),
+    `#!${process.execPath}
+const args = process.argv.slice(2);
+if (args[0] !== "connect") process.exit(2);
+const nodeId = args[args.indexOf("--node-id") + 1];
+if (nodeId === "wrong-node") {
+  process.stderr.write("buzz-host-iroh: node id mismatch: expected wrong-node, address has real-node\\n");
+  process.exit(1);
+}
+process.stdout.write(JSON.stringify({ listen: "127.0.0.1:43210", nodeId }) + "\\n");
+process.on("SIGTERM", () => process.exit(0));
+setInterval(() => {}, 1000);
+`,
+  );
+
+  const { log } = captureLogs();
+  const sup = createIrohLinkSupervisor({
+    addr: "encoded-addr",
+    nodeId: "real-node",
+    config: { irohBin: okScript },
+    log,
+  });
+  t.after(() => sup.stop());
+
+  const url = await sup.start();
+  assert.equal(url, "ws://127.0.0.1:43210");
+  assert.equal(sup.url(), "ws://127.0.0.1:43210");
+  assert.equal(sup.isRunning(), true);
+  await sup.stop();
+  assert.equal(sup.isRunning(), false);
+
+  const bad = createIrohLinkSupervisor({
+    addr: "encoded-addr",
+    nodeId: "wrong-node",
+    config: { irohBin: okScript },
+    log,
+  });
+  await assert.rejects(() => bad.start(), (err) => err.code === "IDENTITY_MISMATCH");
 });
