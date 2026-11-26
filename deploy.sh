@@ -25,6 +25,7 @@ SERVER_FILES=(
   workspace.mjs
   catalog.mjs
   orchestrator.mjs
+  resume.mjs
   control.mjs
   file-lock.mjs
   fs.mjs

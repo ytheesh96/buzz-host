@@ -25,6 +25,7 @@ import { constants } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { createAttention } from "./attention.mjs";
+import { createLimitResume } from "./resume.mjs";
 import { createMcpServer } from "./mcp-server.mjs";
 import { createMemory } from "./memory.mjs";
 import { createOrchestrator } from "./orchestrator.mjs";
@@ -1595,11 +1596,17 @@ const hermesHostExtra = {
     return { ok: true, profile };
   },
 };
+// Limit resume: agents resume on their own after a turn stops on a rate or
+// usage limit (resume.mjs). Its `_acp_limit_stop` / `_acp_limit_clear`
+// signals come from acp-proxy over attention.sock; failed Attention wakes
+// arrive through attention's wake-result hook.
+const resume = createLimitResume({ dataDir: DATA, runDir: RUN_DIR });
 const attention = createAttention({
   dataDir: DATA,
   runDir: RUN_DIR,
-  extra: [memory, orchestrator, hermesHostExtra],
+  extra: [memory, orchestrator, resume, hermesHostExtra],
 });
+attention.onWakeResult = (pubkey, wake, result) => resume.onWakeResult(pubkey, wake, result);
 const runnerManager = createRunnerManager({
   dataDir: DATA,
   runDir: RUN_DIR,
@@ -1627,6 +1634,7 @@ const watcher = createRelayWatcher({
 attention.onChange = (pubkey, record) => watcher.sync(pubkey, record);
 attention.relay = watcher;
 await attention.start();
+await resume.start();
 // Every agent session's MCP bridge talks to this one server on mcp.sock: the
 // memory, orchestrator and Attention handlers stay in buzz-host, so a session
 // costs the tiny C bridge instead of a Node process per session.
