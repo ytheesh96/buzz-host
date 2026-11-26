@@ -97,12 +97,12 @@ test("config helpers normalize drafts, recognize self-hosted agents, and fall ba
   assert.equal(storedToken(), "");
 
   // 1-paste invite URL parsing
-  assert.deepEqual(parseInviteInput("wss://omarchy.tail65c5a9.ts.net:8447"), {
-    url: "wss://omarchy.tail65c5a9.ts.net:8447",
+  assert.deepEqual(parseInviteInput("wss://buzz.example.ts.net:8447"), {
+    url: "wss://buzz.example.ts.net:8447",
     token: undefined,
   });
-  assert.deepEqual(parseInviteInput("wss://omarchy.tail65c5a9.ts.net/_buzz-host#token=bhg_abc123"), {
-    url: "wss://omarchy.tail65c5a9.ts.net/_buzz-host",
+  assert.deepEqual(parseInviteInput("wss://buzz.example.ts.net/_buzz-host#token=bhg_abc123"), {
+    url: "wss://buzz.example.ts.net/_buzz-host",
     token: "bhg_abc123",
   });
   assert.deepEqual(parseInviteInput("wss://example.com/_buzz-host#foo=bar"), {
@@ -630,7 +630,7 @@ test("public build mode scrubs private tailnet hostname from Remote Agents and V
   for (const dir of ["remote-agents", "viewport"]) {
     const bundle = fs.readFileSync(path.join(tmp, dir, "plugin.js"), "utf8");
     assert.ok(bundle.length > 1000, `${dir} bundle should be non-empty`);
-    assert.ok(!/tail65c5a9\.ts\.net/i.test(bundle), `${dir} public bundle must not contain private tailnet hostname`);
+    assert.ok(!/\.ts\.net/i.test(bundle), `${dir} public bundle must not contain private tailnet hostname`);
     assert.ok(bundle.includes('const DEFAULT_URL = ""'), `${dir} public bundle should scrub DEFAULT_URL to empty string`);
   }
 });

@@ -7,7 +7,7 @@ export const AGENT_HOSTS_KEY = "local.buzz-host.agent-hosts.v1";
 export const ACTIVE_MACHINE_KEY = "local.buzz-host.active-machine.v1";
 export const MACHINES_CHANGED_EVENT = "buzz-host:machines-changed";
 export const AGENT_HOSTS_CHANGED_EVENT = "buzz-host:agent-hosts-changed";
-export const DEFAULT_URL = "wss://omarchy.tail65c5a9.ts.net:8447";
+export const DEFAULT_URL = "";
 export const RUNTIMES = [
   { id: "claude", title: "Claude Code" },
   { id: "codex", title: "Codex" },

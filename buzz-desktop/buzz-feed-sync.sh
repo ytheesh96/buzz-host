@@ -13,7 +13,7 @@
 set -euo pipefail
 REPO=ytheesh96/buzz-app
 FEED="${BUZZ_FEED_DIR:-$HOME/.local/share/buzz-feed}"
-BASE="${BUZZ_FEED_URL:-https://omarchy.tail65c5a9.ts.net:8450}"
+BASE="${BUZZ_FEED_URL:-https://$(tailscale status --json | jq -r '.Self.DNSName | rtrimstr(".")'):8450}"
 GH="${GH:-$(command -v gh || ls "$HOME"/.local/share/mise/installs/gh/*/*/bin/gh | tail -1)}"
 KEEP=3
 

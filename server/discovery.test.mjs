@@ -306,7 +306,7 @@ test("routes: iroh-addr.json first, then the public wss URLs, deduplicated", asy
 
 test("machineName: config wins, else the hostname's first label", () => {
   assert.equal(machineName("  Studio  ", "box.local"), "Studio");
-  assert.equal(machineName(undefined, "Vaitheeshs-MacBook-Pro.local"), "Vaitheeshs-MacBook-Pro");
+  assert.equal(machineName(undefined, "Sams-MacBook-Pro.local"), "Sams-MacBook-Pro");
   assert.equal(machineName("", "omarchy"), "omarchy");
 });
 

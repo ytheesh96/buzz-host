@@ -51,7 +51,7 @@ async function publicGuestUrl() {
       return cfg.publicGuestUrl.trim();
     }
   } catch {}
-  return "wss://omarchy.tail65c5a9.ts.net/_buzz-host";
+  return "";
 }
 
 const [cmd, ...args] = process.argv.slice(2);
@@ -81,7 +81,7 @@ try {
       console.log("Full access to this host (all agents, desktops, guest tokens). Keep it like a password.");
       if (record.ownerPubkey) console.log(`Owner: ${record.ownerPubkey}`);
       console.log(`\nToken (shown once):      ${token}`);
-      console.log(`1-paste pairing URL:     ${pairingUrl}`);
+      console.log(`1-paste pairing URL:     ${pairingUrl || "(set publicGuestUrl in config.json or pass --url)"}`);
       console.log(`Revoke with:             buzz-host-tokens revoke ${record.id}`);
     }
   } else if (cmd === "create") {
@@ -117,7 +117,7 @@ try {
       if (record.ownerPubkey) console.log(`Bound owner: ${record.ownerPubkey}`);
       else console.log("Bound owner: (will bind automatically on first agent activation)");
       console.log(`\nToken (shown once):      ${token}`);
-      console.log(`1-paste invite URL:      ${inviteUrl}`);
+      console.log(`1-paste invite URL:      ${inviteUrl || "(set publicGuestUrl in config.json or pass --url)"}`);
     }
   } else if (cmd === "list") {
     const tokens = await store.list();

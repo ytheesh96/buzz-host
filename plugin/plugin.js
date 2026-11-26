@@ -8,7 +8,7 @@ const AGENT_HOSTS_KEY = "local.buzz-host.agent-hosts.v1";
 const ACTIVE_MACHINE_KEY = "local.buzz-host.active-machine.v1";
 const MACHINES_CHANGED_EVENT = "buzz-host:machines-changed";
 const AGENT_HOSTS_CHANGED_EVENT = "buzz-host:agent-hosts-changed";
-const DEFAULT_URL = "wss://omarchy.tail65c5a9.ts.net:8447";
+const DEFAULT_URL = "";
 const RUNTIMES = [
 	{
 		id: "claude",
@@ -146,9 +146,9 @@ const asConfig = (value) => {
 };
 function storedUrl() {
 	try {
-		return localStorage.getItem("local.buzz-host.url") || "wss://omarchy.tail65c5a9.ts.net:8447";
+		return localStorage.getItem("local.buzz-host.url") || "";
 	} catch {
-		return DEFAULT_URL;
+		return "";
 	}
 }
 function setStoredUrl(url) {

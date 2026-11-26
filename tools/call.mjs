@@ -1,5 +1,5 @@
 // Usage: node call.mjs <method> [json-params]   (talks to buzz-host over the tailnet)
-const url = process.env.BUZZ_HOST_URL ?? "wss://omarchy.tail65c5a9.ts.net:8447";
+const url = process.env.BUZZ_HOST_URL ?? "ws://127.0.0.1:8457";
 const [method, params = "{}"] = process.argv.slice(2);
 const ws = new WebSocket(url);
 const timer = setTimeout(() => { console.error("timeout"); process.exit(2); }, 120000);

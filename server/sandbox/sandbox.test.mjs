@@ -559,7 +559,7 @@ test("Docker sandbox config and args harden container and never leak host secret
     sandboxRunDir,
     pubkey: PUBKEY_A,
     meta: {
-      community: "wss://omarchy.tail65c5a9.ts.net",
+      community: "wss://buzz.example.ts.net",
       owner: OWNER,
       runtime: "hermes",
       model: "",
@@ -639,7 +639,7 @@ test("runnerManager prepares and cleans up a docker agent cleanly", async (t) =>
   const prepared = await mgr.prepareAgent(PUBKEY_A, {
     pubkey: PUBKEY_A,
     owner: OWNER,
-    community: "wss://omarchy.tail65c5a9.ts.net",
+    community: "wss://buzz.example.ts.net",
     runtime: "claude",
     model: "",
     concurrency: 2,

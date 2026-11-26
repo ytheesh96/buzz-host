@@ -212,7 +212,7 @@ function parseConfig(raw, file = CONFIG) {
     // zrok, any wss:// proxy). Ignores Tailscale-User-Login headers completely
     // and requires an access token (guest bhg_ or admin bha_).
     guestPort,
-    publicGuestUrl: raw.publicGuestUrl ?? "wss://omarchy.tail65c5a9.ts.net/_buzz-host",
+    publicGuestUrl: raw.publicGuestUrl ?? "",
     maxGuestDesktops: Number.isInteger(raw.maxGuestDesktops) && raw.maxGuestDesktops >= 0 ? raw.maxGuestDesktops : 1,
     guestDesktopIdleMs:
       Number.isFinite(raw.guestDesktopIdleMs) && raw.guestDesktopIdleMs >= 0

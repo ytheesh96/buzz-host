@@ -61,8 +61,8 @@ test("tokenStore creates hashed tokens, verifies, binds owner once, and revokes 
   await assert.rejects(() => store.bindOwner(record.id, OWNER_B), /already bound to another user/);
 
   // Invite URL places token strictly in fragment (never query string).
-  const invite = buildInviteUrl("wss://omarchy.tail65c5a9.ts.net/_buzz-host", token);
-  assert.equal(invite, `wss://omarchy.tail65c5a9.ts.net/_buzz-host#token=${token}`);
+  const invite = buildInviteUrl("wss://buzz.example.ts.net/_buzz-host", token);
+  assert.equal(invite, `wss://buzz.example.ts.net/_buzz-host#token=${token}`);
 
   // Revocation blocks future verification.
   const revoked = await store.revoke(record.id);

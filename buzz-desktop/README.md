@@ -11,11 +11,11 @@ Personal host scripts and systemd units for running and updating the patched Buz
 
 ## Tailnet feed mirror (transition / optional)
 
-Older installs (`1.0.6+2` and earlier from `buzz-pkg`) check `https://omarchy.tail65c5a9.ts.net:8450/latest.json`. `buzz-feed-sync.sh` mirrors the latest release from `ytheesh96/buzz-app` into `~/.local/share/buzz-feed`, served by `buzz-feed.service` behind `tailscale serve`. Once every machine has updated to `1.0.6+3`+, the mirror is optional.
+Older installs (`1.0.6+2` and earlier from `buzz-pkg`) check `https://<host>.<tailnet>.ts.net:8450/latest.json`. `buzz-feed-sync.sh` mirrors the latest release from `ytheesh96/buzz-app` into `~/.local/share/buzz-feed`, served by `buzz-feed.service` behind `tailscale serve`. Once every machine has updated to `1.0.6+3`+, the mirror is optional.
 
 ## Owner desktop (headless display :60)
 
-`owner-desktop.mjs` + `buzz-owner-desktop.service` run the patched Buzz AppImage in Xvnc + Xfce behind `tailscale serve` (`https://omarchy.tail65c5a9.ts.net:8448/`), reusing `~/.local/lib/buzz-host/desktop` and `~/.config/buzz-host/config.json` `allowLogins`.
+`owner-desktop.mjs` + `buzz-owner-desktop.service` run the patched Buzz AppImage in Xvnc + Xfce behind `tailscale serve` (`https://<host>.<tailnet>.ts.net:8448/`), reusing `~/.local/lib/buzz-host/desktop` and `~/.config/buzz-host/config.json` `allowLogins`.
 
 ## Fast local UI iteration
 

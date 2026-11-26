@@ -88,7 +88,7 @@ Live remote desktop preview, in-app Viewport page, and takeover controls for sel
 EOF
 
 # Privacy gate: never leak private hostnames, personal names, or personal pubkeys into the public mirror.
-if grep -rnEi 'tail65c5a9\.ts\.net|vaitheesh|ytheesh96/buzz-host|b9085cc5|9abc8b76|c9bad408|/home/ytheesh96' "$REMOTE_DEST" "$VIEWPORT_DEST"; then
+if grep -rnEi '\.ts\.net|vaitheesh|ytheesh96/buzz-host|b9085cc5|9abc8b76|c9bad408|/home/ytheesh96' "$REMOTE_DEST" "$VIEWPORT_DEST"; then
   echo "ERROR: Private host details detected in public plugin mirror!" >&2
   exit 1
 fi

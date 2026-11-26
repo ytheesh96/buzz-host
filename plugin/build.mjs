@@ -11,9 +11,10 @@
 //   - Hive Watch: plugins/hive-watch/src/index.js -> plugins/hive-watch/plugin.js
 //
 // Pass --check to verify all bundles match source without writing.
-// Pass --public --out-public <dir> to emit scrubbed public bundles (empty
-// DEFAULT_URL, no private tailnet hostname) for Remote Agents and Viewport into
-// <dir>/remote-agents/plugin.js and <dir>/viewport/plugin.js.
+// Pass --public --out-public <dir> to emit public bundles for Remote Agents and
+// Viewport into <dir>/remote-agents/plugin.js and <dir>/viewport/plugin.js. The
+// source has no default server URL; the build refuses any bundle naming a
+// tailnet (*.ts.net) host.
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -46,25 +47,6 @@ if (!rolldownDir) throw new Error("buzz-app has no rolldown; run pnpm install th
 const { build } = await import(
   pathToFileURL(path.join(pnpm, rolldownDir, "node_modules/rolldown/dist/index.mjs")).href
 );
-
-const publicPlugins = isPublic
-  ? [
-      {
-        name: "scrub-private-default-url",
-        transform(code, id) {
-          if (!id.endsWith(path.join("plugin", "src", "config.js"))) return null;
-          const replaced = code.replace(
-            /export const DEFAULT_URL = "[^"]*";/,
-            'export const DEFAULT_URL = "";',
-          );
-          if (replaced === code) {
-            throw new Error("scrub-private-default-url: could not find DEFAULT_URL in plugin/src/config.js");
-          }
-          return { code: replaced };
-        },
-      },
-    ]
-  : [];
 
 const allTargets = [
   {
@@ -117,7 +99,6 @@ for (const target of targets) {
     platform: "browser",
     treeshake: true,
     write: false,
-    plugins: publicPlugins,
     output: {
       format: "esm",
       codeSplitting: false,
@@ -130,7 +111,7 @@ for (const target of targets) {
   if (/\bfrom\s*["']\.?\.\//.test(code)) {
     throw new Error(`bundled ${target.name} (${path.relative(root, target.out)}) still contains relative imports`);
   }
-  if (isPublic && /tail65c5a9\.ts\.net/i.test(code)) {
+  if (isPublic && /\.ts\.net/i.test(code)) {
     throw new Error(`public bundle for ${target.name} still contains private tailnet hostname`);
   }
 

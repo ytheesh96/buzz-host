@@ -165,6 +165,14 @@ test("hostedModels caches per conversation and invalidates when session.state re
 
   const prevWS = globalThis.WebSocket;
   globalThis.WebSocket = FakeWebSocket;
+  // The plugin has no built-in server URL; configure one like a paired user would.
+  const prevStorage = globalThis.localStorage;
+  const store = new Map([["local.buzz-host.url", "wss://buzz.example.test:8447"]]);
+  globalThis.localStorage = {
+    getItem: (k) => (store.has(k) ? store.get(k) : null),
+    setItem: (k, v) => store.set(k, String(v)),
+    removeItem: (k) => store.delete(k),
+  };
   const cleanups = [];
   let registered;
   let tabSync;
@@ -233,5 +241,7 @@ test("hostedModels caches per conversation and invalidates when session.state re
   } finally {
     for (const fn of cleanups) fn?.();
     globalThis.WebSocket = prevWS;
+    if (prevStorage === undefined) delete globalThis.localStorage;
+    else globalThis.localStorage = prevStorage;
   }
 });
