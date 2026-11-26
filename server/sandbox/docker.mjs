@@ -5,7 +5,9 @@
 //     files remain owned cleanly without root escalation)
 //   - --cap-drop=ALL, --security-opt=no-new-privileges:true, --read-only rootfs
 //   - Resource bounds: --pids-limit, --memory, --cpus
-//   - Strictly isolated bind mounts: ONLY this agent's workspace, its isolated
+//   - Strictly isolated bind mounts: ONLY this agent's workspace (its own
+//     ~/buzz-agents/<pubkey>, or for a guest's owner-only agents the guest's
+//     shared ~/buzz-sandboxes/<tokenId>; docker-run validates which), its isolated
 //     sandbox-home, its per-agent /run/buzz-sandbox sockets/dirs, and read-only
 //     buzz-host runtime tools
 //   - Egress: own bridge network (buzzsbx0, no inter-container traffic) behind a

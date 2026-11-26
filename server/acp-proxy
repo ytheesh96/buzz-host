@@ -54,7 +54,9 @@
    additionalDirectories. Every runtime (Hermes too, whose session cwd keys its
    agent identity) gets Buzz's per-turn note naming the folders and, for a
    Canvas workspace, the Canvas. Laptop paths (/home/<user>/x, /Users/<user>/x)
-   map to ~/x here when that exists.
+   map to ~/x here when that exists. In a Docker sandbox every folder must be
+   inside /workspace (`~`, `~/x`, `/workspace/x` and laptop homes map there;
+   other paths, `..` and symlinks out of it are refused): sandbox_local_path.
 
 5. Memory: the first turn each session has in this process gets Buzz's memory
    guide and the agent's core memory (<core-memory>), as Buzz puts them in a
@@ -112,6 +114,9 @@ host_sock = os.environ.get("BUZZ_HOST_MCP_SOCK") or os.path.join(
     os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}",
     "buzz-host", "attention.sock")
 IS_SANDBOX = os.environ.get("BUZZ_HOST_SANDBOX") == "1"
+# A sandboxed agent's whole world of chat folders: its /workspace mount (a
+# guest's shared ~/buzz-sandboxes/<tokenId>, or its own ~/buzz-agents/<pubkey>).
+SANDBOX_ROOT = "/workspace"
 ADAPTER = os.path.basename(sys.argv[1]) if len(sys.argv) > 1 else ""
 ADAPTER_TO_RUNTIME = {
     "claude-agent-acp": "claude",
@@ -1147,10 +1152,80 @@ def apply_settings(sid, key, picks=None):
 
 # ---------- workspaces ----------
 
+def _in_sandbox(p):
+    return p == SANDBOX_ROOT or p.startswith(SANDBOX_ROOT.rstrip("/") + "/")
+
+
+def sandbox_virtual(given):
+    """A chat folder's name as a path under the sandbox's /workspace, lexically,
+    or None. `~` and `~/x`, `/workspace` and `/workspace/x`, and a laptop's
+    `/home/<user>/x` or `/Users/<user>/x` all mean /workspace(/x); any other
+    absolute path (/etc, /home/agent, /run/...), a relative path and any `..`
+    are refused."""
+    p = (given or "").strip()
+    if "\0" in p:
+        return None
+    if p == "~" or p.startswith("~/"):
+        rel = p[2:]
+    elif p == "/workspace" or p.startswith("/workspace/"):
+        rel = p[len("/workspace"):]
+    else:
+        m = re.match(r"^/(?:home|Users)/[^/]+/(.+)$", p)
+        if not m:
+            return None
+        rel = m.group(1)
+    parts = [part for part in rel.split("/") if part not in ("", ".")]
+    if ".." in parts:
+        return None
+    cand = os.path.normpath(os.path.join(SANDBOX_ROOT, *parts)) if parts else os.path.normpath(SANDBOX_ROOT)
+    return cand if _in_sandbox(cand) else None
+
+
+def sandbox_local_path(given):
+    """sandbox_virtual(), resolved: an existing directory whose real path
+    (after symlinks an agent may have planted) is inside /workspace, or None."""
+    cand = sandbox_virtual(given)
+    if not cand:
+        return None
+    real = os.path.realpath(cand)
+    if not _in_sandbox(real) or not os.path.isdir(real):
+        return None
+    return real
+
+
+def sandbox_worktree_dir(given):
+    """Where a chat's new worktrees go inside the sandbox; may not exist yet,
+    but its nearest existing ancestor must really be inside /workspace."""
+    cand = sandbox_virtual(given)
+    if not cand:
+        return None
+    if os.path.lexists(cand):
+        real = os.path.realpath(cand)
+        return real if _in_sandbox(real) and os.path.isdir(real) else None
+    probe = cand
+    while not os.path.lexists(probe):
+        up = os.path.dirname(probe)
+        if up == probe:
+            return None
+        probe = up
+    return cand if _in_sandbox(os.path.realpath(probe)) else None
+
+
+def workspace_home():
+    """Where chat folders live, as a reply names it ("on <host>" or "in this
+    agent's sandbox"), and what `~` means there."""
+    if IS_SANDBOX:
+        return "in this agent's sandbox", SANDBOX_ROOT
+    return f"on {socket.gethostname()}", os.path.expanduser("~")
+
+
 def local_path(given):
     """The directory on this server a chat's folder names, or None. `~` is
     this server's home; a laptop path under /home/<user>/ or /Users/<user>/
-    that is missing here maps to the same path under this server's home."""
+    that is missing here maps to the same path under this server's home.
+    In the sandbox, only folders inside /workspace (sandbox_local_path)."""
+    if IS_SANDBOX:
+        return sandbox_local_path(given)
     p = (given or "").strip()
     if p == "~" or p.startswith("~/"):
         cand = os.path.expanduser(p)
@@ -1198,9 +1273,8 @@ def canvas_workspace(channel, fresh=False):
 def chat_workspace(key, fresh=False):
     """{"source": "command"|"canvas"|None, "folders": [given...], "local":
     {given: dir or None}, "canvas": text or None, "worktree": {...} or None}.
-    A /workspace setting wins over the Canvas; `/workspace off` saves []."""
-    if IS_SANDBOX:
-        return {"source": None, "folders": [], "local": {}, "canvas": None, "worktree": None, "worktree_dir": None}
+    A /workspace setting wins over the Canvas; `/workspace off` saves [].
+    In the sandbox every folder resolves inside /workspace or not at all."""
     channel = (key or "").split("_", 1)[0]
     chosen = wanted_for(key, load_settings()).get("workspace") if settings_file else None
     ws = {"source": None, "folders": [], "canvas": None, "worktree": None}
@@ -1214,8 +1288,11 @@ def chat_workspace(key, fresh=False):
     ws["local"] = {f: local_path(f) for f in ws["folders"]}
     # Worktree mode: new worktrees go here, so it may not exist yet.
     loc = (ws["worktree"] or {}).get("location") or ""
-    ws["worktree_dir"] = local_path(loc) or (
-        os.path.normpath(os.path.expanduser(loc)) if loc == "~" or loc.startswith("~/") or os.path.isabs(loc) else None)
+    if IS_SANDBOX:
+        ws["worktree_dir"] = sandbox_worktree_dir(loc)
+    else:
+        ws["worktree_dir"] = local_path(loc) or (
+            os.path.normpath(os.path.expanduser(loc)) if loc == "~" or loc.startswith("~/") or os.path.isabs(loc) else None)
     return ws
 
 
@@ -1262,7 +1339,10 @@ def workspace_note(sid, key):
     if start:
         lines.append(f"This session started in `{start}`.")
     missing = [f for f in ws["folders"] if not ws["local"].get(f)]
-    if missing:
+    if missing and IS_SANDBOX:
+        lines.append("Not found in your sandbox (only folders inside `/workspace` are reachable here; "
+                     "tell the owner if you need them): " + ", ".join(f"`{f}`" for f in missing) + ".")
+    elif missing:
         lines.append("Not found on this server (you run on the owner's server, not their laptop; "
                      "tell the owner if you need them): " + ", ".join(f"`{f}`" for f in missing) + ".")
     if ws["source"] == "canvas":
@@ -1826,15 +1906,15 @@ def describe(sid, key):
 
 
 def describe_workspace(ws, where, start):
-    host, home = socket.gethostname(), os.path.expanduser("~")
+    host, home = workspace_home()
     if not ws["folders"]:
         return (f"Workspace for {where}: none, so the agent works in its own folder. Set one with "
-                f"`/workspace <path>...` (paths on {host}; `~` is `{home}`), or file the chat in a Buzz "
+                f"`/workspace <path>...` (paths {host}; `~` is `{home}`), or file the chat in a Buzz "
                 "workspace that has folders.")
     shown = []
     for f in ws["folders"]:
         d = ws["local"].get(f)
-        shown.append(f"`{f}`" + (f" → `{d}`" if d and d != f else "") + ("" if d else " (not found on this server)"))
+        shown.append(f"`{f}`" + (f" → `{d}`" if d and d != f else "") + ("" if d else f" (not found {host})"))
     text = (f"Workspace for {where} ({'from its Canvas' if ws['source'] == 'canvas' else 'set with /workspace'}): "
             + ", ".join(shown) + ".")
     if ws.get("worktree"):
@@ -1849,7 +1929,7 @@ def describe_workspace(ws, where, start):
 
 
 def set_workspace(args, key, where):
-    host, home = socket.gethostname(), os.path.expanduser("~")
+    host, home = workspace_home()
     word = args[0].lower()
     if word in ("default", "canvas"):
         update_settings(key, lambda entry: entry.pop("workspace", None))
@@ -1860,8 +1940,8 @@ def set_workspace(args, key, where):
     else:
         missing = [f for f in args if not local_path(f)]
         if missing:
-            return ("Not found on " + host + ": " + ", ".join(f"`{f}`" for f in missing)
-                    + f". Folders must exist on {host} (`~` is `{home}`). Nothing changed.")
+            return (f"Not found {host}: " + ", ".join(f"`{f}`" for f in missing)
+                    + f". Folders must exist {host} (`~` is `{home}`). Nothing changed.")
         update_settings(key, lambda entry: entry.__setitem__("workspace", list(args)))
         text = f"Workspace for {where}: " + ", ".join(
             f"`{f}`" + (f" → `{local_path(f)}`" if local_path(f) != f else "") for f in args) + "."

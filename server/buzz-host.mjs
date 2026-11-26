@@ -31,12 +31,22 @@ import { createOrchestrator } from "./orchestrator.mjs";
 import { createRelayWatcher } from "./attention-relay.mjs";
 import { createDiscoveryPublisher, loadMachineId } from "./discovery.mjs";
 import { catalogs, forComposer, formatTarget, parseTarget, resolveChatSettings, toModelList, toModels } from "./catalog.mjs";
+import {
+  createDirectory as createHostDirectory,
+  deletePath as deleteHostPath,
+  fsOptionsForSession,
+  listDirectory as listHostDirectory,
+  readFile as readHostFile,
+  renamePath as renameHostPath,
+  writeFile as writeHostFile,
+} from "./fs.mjs";
 import { proxyControl as routeControl } from "./control.mjs";
 import * as desktop from "./desktop/desktop.mjs";
 import { acquire as leaseAcquire, release as leaseRelease, publicView } from "./desktop/lease.mjs";
 import { acceptUpgrade, bridge as rfbBridge } from "./desktop/rfb-bridge.mjs";
 import { snapshot as desktopSnapshot } from "./desktop/snapshot.mjs";
 import {
+  agentWorkspaceDir,
   assertSandboxRestrictions,
   createRunnerManager,
   isSandboxed,
@@ -339,6 +349,13 @@ function checkInstructions(text) {
 // Single-quoted for bash `source`; values are validated, quoting is defense.
 const sq = (value) => `'${String(value).replaceAll("'", `'\\''`)}'`;
 
+/** The host folder mounted at a sandboxed agent's /workspace (and its sidecar
+ *  desktop's): a guest's shared ~/buzz-sandboxes/<tokenId> for that guest's
+ *  owner-only agents, else the agent's own ~/buzz-agents/<pubkey>. */
+const workspaceDirOf = (pubkey, m) => agentWorkspaceDir(pubkey, m, { homeDir: HOME, workDir: WORK });
+const sandboxDesktopOpts = (pubkey, m) =>
+  isSandboxed(m) ? { sandboxed: true, workspaceDir: workspaceDirOf(pubkey, m) } : { sandboxed: false };
+
 async function writeRuntimeEnv(pubkey, m) {
   const runtime = RUNTIMES[m.runtime];
   const sandboxed = isSandboxed(m);
@@ -359,6 +376,8 @@ async function writeRuntimeEnv(pubkey, m) {
   const concurrency = checkConcurrency(m.concurrency, DEFAULT_CONCURRENCY);
   const lines = {
     BUZZ_HOST_RUNNER: runner,
+    // docker-run mounts this at /workspace (and re-validates it).
+    BUZZ_SANDBOX_WORKSPACE_DIR: sandboxed ? workspaceDirOf(pubkey, { ...m, runner, respondTo }) : undefined,
     BUZZ_RELAY_URL: m.community,
     BUZZ_ACP_AGENT_OWNER: m.owner,
     BUZZ_ACP_AGENT_COMMAND: runtime.command,
@@ -613,6 +632,12 @@ const UNSERIALIZED = new Set([
   "session.state",
   "session.control",
   "interrupt",
+  "fs.list",
+  "fs.read",
+  "fs.write",
+  "fs.mkdir",
+  "fs.rename",
+  "fs.delete",
   "desktop.status",
   "desktop.view",
   "desktop.lease",
@@ -708,6 +733,11 @@ async function listAllMetas() {
   return out;
 }
 
+/** Where a session's fs.* calls may reach: an admin works in this host's
+ *  home; a guest only inside its token's shared sandbox folder (the one its
+ *  owner-only sandboxed agents see as /workspace), never anywhere else. */
+const fsOptionsFor = (session) => fsOptionsForSession(session, { homeDir: HOME });
+
 async function ownedMeta(pubkey, session) {
   checkPubkey(pubkey);
   const m = await meta(pubkey);
@@ -802,7 +832,10 @@ const methods = {
       // Host OS and what it can do, so clients hide what this host lacks.
       platform: process.platform,
       // sandboxDesktop: Docker agents can have a desktop (in a sidecar container).
-      capabilities: { desktop: DESKTOP_SUPPORTED, sandboxDesktop: DESKTOP_SUPPORTED },
+      // fs/fsWrite: remote file browsing, preview and editing (fs.*). Admins
+      // see this host's home; a guest sees only its shared sandbox folder
+      // (~/buzz-sandboxes/<tokenId>, shown as /workspace).
+      capabilities: { desktop: DESKTOP_SUPPORTED, sandboxDesktop: DESKTOP_SUPPORTED, fs: true, fsWrite: true },
       // Which access token this connection uses (never the secret).
       ...(session?.tokenId ? { tokenId: session.tokenId } : {}),
       ...(isGuest
@@ -992,6 +1025,23 @@ const methods = {
     if (m.activated) {
       await writeRuntimeEnv(pubkey, next);
       await services.restart(pubkey);
+      // A runner or respondTo change can move the agent's /workspace (e.g. a
+      // guest's owner-only agent shared with others gets its own folder): a
+      // running sidecar desktop restarts on the new mount.
+      const before = sandboxDesktopOpts(pubkey, m);
+      const after = sandboxDesktopOpts(pubkey, next);
+      if (
+        DESKTOP_SUPPORTED &&
+        (before.sandboxed !== after.sandboxed || before.workspaceDir !== after.workspaceDir) &&
+        desktop.status(pubkey).running
+      ) {
+        await desktop.stop(pubkey).catch(() => {});
+        if (next.desktop === true && after.sandboxed) {
+          await desktop.start(pubkey, after).catch((error) =>
+            console.error(`desktop restart ${pubkey.slice(0, 8)}: ${error.message}`),
+          );
+        }
+      }
     }
     return { status: await active(pubkey) };
   },
@@ -1190,7 +1240,7 @@ const methods = {
     if (m.desktop !== true) throw new Error("This agent has no desktop; turn it on first");
     assertGuestDesktop(session, m);
     await assertGuestDesktopCapacity(config, pubkey, m);
-    await desktop.start(pubkey, { sandboxed: isSandboxed(m) });
+    await desktop.start(pubkey, sandboxDesktopOpts(pubkey, m));
     touchDesktop(pubkey);
     return { enabled: true, ...desktopView(pubkey) };
   },
@@ -1230,7 +1280,7 @@ const methods = {
     if (m.desktop !== true) throw new Error("This agent has no desktop; turn it on first");
     assertGuestDesktop(session, m);
     await assertGuestDesktopCapacity(config, pubkey, m);
-    await desktop.start(pubkey, { sandboxed: isSandboxed(m) });
+    await desktop.start(pubkey, sandboxDesktopOpts(pubkey, m));
     touchDesktop(pubkey);
     const now = Date.now();
     for (const [t, v] of viewTickets) if (v.expires < now) viewTickets.delete(t);
@@ -1345,6 +1395,28 @@ const methods = {
     const record = await tokenStore.revoke(id);
     await dropTokenAccess(record);
     return { record };
+  },
+
+  // Remote files for Buzz Desktop (fs.mjs): admins work in this host's home,
+  // guests only inside their jailed sandbox folder (fsOptionsFor). All are
+  // unserialized: file work must never wait behind an agent turn.
+  async "fs.list"(_config, params, session) {
+    return listHostDirectory(params ?? {}, await fsOptionsFor(session));
+  },
+  async "fs.read"(_config, params, session) {
+    return readHostFile(params ?? {}, await fsOptionsFor(session));
+  },
+  async "fs.write"(_config, params, session) {
+    return writeHostFile(params ?? {}, await fsOptionsFor(session));
+  },
+  async "fs.mkdir"(_config, params, session) {
+    return createHostDirectory(params ?? {}, await fsOptionsFor(session));
+  },
+  async "fs.rename"(_config, params, session) {
+    return renameHostPath(params ?? {}, await fsOptionsFor(session));
+  },
+  async "fs.delete"(_config, params, session) {
+    return deleteHostPath(params ?? {}, await fsOptionsFor(session));
   },
 
   async remove(config, { pubkey }, session) {
@@ -1539,6 +1611,11 @@ const runnerManager = createRunnerManager({
   // Computer tools for a Docker agent's own sidecar desktop.
   isDesktopEnabled: async (pubkey) => DESKTOP_SUPPORTED && (await meta(pubkey).catch(() => ({}))).desktop === true,
   computerModule: () => import("./desktop/computer.mjs"),
+  // The sidecar desktop mounts the same /workspace as the agent's container.
+  workspaceDirFor: async (pubkey) => {
+    const m = await meta(pubkey).catch(() => null);
+    return m && isSandboxed(m) ? workspaceDirOf(pubkey, m) : undefined;
+  },
 });
 // Event watches: one relay connection per agent that has any, fed to Attention.
 const watcher = createRelayWatcher({

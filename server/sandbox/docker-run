@@ -8,7 +8,20 @@ pubkey="$1"
 
 agent_dir="$HOME/.local/share/buzz-host/agents/$pubkey"
 lib_dir="${BUZZ_HOST_LIB:-$HOME/.local/lib/buzz-host}"
-work_dir="$HOME/buzz-agents/$pubkey"
+# The agent's /workspace: its own ~/buzz-agents/<pubkey>, or (a guest's
+# owner-only agents, chosen by buzz-host in runtime.env) the guest's shared
+# ~/buzz-sandboxes/<tokenId>. Nothing else may be mounted there.
+default_work_dir="$HOME/buzz-agents/$pubkey"
+work_dir="${BUZZ_SANDBOX_WORKSPACE_DIR:-$default_work_dir}"
+if [[ "$work_dir" != "$default_work_dir" ]] && ! [[ "$work_dir" =~ ^"$HOME"/buzz-sandboxes/tok_[0-9a-f]{12}$ ]]; then
+  echo "BUZZ_SANDBOX_WORKSPACE_DIR must be $default_work_dir or $HOME/buzz-sandboxes/tok_<12 hex> (got '$work_dir')" >&2
+  exit 78
+fi
+if [[ "$work_dir" != "$default_work_dir" ]]; then
+  for p in "$work_dir" "$(dirname "$work_dir")"; do
+    if [[ -L "$p" ]]; then echo "refusing to mount a symlinked shared workspace ($p)" >&2; exit 78; fi
+  done
+fi
 run_root="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/buzz-host"
 prefix="${pubkey:0:16}"
 sandbox_run="$run_root/sandbox/$prefix"
@@ -43,7 +56,11 @@ bridge="$(docker network inspect -f '{{index .Options "com.docker.network.bridge
 [[ "$bridge" == "buzzsbx0" ]] || { echo "docker network $network must use bridge buzzsbx0 (got '$bridge')" >&2; exit 78; }
 
 mkdir -p -m 700 "$control_dir" "$agent_dir/fresh" "$agent_dir/wake/results" "$agent_dir/sandbox-home" "$sandbox_run/agent"
-mkdir -p "$work_dir"
+if [[ "$work_dir" == "$default_work_dir" ]]; then
+  mkdir -p "$work_dir"
+else
+  mkdir -p -m 700 "$(dirname "$work_dir")" "$work_dir"
+fi
 
 # Clean up any leftover container from an abrupt crash.
 docker rm -f "$cname" >/dev/null 2>&1 || true

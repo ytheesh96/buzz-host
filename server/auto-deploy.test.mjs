@@ -76,6 +76,7 @@ function makeFixture(t) {
     "orchestrator.mjs",
     "control.mjs",
     "file-lock.mjs",
+    "fs.mjs",
     "ws-security.mjs",
     "service-manager.mjs",
     "iroh-supervisor.mjs",

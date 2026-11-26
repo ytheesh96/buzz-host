@@ -12,9 +12,12 @@
 //   - buzz-host's desktop launcher and this entry script (ro)
 //   - the cua-driver release dir (ro)
 //   - a passwd/group naming this uid (dbus refuses to run without one)
-// Every path is mounted at its host path, so the env file, the browser
+//   - optionally the agent's workspace (rw) at /workspace, the same folder its
+//     agent container has there (~/buzz-sandboxes/<tokenId> for a guest's
+//     owner-only agents, else ~/buzz-agents/<pubkey>); ~/Workspace links to it
+// Every other path is mounted at its host path, so the env file, the browser
 // wrapper and launch_app paths mean the same on both sides. No agent key,
-// relay auth, workspace or credentials are mounted.
+// relay auth or credentials are mounted.
 
 import fs from "node:fs";
 import path from "node:path";
@@ -43,6 +46,7 @@ export function buildDesktopArgs({
   socketDir,
   launcherDir,
   cuaDriver,
+  workspaceDir,
   env = {},
   image = DEFAULT_DESKTOP_IMAGE,
   network = SANDBOX_NETWORK,
@@ -104,6 +108,11 @@ export function buildDesktopArgs({
     ...ro(path.dirname(ENTRY)),
     ...ro(path.dirname(cuaDriver)),
   ];
+  if (workspaceDir) {
+    if (!path.isAbsolute(workspaceDir) || /[:\r\n,]/.test(workspaceDir))
+      throw new Error("desktop sidecar: workspaceDir must be an absolute path without ':' or ','");
+    args.push("-v", `${path.resolve(workspaceDir)}:/workspace:rw`);
+  }
   for (const [k, v] of Object.entries(allEnv)) {
     if (v === undefined || v === null || v === "") continue;
     if (/[\r\n]/.test(String(v))) throw new Error(`desktop sidecar: ${k} has a newline`);
@@ -154,6 +163,24 @@ async function ensureNetwork() {
     throw new Error(`docker network ${SANDBOX_NETWORK} must use bridge ${SANDBOX_BRIDGE} (got '${bridge}')`);
 }
 
+/** ~/Workspace -> /workspace inside the container (dangling on the host side,
+ *  where nothing follows it). Never replaces a real file the user made. */
+function linkWorkspace(dir, withWorkspace) {
+  const link = path.join(dir, "home", "Workspace");
+  let current = null;
+  try {
+    current = fs.lstatSync(link);
+  } catch {}
+  if (current && !current.isSymbolicLink()) return;
+  if (!withWorkspace) {
+    if (current) fs.rmSync(link, { force: true });
+    return;
+  }
+  if (current && fs.readlinkSync(link) === "/workspace") return;
+  if (current) fs.rmSync(link, { force: true });
+  fs.symlinkSync("/workspace", link);
+}
+
 function writeIdentity(dir, uid, gid) {
   fs.mkdirSync(path.join(dir, "home"), { recursive: true, mode: 0o700 });
   fs.writeFileSync(
@@ -176,6 +203,7 @@ export async function run_(pubkey, opts) {
   const uid = process.getuid?.() ?? 1000;
   const gid = process.getgid?.() ?? 1000;
   writeIdentity(opts.dir, uid, gid);
+  linkWorkspace(opts.dir, Boolean(opts.workspaceDir));
   await remove(pubkey);
   await run("docker", buildDesktopArgs({ pubkey, uid, gid, ...opts }), { timeout: 60_000 });
   const { stdout } = await run("docker", ["inspect", "-f", "{{.State.Pid}}", containerName(pubkey)], {

@@ -52,6 +52,8 @@ export function createSandboxMcpBridge({
   isAttentionEnabled,
   isDesktopEnabled = null,
   computerModule = null,
+  // pubkey -> host dir mounted at the sidecar desktop's /workspace (optional).
+  workspaceDirFor = null,
   log = console,
 }) {
   /** pubkey -> { server, sockPath } */
@@ -66,8 +68,11 @@ export function createSandboxMcpBridge({
     let entry = computers.get(pubkey);
     if (!entry) {
       const mod = await computerModule();
+      const workspaceDir = workspaceDirFor ? await workspaceDirFor(pubkey) : undefined;
+      entry = computers.get(pubkey);
+      if (entry) return entry;
       entry = {
-        computer: mod.createComputer(pubkey, { sandboxed: true }),
+        computer: mod.createComputer(pubkey, { sandboxed: true, ...(workspaceDir ? { workspaceDir } : {}) }),
         instructions: mod.instructions(pubkey),
         names: null,
       };

@@ -12,7 +12,8 @@
 // outlives whoever started it; status() and stop() work from any process.
 //
 // Sandboxed (Docker) agents get the same desktop inside a sidecar container
-// instead (start(pubkey, { sandboxed: true }), see sandboxStart below): the
+// instead (start(pubkey, { sandboxed: true, workspaceDir }), see sandboxStart
+// below; the agent's workspace is mounted there at /workspace): the
 // launcher and cua-driver run there, and only the two sockets come out
 // through the bind-mounted socket dir, so the Viewport bridge, snapshots,
 // lease and computer tools on this side are unchanged.
@@ -342,15 +343,18 @@ async function startDriver(pubkey) {
 }
 
 /** Start (or reuse) the agent's desktop and its cua-driver. Idempotent.
- *  `sandboxed`: the agent runs in Docker, so its desktop does too. */
-export async function start(pubkey, { waitMs = 20_000, sandboxed = false } = {}) {
+ *  `sandboxed`: the agent runs in Docker, so its desktop does too.
+ *  `workspaceDir` (sandboxed only): the agent's workspace on this host,
+ *  mounted at the sidecar's /workspace; a running sidecar with another (or
+ *  no) workspace mount is restarted with this one. */
+export async function start(pubkey, { waitMs = 20_000, sandboxed = false, workspaceDir } = {}) {
   const dir = desktopDir(pubkey);
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   fs.mkdirSync(socketDir(pubkey), { recursive: true, mode: 0o700 });
   // A desktop left from the other kind of runner (the owner switched it) goes first.
   if (sidecar.isSidecar(dir) !== sandboxed && (status(pubkey).running || recordedPid(path.join(dir, "launcher.pid"))))
     await stop(pubkey);
-  if (sandboxed) return sandboxStart(pubkey, dir, { waitMs: Math.max(waitMs, 60_000) });
+  if (sandboxed) return sandboxStart(pubkey, dir, { waitMs: Math.max(waitMs, 60_000), workspaceDir });
   sidecar.clearMarker(dir);
   if (!status(pubkey).running) {
     await withAllocLock(async () => {
@@ -410,9 +414,13 @@ const SANDBOX_BROWSER = "/usr/bin/chromium";
 // Needs no display number, so no allocation lock (whose 30 s staleness rule
 // a container start could outlast); concurrent starts in this process share one.
 const sandboxStarting = new Map(); // pubkey -> promise
+// The workspace mount a running sidecar was started with ("" = none).
+const WORKSPACE_FILE = "workspace";
+export const sidecarWorkspace = (dir) => read(path.join(dir, WORKSPACE_FILE)) ?? "";
 function sandboxStart(pubkey, dir, opts) {
   const st = status(pubkey);
-  if (st.running && st.driver) return Promise.resolve(st);
+  const sameMount = opts.workspaceDir === undefined || sidecarWorkspace(dir) === (opts.workspaceDir ?? "");
+  if (st.running && st.driver && sameMount) return Promise.resolve(st);
   let p = sandboxStarting.get(pubkey);
   if (!p) {
     p = sandboxLaunch(pubkey, dir, opts).finally(() => sandboxStarting.delete(pubkey));
@@ -420,10 +428,13 @@ function sandboxStart(pubkey, dir, opts) {
   }
   return p;
 }
-async function sandboxLaunch(pubkey, dir, { waitMs }) {
+async function sandboxLaunch(pubkey, dir, { waitMs, workspaceDir }) {
   await sidecar.remove(pubkey);
   for (const f of ["launcher.pid", "cua.pid", path.join(dir, "env"), rfbSock(pubkey), cuaSock(pubkey)])
     fs.rmSync(path.isAbsolute(f) ? f : path.join(dir, f), { force: true });
+  // An unspecified workspace keeps the one the last launch used.
+  const mount = workspaceDir === undefined ? sidecarWorkspace(dir) : workspaceDir || "";
+  fs.writeFileSync(path.join(dir, WORKSPACE_FILE), mount, { mode: 0o600 });
   // Chromium's own sandbox needs user namespaces, which the container
   // (no capabilities, no-new-privileges) does not have; the container is
   // the sandbox here.
@@ -434,6 +445,7 @@ async function sandboxLaunch(pubkey, dir, { waitMs }) {
     socketDir: socketDir(pubkey),
     launcherDir: HERE,
     cuaDriver: CUA_DRIVER,
+    ...(mount ? { workspaceDir: mount } : {}),
     env: {
       HERMES_BD_PROFILE: `agent ${pubkey.slice(0, 8)}`,
       HERMES_BD_DISPLAY_NUM: "1",
@@ -472,7 +484,7 @@ export async function stop(pubkey) {
   const dir = desktopDir(pubkey);
   if (sidecar.isSidecar(dir)) {
     await sidecar.remove(pubkey);
-    for (const f of ["launcher.pid", "cua.pid", "env"]) fs.rmSync(path.join(dir, f), { force: true });
+    for (const f of ["launcher.pid", "cua.pid", "env", WORKSPACE_FILE]) fs.rmSync(path.join(dir, f), { force: true });
     for (const f of [rfbSock(pubkey), cuaSock(pubkey)]) fs.rmSync(f, { force: true });
     return status(pubkey);
   }

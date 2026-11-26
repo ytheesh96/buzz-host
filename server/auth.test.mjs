@@ -8,6 +8,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
+  ADMIN_ONLY_METHODS,
   assertAgentAccess,
   assertGuestDesktop,
   assertMethodAllowed,
@@ -632,4 +633,28 @@ test("buzz-host-tokens CLI creates admin tokens and lists roles", async (t) => {
   assert.equal(revoked.role, "admin");
   assert.ok(revoked.revokedAt);
   assert.match(runCli("list"), /admin  Laptop  \[REVOKED/);
+});
+
+test("fs.* RPCs need a signed-in session but are open to guests (jailed in buzz-host)", () => {
+  const admin = { authenticated: true, role: "admin" };
+  const guest = {
+    authenticated: true,
+    role: "guest",
+    tokenId: "tok_cccccccccccc",
+    ownerPubkey: OWNER_A,
+    limits: {
+      maxAgents: 2,
+      maxConcurrency: 2,
+      allowedRuntimes: ["hermes"],
+      allowHostDesktop: false,
+      allowSandboxDesktop: false,
+    },
+  };
+  for (const method of ["fs.list", "fs.read", "fs.write", "fs.mkdir", "fs.rename", "fs.delete"]) {
+    assert.ok(!ADMIN_ONLY_METHODS.has(method), method);
+    assert.doesNotThrow(() => assertMethodAllowed(admin, method));
+    assert.doesNotThrow(() => assertMethodAllowed(guest, method));
+    assert.throws(() => assertMethodAllowed({ authenticated: false, role: "guest" }, method), /Authentication required/);
+    assert.throws(() => assertMethodAllowed(undefined, method), /Authentication required/);
+  }
 });

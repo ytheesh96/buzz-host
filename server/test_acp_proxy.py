@@ -115,6 +115,94 @@ class Paths(Base):
             self.assertIsNone(lp(missing), missing)
 
 
+class SandboxWorkspace(Base):
+    """Inside the Docker sandbox, chat folders resolve inside /workspace only.
+    SANDBOX_ROOT stands in for the container's /workspace mount."""
+
+    def setUp(self):
+        super().setUp()
+        self.ws = os.path.join(self.home, "ws")
+        self.outside = os.path.join(self.home, "outside")
+        for d in ("ws/proj/src", "ws/lib", "outside/secret"):
+            os.makedirs(os.path.join(self.home, d))
+        os.symlink(self.outside, os.path.join(self.ws, "escape"))
+        os.symlink(os.path.join(self.outside, "secret"), os.path.join(self.ws, "proj", "deep-escape"))
+        os.symlink("proj", os.path.join(self.ws, "proj-link"))
+        os.symlink("/etc", os.path.join(self.ws, "etc-link"))
+        self.p.IS_SANDBOX = True
+        self.p.SANDBOX_ROOT = self.ws
+        self.proj = os.path.join(self.ws, "proj")
+
+    def test_virtual_mapping(self):
+        v = self.p.sandbox_virtual
+        for given in ("~", "~/", "/workspace", "/workspace/", " /workspace "):
+            self.assertEqual(v(given), self.ws, given)
+        self.assertEqual(v("~/proj"), self.proj)
+        self.assertEqual(v("/workspace/proj/src"), os.path.join(self.proj, "src"))
+        self.assertEqual(v("/home/anu/proj"), self.proj)
+        self.assertEqual(v("/Users/anu/proj/"), self.proj)
+        self.assertEqual(v("~/./proj"), self.proj)
+        for bad in ("/etc", "/etc/passwd", "/home/agent", "/home/anu", "/Users/anu", "/run/buzz-sandbox/agent",
+                    "/workspacefoo", "/opt/buzz-host", "proj", "", None, "~nobody/x", "~/..", "~/../x",
+                    "/workspace/..", "/workspace/proj/../../x", "/home/anu/../../etc", "~/a\0b"):
+            self.assertIsNone(v(bad), repr(bad))
+
+    def test_local_path_only_returns_existing_dirs_really_inside_workspace(self):
+        lp = self.p.local_path
+        self.assertEqual(lp("~"), self.ws)
+        self.assertEqual(lp("/workspace/proj"), self.proj)
+        self.assertEqual(lp("/home/yt/proj/src"), os.path.join(self.proj, "src"))
+        self.assertEqual(lp("~/proj-link"), self.proj, "a link inside /workspace resolves to its target")
+        for bad in ("~/escape", "~/escape/secret", "/workspace/proj/deep-escape", "~/etc-link", "~/missing",
+                    "~/proj/src/../../..", "/etc", self.outside, self.home, "/home/agent"):
+            self.assertIsNone(lp(bad), bad)
+        # Not even a host path that really exists outside the mount.
+        self.assertIsNone(lp(os.path.join(self.outside, "secret")))
+
+    def test_worktree_dir_may_not_exist_but_must_stay_inside(self):
+        wt = self.p.sandbox_worktree_dir
+        self.assertEqual(wt("~/.buzz/worktrees"), os.path.join(self.ws, ".buzz/worktrees"))
+        self.assertEqual(wt("/workspace/proj"), self.proj)
+        for bad in ("~/escape/new", "~/escape/a/b", "~/etc-link/x", "/tmp/worktrees", "~/../worktrees", ""):
+            self.assertIsNone(wt(bad), bad)
+        with open(os.path.join(self.ws, "file.txt"), "w") as f:
+            f.write("x")
+        self.assertIsNone(wt("~/file.txt"), "an existing non-directory is not a worktree location")
+
+    def test_chat_workspace_and_session_start_inside_the_sandbox(self):
+        self.canvas = {"folders": ["/home/yt/proj", "~/escape", "/etc"], "canvas": CANVAS,
+                       "worktree": {"location": "~/escape/wt", "baseBranch": "main"}}
+        ws = self.p.chat_workspace(CHANNEL, fresh=True)
+        self.assertEqual(ws["source"], "canvas")
+        self.assertEqual(ws["local"], {"/home/yt/proj": self.proj, "~/escape": None, "/etc": None})
+        self.assertIsNone(ws["worktree_dir"], "a worktree location through a link out is dropped")
+        params = self.new()
+        self.assertEqual(params["cwd"], self.proj)
+        self.assertNotIn(self.outside, json.dumps(params))
+        note = self.turn()[0]
+        self.assertIn(f"`{self.proj}`", note)
+        self.assertIn("Not found in your sandbox", note)
+        self.assertIn("`~/escape`", note)
+        self.assertNotIn(self.outside, note)
+
+    def test_workspace_command_uses_the_jailed_resolver(self):
+        run = lambda *args: self.p.run_command("workspace", list(args), "s1", CHANNEL, None)
+        out = run("~/proj", "/etc")
+        self.assertIn("Nothing changed", out)
+        self.assertIn("in this agent's sandbox", out)
+        self.assertIn(f"`~` is `{self.ws}`", out)
+        self.assertEqual(self.p.load_settings(), {})
+        for bad in ("~/escape", "/workspace/../outside", "/home/agent"):
+            self.assertIn("Nothing changed", run(bad), bad)
+        self.assertEqual(self.p.load_settings(), {})
+        run("/workspace/proj")
+        self.assertEqual(self.p.load_settings()[CHANNEL]["workspace"], ["/workspace/proj"])
+        self.assertIn(f"→ `{self.proj}`", run())
+        self.assertEqual(self.new(rid="n2", sid="s2")["cwd"], self.proj)
+        run("off")
+        self.assertIn("paths in this agent's sandbox", run())
+
+
 class Claude(Base):
     def test_session_starts_in_the_chat_folder(self):
         self.settings(["/home/yt/Work/app", "~/Work/lib"])

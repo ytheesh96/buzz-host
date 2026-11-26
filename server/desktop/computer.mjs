@@ -92,8 +92,9 @@ export const instructions = (pubkey) =>
   `{"launch_path":"${path.join(desktop.desktopDir(pubkey), "bin", "browser")}","urls":[...]}. If a call says a human has taken over, stop and tell your owner what you need.`;
 
 /** `sandboxed`: the agent runs in Docker, so its desktop runs in a sidecar
- *  container (desktop.mjs); this client still runs in buzz-host. */
-export function createComputer(pubkey, { chat, sandboxed = false } = {}) {
+ *  container (desktop.mjs); this client still runs in buzz-host.
+ *  `workspaceDir`: the agent's workspace, mounted at the sidecar's /workspace. */
+export function createComputer(pubkey, { chat, sandboxed = false, workspaceDir } = {}) {
   const dir = desktop.desktopDir(pubkey);
   let child = null;
   let starting = null;
@@ -115,7 +116,7 @@ export function createComputer(pubkey, { chat, sandboxed = false } = {}) {
   async function ensure() {
     if (child) return;
     starting ??= (async () => {
-      const st = await desktop.start(pubkey, { sandboxed });
+      const st = await desktop.start(pubkey, { sandboxed, ...(workspaceDir ? { workspaceDir } : {}) });
       const env = { ...desktop.baseEnv(), ...desktop.desktopEnv(dir), XDG_SESSION_TYPE: "x11" };
       const c = spawn(desktop.CUA_DRIVER, ["mcp", "--socket", st.cuaSocket], {
         env,

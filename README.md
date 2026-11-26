@@ -149,6 +149,18 @@ After changing the plugin: `systemctl --user reload hermes-gateway` while it is 
 
 - Deploy changes: `./deploy.sh`
 - Call the API: `node tools/call.mjs list` / `logs '{"pubkey":"…"}'`
+- Remote files: `fs.list`, `fs.read`, `fs.write`, `fs.mkdir`, `fs.rename` and `fs.delete`
+  back Buzz Desktop's remote folder picker, file preview and editor; `hello` reports
+  `capabilities.fs` and `capabilities.fsWrite`. Admin sessions work in this host's home.
+  A guest token is jailed to its own `~/buzz-sandboxes/<tokenId>/`, shown to it as
+  `/workspace` (no host path ever appears in replies or errors).
+- Guest sandbox home: a guest's sandboxed agents that answer only their owner
+  (`respondTo: owner-only`) share that same `~/buzz-sandboxes/<tokenId>/` as their
+  `/workspace` (and their sidecar desktop's `/workspace`, linked as `~/Workspace`), so the
+  guest and all their private agents work on one "computer". An agent that answers anyone
+  else (`allowlist`/`anyone`), and every admin-created agent, keeps its own
+  `~/buzz-agents/<pubkey>`. Chat workspace folders (`/workspace <path>` and Canvas folders)
+  work inside the sandbox too, limited to `/workspace`.
 - Agent logs on the server: `journalctl --user -u buzz-agent@<pubkey>` (macOS:
   `~/Library/Logs/buzz-host/agent-<pubkey>.log`, server in `server.log` there)
 - macOS hosts: `./deploy.sh --local` installs the `com.buzz-host.server`

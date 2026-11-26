@@ -26,6 +26,7 @@ import {
 } from "./docker.mjs";
 import { openshellRunner } from "./openshell.mjs";
 import { remove as removeDesktopSidecar } from "./desktop-sidecar.mjs";
+import { GUEST_TOKEN_ID, guestSandboxDir } from "../fs.mjs";
 
 const HEX64 = /^[0-9a-f]{64}$/;
 export const MAX_ALLOWLIST = 200;
@@ -105,6 +106,40 @@ export function isSandboxed(meta) {
   return Boolean(meta?.runner && meta.runner !== "host");
 }
 
+export { GUEST_TOKEN_ID, guestSandboxDir };
+
+/** The host folder an agent works in (mounted at /workspace for sandboxed
+ *  agents). Only a guest-created, sandboxed, owner-only agent shares its
+ *  guest's ~/buzz-sandboxes/<tokenId>; every other agent (host agents,
+ *  admin-created sandboxed agents, and any agent that answers other people —
+ *  allowlist/anyone) keeps its own ~/buzz-agents/<pubkey>, so outsiders who
+ *  talk to a shared agent never reach the guest's personal files. */
+export function agentWorkspaceDir(pubkey, meta, { homeDir = os.homedir(), workDir = path.join(homeDir, "buzz-agents") } = {}) {
+  if (!HEX64.test(pubkey ?? "")) throw new Error("Invalid agent pubkey");
+  let respondTo;
+  try {
+    respondTo = normalizeRespondTo(meta?.respondTo, "owner-only");
+  } catch {
+    respondTo = "invalid";
+  }
+  if (
+    isSandboxed(meta) &&
+    typeof meta?.createdByTokenId === "string" &&
+    GUEST_TOKEN_ID.test(meta.createdByTokenId) &&
+    respondTo === "owner-only"
+  ) {
+    return guestSandboxDir(meta.createdByTokenId, homeDir);
+  }
+  return path.join(workDir, pubkey);
+}
+
+/** Create an agent's workspace folder; the shared guest folder is private (0700). */
+export async function ensureAgentWorkspace(dir, { homeDir = os.homedir() } = {}) {
+  const shared = path.dirname(dir) === path.join(homeDir, "buzz-sandboxes");
+  await fs.mkdir(dir, { recursive: true, ...(shared ? { mode: 0o700 } : {}) });
+  return dir;
+}
+
 export function assertSandboxRestrictions(meta) {
   if (!isSandboxed(meta)) return;
   if (meta.orchestrate === true) {
@@ -123,11 +158,14 @@ export function createRunnerManager({
   isAttentionEnabled,
   isDesktopEnabled = null,
   computerModule = null,
+  // pubkey -> the agent's workspace dir, for its sidecar desktop's /workspace.
+  workspaceDirFor = null,
   log = console,
 }) {
   const proxy = createSandboxProxy({ dataDir, runDir, homeDir, log });
   const mcpBridge = createSandboxMcpBridge({
     runDir,
+    workspaceDirFor,
     callTool,
     isAttentionEnabled,
     isDesktopEnabled,
@@ -165,6 +203,7 @@ export function createRunnerManager({
     assertSandboxRestrictions(meta);
 
     const agentDir = path.join(dataDir, pubkey);
+    const workspaceDir = agentWorkspaceDir(pubkey, meta, { homeDir, workDir });
     const runSubdir = sandboxRunDir(pubkey);
     const controlDir = controlDirFor(pubkey);
     await Promise.all([
@@ -172,7 +211,7 @@ export function createRunnerManager({
       fs.mkdir(path.join(agentDir, "fresh"), { recursive: true, mode: 0o700 }),
       fs.mkdir(path.join(agentDir, "wake", "results"), { recursive: true, mode: 0o700 }),
       fs.mkdir(controlDir, { recursive: true, mode: 0o700 }),
-      fs.mkdir(path.join(workDir, pubkey), { recursive: true }),
+      ensureAgentWorkspace(workspaceDir, { homeDir }),
     ]);
 
     const [{ token }, _mcp, agyProjectId, useGeminiApiKey] = await Promise.all([
@@ -205,7 +244,7 @@ export function createRunnerManager({
       useGeminiApiKey,
     });
 
-    return { sandboxRunDir: runSubdir, controlDir, envFile, libDir };
+    return { sandboxRunDir: runSubdir, controlDir, envFile, libDir, workspaceDir };
   }
 
   /** Re-establish proxy and MCP Unix sockets on buzz-host startup for active sandboxed agents. */

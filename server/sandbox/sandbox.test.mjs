@@ -7,9 +7,13 @@ import { createConnection } from "node:net";
 import os from "node:os";
 import path from "node:path";
 
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import {
+  agentWorkspaceDir,
   assertSandboxRestrictions,
   createRunnerManager,
+  guestSandboxDir,
   isSandboxed,
   normalizeAllowlist,
   normalizeRespondTo,
@@ -17,7 +21,7 @@ import {
 } from "./index.mjs";
 import { createSandboxProxy, parseDotEnvValue } from "./proxy.mjs";
 import { createSandboxMcpBridge, isAllowedSandboxTool } from "./mcp-bridge.mjs";
-import { buildDesktopArgs, containerName as desktopContainerName } from "./desktop-sidecar.mjs";
+import { ENTRY as DESKTOP_ENTRY, buildDesktopArgs, containerName as desktopContainerName } from "./desktop-sidecar.mjs";
 import {
   SANDBOX_BRIDGE,
   SANDBOX_FIREWALL_UNIT,
@@ -480,7 +484,8 @@ test("desktop sidecar args: hardened, filtered network, only the desktop's own d
     uid: 1000,
     gid: 1000,
   });
-  const joined = args.join(" ");
+  // The entry script's dir is this checkout, wherever it lives (maybe under ~/buzz-agents).
+  const joined = args.join(" ").replaceAll(path.dirname(DESKTOP_ENTRY), "<entry>");
   assert.equal(args[args.indexOf("--name") + 1], desktopContainerName(PUBKEY_A));
   assert.notEqual(desktopContainerName(PUBKEY_A), containerName(PUBKEY_A));
   for (const flag of ["--cap-drop=ALL", "--security-opt=no-new-privileges:true", "--read-only", "--init"])
@@ -680,4 +685,145 @@ test("egress filter: nft table, systemd unit and docker-run agree on the bridge 
   assert.match(dockerRun, /systemctl is-active --quiet "\$firewall_unit"/);
   assert.match(unit, /ExecStart=\/usr\/bin\/nft -f \/etc\/buzz-host\/buzz-sandbox\.nft/);
   assert.match(unit, /Before=docker\.service/);
+});
+
+test("agentWorkspaceDir: only a guest's owner-only sandboxed agents share ~/buzz-sandboxes/<tokenId>", () => {
+  const homeDir = "/home/u";
+  const workDir = "/home/u/buzz-agents";
+  const opts = { homeDir, workDir };
+  const guest = { runner: "docker", respondTo: "owner-only", createdByTokenId: "tok_0123456789ab" };
+  const shared = "/home/u/buzz-sandboxes/tok_0123456789ab";
+  assert.equal(guestSandboxDir("tok_0123456789ab", homeDir), shared);
+  assert.equal(agentWorkspaceDir(PUBKEY_A, guest, opts), shared);
+  assert.equal(agentWorkspaceDir(PUBKEY_B, guest, opts), shared, "both of the guest's agents share one folder");
+  assert.equal(agentWorkspaceDir(PUBKEY_A, { ...guest, respondTo: undefined }, opts), shared, "owner-only is the default");
+  assert.equal(
+    agentWorkspaceDir(PUBKEY_A, { ...guest, createdByTokenId: "tok_ffffffffffff" }, opts),
+    "/home/u/buzz-sandboxes/tok_ffffffffffff",
+    "another guest gets its own folder",
+  );
+  // Everyone else keeps a per-agent folder, so outsiders never reach a guest's files.
+  const own = `${workDir}/${PUBKEY_A}`;
+  for (const m of [
+    { ...guest, respondTo: "allowlist", respondToAllowlist: [OWNER] },
+    { ...guest, respondTo: "anyone" },
+    { ...guest, respondTo: "bogus" },
+    { ...guest, runner: "host" },
+    { ...guest, runner: undefined },
+    { runner: "docker", respondTo: "owner-only" },
+    { ...guest, createdByTokenId: "tok_../../etc" },
+    { ...guest, createdByTokenId: "tok_0123456789AB" },
+    { ...guest, createdByTokenId: 42 },
+    {},
+  ]) {
+    assert.equal(agentWorkspaceDir(PUBKEY_A, m, opts), own, JSON.stringify(m));
+  }
+  assert.throws(() => agentWorkspaceDir("../x", guest, opts), /Invalid agent pubkey/);
+  assert.throws(() => guestSandboxDir("tok_../x", homeDir), /Invalid guest token id/);
+});
+
+test("runnerManager prepares a guest's owner-only agent in its shared 0700 sandbox folder", async (t) => {
+  const tmp = await makeTempDir("buzz-sandbox-shared-");
+  t.after(() => fs.rm(tmp, { recursive: true, force: true }));
+  const dataDir = path.join(tmp, "data");
+  const workDir = path.join(tmp, "work");
+  for (const pk of [PUBKEY_A, PUBKEY_B]) {
+    const agentDir = path.join(dataDir, pk);
+    await fs.mkdir(agentDir, { recursive: true });
+    await fs.writeFile(path.join(agentDir, "key"), "e".repeat(64) + "\n", { mode: 0o600 });
+    await fs.writeFile(path.join(agentDir, "auth.json"), JSON.stringify(["auth", OWNER, "", "0".repeat(128)]));
+  }
+  const mgr = createRunnerManager({
+    dataDir,
+    runDir: path.join(tmp, "run"),
+    workDir,
+    libDir: "/opt/lib",
+    homeDir: tmp,
+    callTool: async () => "ok",
+    isAttentionEnabled: async () => false,
+    log: { warn() {}, error() {} },
+  });
+  t.after(() => mgr.close());
+  const base = { owner: OWNER, community: "wss://relay.example", runtime: "claude", model: "", concurrency: 1, runner: "docker", hasInstructions: false };
+  const a = await mgr.prepareAgent(PUBKEY_A, { ...base, pubkey: PUBKEY_A, respondTo: "owner-only", createdByTokenId: "tok_0123456789ab" });
+  const b = await mgr.prepareAgent(PUBKEY_B, { ...base, pubkey: PUBKEY_B, respondTo: "anyone", respondToAllowlist: [], createdByTokenId: "tok_0123456789ab" });
+  const shared = path.join(tmp, "buzz-sandboxes", "tok_0123456789ab");
+  assert.equal(a.workspaceDir, shared);
+  assert.equal(b.workspaceDir, path.join(workDir, PUBKEY_B), "a shared (anyone) agent keeps its own folder");
+  assert.equal((await fs.stat(shared)).mode & 0o777, 0o700);
+  assert.equal((await fs.stat(path.join(tmp, "buzz-sandboxes"))).mode & 0o777, 0o700);
+  await fs.access(b.workspaceDir);
+  await mgr.cleanupAgent(PUBKEY_A);
+  await mgr.cleanupAgent(PUBKEY_B);
+  await fs.access(shared); // cleanup never deletes the guest's files
+});
+
+test("desktop sidecar mounts the agent's workspace at /workspace only when given one", () => {
+  const dir = `/home/u/.local/share/buzz-host/agents/${PUBKEY_A}/desktop`;
+  const base = {
+    pubkey: PUBKEY_A,
+    dir,
+    socketDir: `/run/user/1000/buzz-host/desktop/${PUBKEY_A.slice(0, 16)}`,
+    launcherDir: "/home/u/.local/lib/buzz-host/desktop",
+    cuaDriver: "/home/u/.local/share/buzz-host/tools/cua/cua-driver",
+    uid: 1000,
+    gid: 1000,
+  };
+  const mountsOf = (args) => args.flatMap((a, i) => (args[i - 1] === "-v" ? [a] : []));
+  assert.ok(!mountsOf(buildDesktopArgs(base)).some((m) => m.includes(":/workspace")));
+  const shared = buildDesktopArgs({ ...base, workspaceDir: "/home/u/buzz-sandboxes/tok_0123456789ab" });
+  const ws = mountsOf(shared).filter((m) => m.endsWith(":/workspace:rw"));
+  assert.deepEqual(ws, ["/home/u/buzz-sandboxes/tok_0123456789ab:/workspace:rw"]);
+  // Still hardened, and still nothing of the agent's identity or credentials.
+  for (const flag of ["--cap-drop=ALL", "--security-opt=no-new-privileges:true", "--read-only"]) assert.ok(shared.includes(flag));
+  assert.doesNotMatch(shared.join(" "), /sandbox\.env|\/key\b|auth\.json|proxy\.sock|docker\.sock/);
+  const own = buildDesktopArgs({ ...base, workspaceDir: `/home/u/buzz-agents/${PUBKEY_A}` });
+  assert.ok(own.includes(`/home/u/buzz-agents/${PUBKEY_A}:/workspace:rw`));
+  for (const bad of ["relative/dir", "/x:/etc", "/x,y", "/x\n"]) {
+    assert.throws(() => buildDesktopArgs({ ...base, workspaceDir: bad }), /workspaceDir/, bad);
+  }
+});
+
+test("docker-run accepts only the agent's own folder or a guest sandbox folder as /workspace", async (t) => {
+  const tmp = await makeTempDir("buzz-docker-run-");
+  t.after(() => fs.rm(tmp, { recursive: true, force: true }));
+  const here = path.dirname(new URL(import.meta.url).pathname);
+  const run = (workspace) =>
+    promisify(execFile)("bash", [path.join(here, "docker-run"), PUBKEY_A], {
+      env: {
+        PATH: process.env.PATH,
+        HOME: tmp,
+        XDG_RUNTIME_DIR: path.join(tmp, "run"),
+        ...(workspace === undefined ? {} : { BUZZ_SANDBOX_WORKSPACE_DIR: workspace }),
+      },
+    }).then(
+      () => ({ code: 0, stderr: "" }),
+      (error) => ({ code: error.code, stderr: error.stderr }),
+    );
+  // Accepted values get past the check and stop at the next one (no sandbox.env here).
+  for (const ok of [undefined, `${tmp}/buzz-agents/${PUBKEY_A}`, `${tmp}/buzz-sandboxes/tok_0123456789ab`]) {
+    const r = await run(ok);
+    assert.equal(r.code, 78, String(ok));
+    assert.match(r.stderr, /sandbox\.env missing/, String(ok));
+  }
+  for (const bad of [
+    "/etc",
+    `${tmp}`,
+    `${tmp}/buzz-agents/${PUBKEY_B}`,
+    `${tmp}/buzz-sandboxes/tok_0123456789ab/..`,
+    `${tmp}/buzz-sandboxes/tok_0123456789ab/sub`,
+    `${tmp}/buzz-sandboxes/tok_0123456789AB`,
+    `${tmp}/buzz-sandboxes/../.ssh`,
+    `/elsewhere/buzz-sandboxes/tok_0123456789ab`,
+  ]) {
+    const r = await run(bad);
+    assert.equal(r.code, 78, bad);
+    assert.match(r.stderr, /BUZZ_SANDBOX_WORKSPACE_DIR must be/, bad);
+  }
+  // A symlinked shared folder is refused too.
+  await fs.mkdir(path.join(tmp, "buzz-sandboxes"), { recursive: true });
+  await fs.symlink(path.join(tmp, ".ssh"), path.join(tmp, "buzz-sandboxes", "tok_aaaaaaaaaaaa"));
+  const linked = await run(`${tmp}/buzz-sandboxes/tok_aaaaaaaaaaaa`);
+  assert.equal(linked.code, 78);
+  assert.match(linked.stderr, /symlinked shared workspace/);
 });
