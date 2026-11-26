@@ -80,7 +80,7 @@ jobs:
             runner: ubuntu-24.04-arm
             container: rust:1-bookworm
           - target: darwin-arm64
-            runner: macos-14
+            runner: macos-15
             container: ""
     runs-on: ${{ matrix.runner }}
     container: ${{ matrix.container || null }}
