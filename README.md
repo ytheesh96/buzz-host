@@ -377,6 +377,86 @@ browser…, about 65), served through `desktop/computer.mjs`.
   Removing the agent stops its desktop.
 - Tests: `node --test server/desktop/` (lease, RFB filter, snapshot and per-chat activity).
 
+## Install on a new machine (bundle)
+
+Release bundles set up a machine with one command: no checkout, no `deploy.sh` run by hand, no
+Docker build of buzz-acp on the target.
+
+```sh
+curl -fsSL https://github.com/ytheesh96/buzz-host/releases/latest/download/install.sh | sh -s -- --up
+```
+
+The repo is private, so for now plain `curl` can't fetch Release assets. Use one of these instead:
+
+- With `GH_TOKEN` set, or an authenticated `gh`, install.sh fetches the assets itself:
+  `gh release download -R ytheesh96/buzz-host -p install.sh && sh install.sh --up`
+- Copy a bundle over and run `sh install.sh --bundle buzz-host-linux-arm64.tar.gz --up`. The
+  checksum comes from `<file>.sha256` or `SHA256SUMS` next to the file, or from `--sha256`.
+
+What the pieces do:
+
+- **Bundles** (`.github/workflows/release.yml`, on a `v*` tag): one `buzz-host-<target>.tar.gz`
+  per target (`linux-x64`, `linux-arm64`, `darwin-arm64`), plus `SHA256SUMS` and `install.sh`,
+  attached to the GitHub Release.
+  - Each bundle holds the files `deploy.sh --local` installs (`deploy.sh`, `server/`,
+    `hermes-plugin/`, `agy-plugin/`, minus tests), the `buzz-host` CLI (`bin/`, `cli/`) and a
+    pinned Node (`node/`, version and checksums in `bundle/node.env`).
+  - It also holds prebuilt `bin/buzz-acp`, `bin/buzz` (upstream block/buzz at
+    `bundle/UPSTREAM_REF` plus `patches/*.patch`), `bin/buzz-host-iroh` and
+    `bin/buzz-mcp-bridge`.
+  - Linux binaries are built on Debian 12 (glibc 2.36).
+  - To build one locally: `bundle/build-upstream.sh <bins>`, then
+    `bundle/make-bundle.sh --version … --target … --bins <bins> --out <dir>`.
+- **install.sh** checks the tarball and unpacks it into
+  `~/.local/share/buzz-host/runtime/<version>`. It then points `runtime/current` at that version,
+  keeps the version it replaced and deletes older ones, and links `~/.local/bin/buzz-host`.
+  - It needs only `curl` or `wget`, `tar` and `sha256sum` or `shasum`.
+  - `--up [args…]` runs `buzz-host up [args…]` afterwards.
+- **`buzz-host up`** is safe to re-run. It does these steps in order:
+  1. Writes `~/.config/buzz-host/config.json` if it's missing. A new config is token-only:
+     `guestPort` 8467, no `allowLogins`, and an empty `publicGuestUrl` so the host doesn't
+     advertise omarchy's URL. An existing config is kept; up only adds a missing `guestPort` and
+     an explicit `--url`.
+  2. Runs the bundle's `deploy.sh --local` without restarting anything, with
+     `BUZZ_HOST_NODE=<runtime>/current/node/bin/node`. It then copies the prebuilt binaries
+     whose bytes changed, keeping the old buzz-acp as `buzz-acp.prev`, and links `bin/node` to
+     the bundle's Node.
+  3. npm-installs the Claude and Codex ACP adapters if they're missing (`--no-adapters` skips
+     this).
+  4. Linux: enables lingering, runs `daemon-reload`, enables `buzz-host.service` and restarts
+     it. macOS: (re)bootstraps the `com.buzz-host.server` LaunchAgent. Either way, buzz-host
+     restarts only when files or config changed, then up waits for `/health`.
+  5. Prints the connection info.
+
+  Re-running up with the same bundle restarts nothing. A new bundle upgrades in place and
+  restarts buzz-host. Agent units (`buzz-agent@<pubkey>.service`) are never touched, so agents
+  keep running and pick up a new buzz-acp at their next restart. `--no-service` installs only
+  the files and config. `buzz-host up --help` lists every flag.
+- Host requirements: `bash`, `python3` (acp-proxy), systemd with a user manager (Linux) or a
+  logged-in user (macOS). Optional: a C compiler (otherwise the prebuilt MCP bridge is used),
+  Docker (sandboxed agents) and Tailscale (Funnel/Serve URLs).
+- omarchy keeps deploying from git (`deploy.sh`, auto-deploy). Without `BUZZ_HOST_NODE`,
+  `deploy.sh` behaves exactly as before.
+
+### `buzz-host up --json` (stable contract)
+
+`buzz-host up --json` prints exactly one JSON object on stdout. Logs go to stderr. The exit code
+is 0 on success and non-zero on error, with the message on stderr. The Buzz app's SSH machines
+(#46) read this object:
+
+```json
+{"version":"0.1.0","url":"ws://127.0.0.1:8467","token":"bha_…","pubkey":"5daa…02d8"}
+```
+
+| Field | Always | Meaning |
+|---|---|---|
+| `version` | yes | Bundle version (`VERSION`; `dev` in a git checkout) |
+| `url` | yes | Where clients connect: the config's `publicGuestUrl` (or `--url`) if set, else `ws://127.0.0.1:<guestPort>`, local to the host and meant to be reached through an SSH tunnel |
+| `token` | yes | An admin access token (`bha_…`) for the token listener (send it in the first `auth` call). Re-runs print the same token while it's live. It's kept in `~/.config/buzz-host/up-token.json` (0600). Revoke it with `buzz-host-tokens revoke <id>` and the next `up` mints a new one |
+| `pubkey` | no | The machine's iroh endpoint id, present once `buzz-host-iroh` is up |
+
+New fields may be added later. These four keep their names and meanings.
+
 ## Deploying & Auto-deploy
 
 - **Manual deploy:** `./deploy.sh [host]` (default `omarchy`, over SSH) or `./deploy.sh --local` directly on the server (atomic temp-file + `mv` installs, preserving unmanaged binaries like `bin/buzz-acp` and `npm/`).

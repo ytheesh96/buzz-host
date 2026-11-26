@@ -4,6 +4,9 @@
 #   ./deploy.sh [host]        Deploy over SSH (default: omarchy)
 #   ./deploy.sh --local       Deploy atomically to the local machine (no SSH;
 #                             systemd --user on Linux, a launchd LaunchAgent on macOS)
+# BUZZ_HOST_NODE=/path/to/node (--local only) runs buzz-host on that Node
+# instead of /usr/bin/node (Linux) or the PATH's node (macOS); `buzz-host up`
+# sets it to the bundle's pinned Node.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
@@ -75,7 +78,7 @@ install_launch_agent() {
   local label="com.buzz-host.server"
   local plist="$agents_dir/$label.plist"
   local node_bin runtime_dir
-  node_bin="$(command -v node || true)"
+  node_bin="${BUZZ_HOST_NODE:-$(command -v node || true)}"
   [ -n "$node_bin" ] || { echo "error: node not found on PATH" >&2; exit 1; }
   runtime_dir="${XDG_RUNTIME_DIR:-/tmp/bh-$(id -u)}"
   mkdir -p "$agents_dir" "$log_dir"
@@ -198,7 +201,16 @@ deploy_local() {
   done
 
   if [ "$os_name" != "Darwin" ]; then
-    atomic_copy "$SERVER_DIR/buzz-host.service" "$systemd_dir/buzz-host.service" 0644
+    if [ -n "${BUZZ_HOST_NODE:-}" ]; then
+      local unit_tmp
+      unit_tmp="$(mktemp "$systemd_dir/.buzz-host.service.src.XXXXXX")"
+      sed -e "s|^ExecStart=/usr/bin/node |ExecStart=$(printf '%s' "$BUZZ_HOST_NODE" | sed -e 's/[|&\\]/\\&/g') |" \
+        "$SERVER_DIR/buzz-host.service" > "$unit_tmp"
+      atomic_copy "$unit_tmp" "$systemd_dir/buzz-host.service" 0644
+      rm -f "$unit_tmp"
+    else
+      atomic_copy "$SERVER_DIR/buzz-host.service" "$systemd_dir/buzz-host.service" 0644
+    fi
     atomic_copy "$SERVER_DIR/buzz-agent@.service" "$systemd_dir/buzz-agent@.service" 0644
 
     # Refresh auto-deploy units only if already enabled/installed on this host.

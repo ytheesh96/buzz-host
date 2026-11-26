@@ -1,0 +1,223 @@
+# Portable buzz-host bundles: one tarball per target with the server files,
+# the patched buzz-acp + buzz CLI (upstream block/buzz at bundle/UPSTREAM_REF
+# plus patches/*.patch), buzz-host-iroh, the MCP bridge and a pinned Node.
+#
+# - Push a tag `v<semver>`: build, smoke-test and publish a GitHub Release
+#   with buzz-host-<target>.tar.gz, SHA256SUMS and install.sh.
+# - Run it by hand (workflow_dispatch), or open a PR that changes bundle
+#   inputs: build and smoke-test; bundles are kept as workflow artifacts.
+#   On a manual run, set `release_tag` to also publish a prerelease.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  # Build and smoke-test (never publish) PRs that change what goes into a bundle.
+  pull_request:
+    paths:
+      - ".github/workflows/release.yml"
+      - "bundle/**"
+      - "cli/**"
+      - "bin/**"
+      - "install.sh"
+      - "deploy.sh"
+      - "patches/**"
+      - "iroh-bridge/**"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Also publish a prerelease with this tag (e.g. v0.1.0-rc.1); empty = artifacts only"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}-${{ inputs.release_tag || 'build' }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "26.12.0"
+      - run: node --test server/ attention/ memory/ plugin/ cli/
+      - run: python3 -m unittest discover -s server -p 'test_*.py'
+
+  build:
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x64
+            runner: ubuntu-24.04
+            # Debian 12 (glibc 2.36): bundles run on older distros than the runner's.
+            container: rust:1-bookworm
+          - target: linux-arm64
+            runner: ubuntu-24.04-arm
+            container: rust:1-bookworm
+          - target: darwin-arm64
+            runner: macos-14
+            container: ""
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.container || null }}
+    env:
+      CARGO_TERM_COLOR: never
+      CARGO_PROFILE_RELEASE_STRIP: symbols
+    steps:
+      - uses: actions/checkout@v4
+
+      # The github.workspace / runner.temp contexts are host paths inside a container
+      # job, so everything lives under the workspace and paths come from
+      # $GITHUB_WORKSPACE at run time.
+      - name: Paths
+        shell: bash
+        run: |
+          {
+            echo "BUZZ_UPSTREAM_SRC=$GITHUB_WORKSPACE/.upstream/buzz"
+            echo "CARGO_TARGET_DIR=$GITHUB_WORKSPACE/.upstream/target"
+            echo "WORK=$GITHUB_WORKSPACE/.work"
+          } >> "$GITHUB_ENV"
+
+      - name: Version
+        id: version
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            v="${GITHUB_REF#refs/tags/v}"
+          elif [[ -n "${{ inputs.release_tag }}" ]]; then
+            v="${{ inputs.release_tag }}"; v="${v#v}"
+          else
+            v="0.0.0-dev.${GITHUB_RUN_NUMBER}"
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "buzz-host $v for ${{ matrix.target }}"
+
+      - name: Tools (container)
+        if: matrix.container != ''
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends xz-utils zstd >/dev/null
+          echo "/usr/local/cargo/bin" >> "$GITHUB_PATH"
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Cargo cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            /usr/local/cargo/registry
+            /usr/local/cargo/git
+            .upstream/target
+            iroh-bridge/target
+          key: cargo-${{ matrix.target }}-${{ hashFiles('bundle/UPSTREAM_REF', 'patches/*.patch', 'iroh-bridge/Cargo.lock') }}
+          restore-keys: cargo-${{ matrix.target }}-
+
+      - name: Build buzz-acp + buzz (upstream + patches)
+        shell: bash
+        run: bundle/build-upstream.sh "$WORK/bins"
+
+      - name: Build buzz-host-iroh
+        shell: bash
+        run: |
+          cd iroh-bridge
+          rustup toolchain install
+          CARGO_TARGET_DIR="$GITHUB_WORKSPACE/iroh-bridge/target" cargo build --release --locked
+          cd ..
+          install -m 0755 iroh-bridge/target/release/buzz-host-iroh "$WORK/bins/buzz-host-iroh"
+          "$WORK/bins/buzz-host-iroh" --help >/dev/null
+
+      - name: Build buzz-mcp-bridge
+        shell: bash
+        run: cc -O2 -Wall -Wextra -o "$WORK/bins/buzz-mcp-bridge" server/buzz-mcp-bridge.c
+
+      - name: Assemble bundle
+        shell: bash
+        run: |
+          bundle/make-bundle.sh --version "${{ steps.version.outputs.version }}" --target "${{ matrix.target }}" \
+            --bins "$WORK/bins" --out "$WORK/dist"
+          cat "$WORK/dist/"*.sha256
+
+      # Install the bundle into a throwaway HOME with install.sh, run
+      # `buzz-host up --no-service` twice (same token), then start the server
+      # by hand and check /health and an authenticated `hello`.
+      - name: Smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+          export HOME="$WORK/smoke-home" XDG_RUNTIME_DIR="$WORK/smoke-run"
+          mkdir -p "$HOME" "$XDG_RUNTIME_DIR" && chmod 700 "$XDG_RUNTIME_DIR"
+          sh install.sh --bundle "$WORK/dist/buzz-host-${{ matrix.target }}.tar.gz"
+          bh="$HOME/.local/bin/buzz-host"
+          "$bh" version
+          "$bh" up --no-service --no-adapters --guest-port 18467 --port 18457 --json > up1.json
+          "$bh" up --no-service --no-adapters --json > up2.json
+          cat up1.json; cmp up1.json up2.json
+          lib="$HOME/.local/lib/buzz-host"
+          "$lib/bin/buzz-acp" --help >/dev/null
+          "$lib/bin/buzz" --help >/dev/null
+          "$lib/bin/node" --version
+          PATH="$lib/bin:$PATH" "$lib/bin/node" "$lib/buzz-host.mjs" > server.log 2>&1 &
+          pid=$!
+          for i in $(seq 1 60); do curl -fsS http://127.0.0.1:18467/health && break; sleep 0.5; done
+          token="$("$lib/bin/node" -e 'console.log(JSON.parse(require("fs").readFileSync("up1.json")).token)')"
+          "$lib/bin/node" -e '
+            const ws = new WebSocket("ws://127.0.0.1:18467");
+            const t = setTimeout(() => { console.error("timeout"); process.exit(1); }, 15000);
+            let n = 0;
+            ws.onopen = () => ws.send(JSON.stringify({ id: 1, method: "auth", params: { token: process.argv[1] } }));
+            ws.onmessage = (e) => {
+              const m = JSON.parse(e.data);
+              if (m.error) { console.error(m.error); process.exit(1); }
+              if (++n === 1) return ws.send(JSON.stringify({ id: 2, method: "hello", params: {} }));
+              console.log("hello:", m.result.platform, m.result.role); clearTimeout(t); ws.close();
+            };' "$token"
+          kill "$pid"; wait "$pid" || true
+          cat server.log
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bundle-${{ matrix.target }}
+          path: .work/dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.release_tag != ''
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bundle-*
+          path: dist
+          merge-multiple: true
+      - name: SHA256SUMS
+        run: |
+          cd dist
+          cat *.tar.gz.sha256 > SHA256SUMS
+          sha256sum -c SHA256SUMS
+          rm *.tar.gz.sha256
+          cp ../install.sh .
+          cat SHA256SUMS
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ inputs.release_tag }}"
+          [ -n "$tag" ] || tag="${GITHUB_REF#refs/tags/}"
+          flags=()
+          if [[ -n "${{ inputs.release_tag }}" || "$tag" == *-* ]]; then flags+=(--prerelease); fi
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/* --clobber
+          else
+            gh release create "$tag" dist/* --target "$GITHUB_SHA" --title "buzz-host $tag" --generate-notes "${flags[@]}"
+          fi
