@@ -50,10 +50,11 @@ block/buzz desktop amd64 deb; adapters are npm packages in `~/.local/lib/buzz-ho
   Guest tokens (`bhg_…`) are scoped, sandboxed friend accounts. Admin tokens
   (`bha_…`) give the owner full access from devices that are not on the
   tailnet, behind server-only Tailscale Funnel, zrok or any `wss://` proxy:
-  `buzz-host-tokens create-admin --label "My laptop" [--url wss://…]` prints the
+  `buzz-host tokens create-admin --label "My laptop" [--url wss://…]` prints the
   token and a 1-paste `wss://…#token=bha_…` pairing URL once. Tokens are stored
-  only as SHA-256 hashes; `buzz-host-tokens list` shows each one's role, and
-  `buzz-host-tokens revoke <tok_…>` cuts its connections within about 15 seconds.
+  only as SHA-256 hashes; `buzz-host tokens list` shows each one's role, and
+  `buzz-host tokens revoke <tok_…>` cuts its connections within about 15 seconds.
+  (`buzz-host-tokens <command>` is a compatibility shim for the same code.)
 - `allowLogins` is optional. Leave it out (or empty) on a token-only host: the
   `Tailscale-User-Login` listener does not start at all.
 - Agents only answer their owner by default (`BUZZ_ACP_RESPOND_TO=owner-only`).
@@ -147,6 +148,7 @@ After changing the plugin: `systemctl --user reload hermes-gateway` while it is 
 
 ## Operating
 
+- Run and inspect it with the [`buzz-host` command](#the-buzz-host-command) (`status`, `logs`, `doctor`, `restart`…)
 - Deploy changes: `./deploy.sh`
 - Call the API: `node tools/call.mjs list` / `logs '{"pubkey":"…"}'`
 - Remote files: `fs.list`, `fs.read`, `fs.write`, `fs.mkdir`, `fs.rename` and `fs.delete`
@@ -161,7 +163,7 @@ After changing the plugin: `systemctl --user reload hermes-gateway` while it is 
   else (`allowlist`/`anyone`), and every admin-created agent, keeps its own
   `~/buzz-agents/<pubkey>`. Chat workspace folders (`/workspace <path>` and Canvas folders)
   work inside the sandbox too, limited to `/workspace`.
-- Agent logs on the server: `journalctl --user -u buzz-agent@<pubkey>` (macOS:
+- Agent logs on the server: `buzz-host logs [agent]`, i.e. `journalctl --user -u buzz-agent@<pubkey>` (macOS:
   `~/Library/Logs/buzz-host/agent-<pubkey>.log`, server in `server.log` there)
 - macOS hosts: `./deploy.sh --local` installs the `com.buzz-host.server`
   LaunchAgent instead of systemd units. Sockets live under `/tmp/bh-<uid>`
@@ -452,10 +454,40 @@ is 0 on success and non-zero on error, with the message on stderr. The Buzz app'
 |---|---|---|
 | `version` | yes | Bundle version (`VERSION`; `dev` in a git checkout) |
 | `url` | yes | Where clients connect: the config's `publicGuestUrl` (or `--url`) if set, else `ws://127.0.0.1:<guestPort>`, local to the host and meant to be reached through an SSH tunnel |
-| `token` | yes | An admin access token (`bha_…`) for the token listener (send it in the first `auth` call). Re-runs print the same token while it's live. It's kept in `~/.config/buzz-host/up-token.json` (0600). Revoke it with `buzz-host-tokens revoke <id>` and the next `up` mints a new one |
+| `token` | yes | An admin access token (`bha_…`) for the token listener (send it in the first `auth` call). Re-runs print the same token while it's live. It's kept in `~/.config/buzz-host/up-token.json` (0600). Revoke it with `buzz-host tokens revoke <id>` and the next `up` mints a new one |
 | `pubkey` | no | The machine's iroh endpoint id, present once `buzz-host-iroh` is up |
 
 New fields may be added later. These four keep their names and meanings.
+
+### The `buzz-host` command
+
+One command for day-to-day running, the same on systemd (`--user`) and launchd. In a bundle install
+it's `~/.local/bin/buzz-host`; in a checkout, `bin/buzz-host`. Every subcommand takes `--help`, and
+`--json` prints one JSON document on stdout (errors go to stderr, exit 1; a mistyped command line
+exits 2).
+
+| Command | What it does |
+|---|---|
+| `up` | Install/upgrade and start (above). Its `--json` contract is unchanged |
+| `status [--json]` | buzz-host's and every agent's unit state (`active`, `inactive`, `failed`…), listener `/health`, URL, iroh node id, version. Exit 0 when buzz-host is running, 3 when it isn't |
+| `down [agent] [--keep-agents]` | Stop buzz-host and all agents, or just one agent. Units stay installed: they start at the next login, `up` restarts buzz-host, `restart --agents` starts the agents |
+| `restart [agent] [--agents]` | Restart buzz-host and wait for `/health`; agents keep running unless `--agents`, or name one. Also starts a stopped unit |
+| `pair [--new] [--label …] [--url wss://…] [--qr]` | URL, admin token and the 1-paste pairing URL, plus the iroh node id, routes and discovery relays (PR #38). Prints the token `up` does (made if missing); `--new` mints a separate admin token for one device. `--qr` draws a QR code with `qrencode` when it's installed |
+| `tokens create \| create-admin \| list \| revoke` | The access-token commands, as in `buzz-host-tokens` |
+| `logs [agent] [-n 80] [-f]` | buzz-host's log, or one agent's: `journalctl --user` on Linux, `~/Library/Logs/buzz-host` on macOS |
+| `doctor` | Read-only checks: user service manager and linger, installed files, config, buzz-host and its ports, iroh, runtimes installed and signed in (Claude, Codex, Hermes, Antigravity), Python, Docker, tokens. Prints a fix for each problem; exit 1 if a check fails |
+
+An `agent` is a name (case-insensitive) or a pubkey prefix of 4+ hex digits. `status --json` looks like:
+
+```json
+{"version":"0.1.0","bundleId":"…","platform":"linux","url":"wss://…",
+ "server":{"unit":"buzz-host.service","state":"active","listeners":[{"role":"token","port":8467,"healthy":true}]},
+ "iroh":{"nodeId":"…"},
+ "agents":[{"pubkey":"…","name":"…","runtime":"claude","runner":"host","unit":"buzz-agent@….service","state":"active"}]}
+```
+
+Tests: `node --test cli/` (`cli/manage.test.mjs` covers each subcommand on both platforms against a
+temporary HOME with fake `systemctl`/`launchctl`).
 
 ## Deploying & Auto-deploy
 

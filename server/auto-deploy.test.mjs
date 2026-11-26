@@ -80,6 +80,7 @@ function makeFixture(t) {
     "ws-security.mjs",
     "service-manager.mjs",
     "iroh-supervisor.mjs",
+    "tokens-cli.mjs",
   ];
   for (const f of serverFiles) {
     const p = path.join(work, "server", f);
