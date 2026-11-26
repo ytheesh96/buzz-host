@@ -192,6 +192,35 @@ test("a settled entry with three stops behind it is given up, not resurrected", 
   assert.equal((await pending(resume))[key], undefined);
 });
 
+test("the tick settles a fired wake from its result file (channel-less path)", async () => {
+  const { resume, wakeDir, agentDir } = await setup();
+  const wake = { id: "att-ind-2", channel: "", root: "", prompt: "One-off: verify the deploy." };
+  await resume.onWakeResult(PK, wake, { outcome: "error", detail: "429 Too Many Requests" });
+  const key = "wake:att-ind-2";
+  await resume._test.fire(PK, key, (await pending(resume))[key]);
+  const fired = (await pending(resume))[key].fired;
+  const resultsDir = path.join(wakeDir, "results");
+  await fs.mkdir(resultsDir, { recursive: true });
+  await fs.writeFile(path.join(resultsDir, `${fired}.json`), JSON.stringify({ outcome: "ok", detail: "end_turn", finished_at: 1 }));
+  await resume._test.runTick();
+  assert.equal((await pending(resume))[key], undefined);
+});
+
+test("a fired wake whose result is another limit schedules the next attempt via the tick", async () => {
+  const { resume, wakeDir } = await setup();
+  await resume.call(PK, "_acp_limit_stop", { channel: CHANNEL, root: "", error: ERROR });
+  const key = `${CHANNEL}_`;
+  await resume._test.fire(PK, key, (await pending(resume))[key]);
+  const fired = (await pending(resume))[key].fired;
+  const resultsDir = path.join(wakeDir, "results");
+  await fs.mkdir(resultsDir, { recursive: true });
+  await fs.writeFile(path.join(resultsDir, `${fired}.json`), JSON.stringify({ outcome: "error", detail: ERROR, finished_at: 1 }));
+  await resume._test.runTick();
+  const entry = (await pending(resume))[key];
+  assert.equal(entry.attempts, 2, "stop count carries over");
+  assert.equal(entry.fired, "");
+});
+
 test("invalid chat scopes are refused", async () => {
   const { resume } = await setup();
   await assert.rejects(resume.call(PK, "_acp_limit_stop", { channel: "not-a-channel", root: "", error: ERROR }), /Invalid chat scope/);

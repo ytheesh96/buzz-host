@@ -250,6 +250,21 @@ export function createLimitResume({ dataDir, runDir, log = console }) {
     });
   }
 
+  /** Settles a fired entry from its wake's recorded outcome (written by
+   * buzz-acp next to the result Attention wakes use). Returns the outcome. */
+  async function settleFired(pubkey, key, entry) {
+    const file = path.join(agentDir(pubkey), "wake", "results", `${entry.fired}.json`);
+    let result;
+    try {
+      result = JSON.parse(await fs.readFile(file, "utf8"));
+      await fs.rm(file, { force: true });
+    } catch (error) {
+      if (error.code !== "ENOENT") log.warn(`limit-resume: ${pubkey.slice(0, 8)} result ${entry.fired}: ${error.message}`);
+      return null;
+    }
+    return result;
+  }
+
   async function tick() {
     const names = await fs.readdir(dataDir).catch(() => []);
     for (const pubkey of names.filter((name) => HEX64.test(name))) {
@@ -257,6 +272,32 @@ export function createLimitResume({ dataDir, runDir, log = console }) {
         const state = await loadState(pubkey);
         for (const [key, entry] of Object.entries(state.pending)) {
           if (entry.fired) {
+            const result = await settleFired(pubkey, key, entry);
+            if (result) {
+              const detail = String(result.detail ?? "").slice(0, MAX_ERROR_CHARS);
+              await mutate(pubkey, async (next) => {
+                if (!next.pending[key]?.fired) return;
+                delete next.pending[key];
+                await saveState(pubkey, next);
+              });
+              log.log(`limit-resume: ${pubkey.slice(0, 8)} ${key} settled by result (${result.outcome})`);
+              if (result.outcome === "error" && isLimitText(detail)) {
+                try {
+                  await schedule(pubkey, {
+                    channel: entry.channel || "",
+                    root: entry.root || "",
+                    origin: entry.origin || "chat",
+                    prompt: entry.prompt || "",
+                    wakeId: entry.wakeId || "",
+                    error: detail,
+                    after: entry.attempts ?? 0,
+                  });
+                } catch (error) {
+                  log.warn(`limit-resume: retry for ${pubkey.slice(0, 8)}: ${error.message}`);
+                }
+              }
+              continue;
+            }
             if (now() - entry.firedAt > STALE_FIRED_MS) {
               await mutate(pubkey, async (next) => {
                 delete next.pending[key];
@@ -360,6 +401,6 @@ export function createLimitResume({ dataDir, runDir, log = console }) {
     async state(pubkey) {
       return loadState(pubkey);
     },
-    _test: { fire, schedule, clear, entryKey, resumePrompt, loadState, saveState },
+    _test: { fire, schedule, clear, entryKey, resumePrompt, loadState, saveState, runTick: tick },
   };
 }
