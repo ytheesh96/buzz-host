@@ -1,27 +1,93 @@
-// Settings → Plugins → Remote Agents: server address, access token, connection check, and admin guest invites.
-import {
-  DEFAULT_URL,
-  parseInviteInput,
-  setStoredToken,
-  setStoredUrl,
-  storedToken,
-  storedUrl,
-} from "./config.js";
+// Settings → Plugins → Remote Agents: compact host status card and admin Shared access.
+import { activeMachine, storedMachines, storedUrl } from "./config.js";
 import { formatInviteMessage, sendInviteDm } from "./invite.js";
 
-export function createServerCard({ React, client, uiKit, Btn, relay }) {
+/** A short description of an invite's state for the Shared access list. */
+export function inviteState(t) {
+  if ((t.agentCount ?? 0) > 0) return "In use";
+  return t.ownerPubkey ? "Invited via Buzz DM" : "Not used yet";
+}
+
+export function inviteAccessLabel(t) {
+  if (t.allowHostDesktop) return "Trusted host access";
+  return t.allowSandboxDesktop === false ? "Sandboxed · no desktop" : "Sandboxed";
+}
+
+const RELAY_DISCONNECTED = { status: "disconnected" };
+
+export function createServerCard({ React, client, uiKit, Btn, relay, navigation }) {
   const { h, Row, Text, Note } = uiKit;
 
-  function GuestInvites({ publicGuestUrl }) {
+  const rowBox = {
+    display: "flex",
+    justifyContent: "space-between",
+    alignItems: "center",
+    gap: "var(--space-2)",
+    padding: "var(--space-2) var(--space-3)",
+    borderRadius: "var(--radius-control)",
+    border: "1px solid var(--border-standard)",
+  };
+  const panelBox = {
+    display: "grid",
+    gap: "var(--space-3)",
+    padding: "var(--space-3)",
+    borderRadius: "var(--radius-control)",
+    background: "var(--surface-inset)",
+    border: "1px solid var(--border-standard)",
+  };
+  const Button = ({ variant, ...props }) =>
+    Btn
+      ? h(Btn, { variant, ...props })
+      : h("button", { type: "button", ...props });
+
+  const openMachines = () =>
+    navigation?.open?.({
+      version: 1,
+      kind: "settings",
+      section: "agents",
+      provider: "local.buzz-host/omarchy",
+    });
+
+  function Check({ checked, disabled, onChange, title, hint }) {
+    return h(
+      "label",
+      {
+        style: {
+          display: "flex",
+          gap: "var(--space-2)",
+          alignItems: "flex-start",
+          cursor: disabled ? "default" : "pointer",
+        },
+      },
+      h("input", {
+        type: "checkbox",
+        checked,
+        disabled,
+        onChange: (e) => onChange(e.target.checked),
+        style: { marginTop: "3px" },
+      }),
+      h(
+        "div",
+        { style: { display: "grid", gap: "2px" } },
+        h("span", { style: { fontWeight: 500 } }, title),
+        hint && h(Note, null, hint),
+      ),
+    );
+  }
+
+  function SharedAccess({ publicGuestUrl }) {
     const relaySnap = React.useSyncExternalStore(
       (onStoreChange) => (relay?.subscribe ? relay.subscribe(onStoreChange) : () => {}),
-      () => relay?.snapshot?.() ?? { status: "disconnected" },
+      () => relay?.snapshot?.() ?? RELAY_DISCONNECTED,
     );
     const session = relaySnap?.status === "ready" ? relaySnap.session : undefined;
     const dmAvailable = Boolean(session?.directMessages?.available && session?.messages?.send);
 
     const [tokens, setTokens] = React.useState([]);
     const [loading, setLoading] = React.useState(true);
+    const [composing, setComposing] = React.useState(false);
+    const [linkMode, setLinkMode] = React.useState(false);
+    const [showRevoked, setShowRevoked] = React.useState(false);
     const [memberQuery, setMemberQuery] = React.useState("");
     const [members, setMembers] = React.useState([]);
     const [searchingMembers, setSearchingMembers] = React.useState(false);
@@ -54,9 +120,10 @@ export function createServerCard({ React, client, uiKit, Btn, relay }) {
       void refresh();
     }, []);
 
-    // Load/search human community members for 1-click DM invites.
+    // Load/search human community members only while the Buzz-member picker is open.
+    const pickingMember = composing && !linkMode && dmAvailable;
     React.useEffect(() => {
-      if (!dmAvailable || !session?.directMessages?.people) {
+      if (!pickingMember || !session?.directMessages?.people) {
         setMembers([]);
         return undefined;
       }
@@ -81,28 +148,42 @@ export function createServerCard({ React, client, uiKit, Btn, relay }) {
         clearTimeout(timer);
         controller.abort();
       };
-    }, [dmAvailable, session, memberQuery]);
+    }, [pickingMember, session, memberQuery]);
+
+    const memberName = (p) => p.name || p.username || p.pubkey.slice(0, 8);
 
     const selectMember = (person) => {
       setSelectedMember(person);
-      setLabel(person.name || person.username || person.pubkey.slice(0, 8));
+      setLabel(memberName(person));
       setOwnerPubkey(person.pubkey);
       setError("");
     };
 
     const clearMember = () => {
       setSelectedMember(null);
+      setLabel("");
       setOwnerPubkey("");
+    };
+
+    const closeComposer = () => {
+      setComposing(false);
+      setLinkMode(false);
+      setSelectedMember(null);
+      setMemberQuery("");
+      setLabel("");
+      setOwnerPubkey("");
+      setAllowHostDesktop(false);
+      setError("");
     };
 
     const createInvite = async ({ sendDm = false } = {}) => {
       const cleanLabel = label.trim();
       if (!cleanLabel) {
-        setError("Enter a friend's name or pick a Buzz member first.");
+        setError(sendDm ? "Pick a Buzz member first." : "Enter your friend's name first.");
         return;
       }
       if (sendDm && !selectedMember?.pubkey) {
-        setError("Pick a Buzz member first to send an in-app invite.");
+        setError("Pick a Buzz member first.");
         return;
       }
       if (sendDm && !publicGuestUrl) {
@@ -115,7 +196,7 @@ export function createServerCard({ React, client, uiKit, Btn, relay }) {
       setDmSentTo("");
       setCopied(false);
       try {
-        const cleanPubkey = (selectedMember?.pubkey || ownerPubkey).trim();
+        const cleanPubkey = (sendDm ? selectedMember.pubkey : ownerPubkey).trim();
         const res = await client.call("tokens.create", {
           label: cleanLabel,
           ...(cleanPubkey ? { ownerPubkey: cleanPubkey } : {}),
@@ -125,6 +206,7 @@ export function createServerCard({ React, client, uiKit, Btn, relay }) {
           allowSandboxDesktop,
         });
         setCreated(res);
+        let dmError = "";
         if (sendDm && session) {
           const inviteMsg = formatInviteMessage({
             url: publicGuestUrl,
@@ -136,20 +218,15 @@ export function createServerCard({ React, client, uiKit, Btn, relay }) {
           const timeout = setTimeout(() => controller.abort(), 20000);
           try {
             await sendInviteDm(session, selectedMember.pubkey, inviteMsg, controller.signal);
-            setDmSentTo(selectedMember.name || selectedMember.username || cleanLabel);
+            setDmSentTo(memberName(selectedMember));
           } catch (dmErr) {
-            setError(
-              `Invite token was created, but DM delivery failed (${String(dmErr?.message ?? dmErr)}). Copy the invite link below to share manually.`,
-            );
+            dmError = `The invite was created, but sending it failed (${String(dmErr?.message ?? dmErr)}). Copy the link below to share it yourself.`;
           } finally {
             clearTimeout(timeout);
           }
         }
-        setLabel("");
-        setOwnerPubkey("");
-        setSelectedMember(null);
-        setMemberQuery("");
-        setAllowHostDesktop(false);
+        closeComposer();
+        if (dmError) setError(dmError);
         await refresh();
       } catch (e) {
         setError(String(e.message ?? e));
@@ -181,8 +258,218 @@ export function createServerCard({ React, client, uiKit, Btn, relay }) {
       }
     };
 
-    const activeTokens = tokens.filter((t) => !t.revokedAt);
-    const revokedTokens = tokens.filter((t) => t.revokedAt);
+    // Admin access tokens are connection details, not shared access.
+    const guestTokens = tokens.filter((t) => t.role !== "admin");
+    const activeTokens = guestTokens.filter((t) => !t.revokedAt);
+    const revokedTokens = guestTokens.filter((t) => t.revokedAt);
+
+    const limits = h(
+      "details",
+      null,
+      h("summary", { style: { cursor: "pointer" } }, "Limits & permissions"),
+      h(
+        "div",
+        { style: { display: "grid", gap: "var(--space-3)", paddingTop: "var(--space-3)" } },
+        h(
+          "div",
+          { style: { display: "grid", gap: "var(--space-2)", gridTemplateColumns: "minmax(0, 1fr) minmax(0, 1fr)" } },
+          h(
+            Row,
+            { label: "Max agents" },
+            h(Text, {
+              type: "number",
+              min: 1,
+              max: 20,
+              value: maxAgents,
+              disabled: busy,
+              onChange: (e) => setMaxAgents(e.target.value),
+            }),
+          ),
+          h(
+            Row,
+            { label: "Max parallel chats" },
+            h(Text, {
+              type: "number",
+              min: 1,
+              max: 8,
+              value: maxConcurrency,
+              disabled: busy,
+              onChange: (e) => setMaxConcurrency(e.target.value),
+            }),
+          ),
+        ),
+        h(Check, {
+          checked: allowSandboxDesktop,
+          disabled: busy,
+          onChange: setAllowSandboxDesktop,
+          title: "Allow a sandboxed desktop",
+          hint: "Their agents can have their own desktop in a separate container with internet only. Uses about 2 GB of RAM per running desktop.",
+        }),
+        h(Check, {
+          checked: allowHostDesktop,
+          disabled: busy,
+          onChange: setAllowHostDesktop,
+          title: "Allow host access & remote desktop (trusted)",
+          hint: "Only for people you trust on this machine. Lets them run agents on the host as you.",
+        }),
+        linkMode &&
+          h(
+            Row,
+            {
+              label: "Nostr public key (optional)",
+              hint: "Lock the link to one Buzz account. Leave blank to lock it to whoever connects first.",
+            },
+            h(Text, {
+              value: ownerPubkey,
+              disabled: busy,
+              placeholder: "Only if you know it",
+              onChange: (e) => setOwnerPubkey(e.target.value),
+            }),
+          ),
+      ),
+    );
+
+    const memberPicker = selectedMember
+      ? h(
+          "div",
+          { style: rowBox },
+          h(
+            "div",
+            { style: { display: "grid", gap: "2px", minWidth: 0 } },
+            h("strong", null, memberName(selectedMember)),
+            selectedMember.username && h(Note, null, `@${selectedMember.username}`),
+          ),
+          h(Button, { disabled: busy, onClick: clearMember }, "Change"),
+        )
+      : h(
+          "div",
+          { style: { display: "grid", gap: "var(--space-2)" } },
+          h(Text, {
+            value: memberQuery,
+            disabled: busy,
+            "aria-label": "Search Buzz members",
+            placeholder: "Search Buzz members…",
+            onChange: (e) => setMemberQuery(e.target.value),
+          }),
+          searchingMembers
+            ? h(Note, null, "Searching…")
+            : members.length === 0
+              ? h(Note, null, memberQuery.trim() ? "No matching members found." : "No other members loaded yet.")
+              : h(
+                  "div",
+                  {
+                    style: {
+                      display: "flex",
+                      flexWrap: "wrap",
+                      gap: "var(--space-1, 6px)",
+                      maxHeight: "120px",
+                      overflowY: "auto",
+                    },
+                  },
+                  ...members.slice(0, 12).map((person) =>
+                    h(
+                      "button",
+                      {
+                        key: person.pubkey,
+                        type: "button",
+                        disabled: busy,
+                        onClick: () => selectMember(person),
+                        style: {
+                          display: "inline-flex",
+                          alignItems: "center",
+                          gap: "6px",
+                          padding: "4px 10px",
+                          borderRadius: "999px",
+                          border: "1px solid var(--border-standard)",
+                          background: "var(--surface-panel, transparent)",
+                          color: "var(--text-standard)",
+                          cursor: busy ? "default" : "pointer",
+                          font: "inherit",
+                          fontSize: "0.85rem",
+                        },
+                      },
+                      memberName(person),
+                      person.username && person.name && person.username !== person.name
+                        ? h("span", { className: "text-secondary" }, `@${person.username}`)
+                        : null,
+                    ),
+                  ),
+                ),
+        );
+
+    const composer =
+      composing &&
+      h(
+        "div",
+        { role: "group", "aria-label": "Invite a friend", style: panelBox },
+        linkMode || !dmAvailable
+          ? h(
+              Row,
+              { label: "Friend's name", hint: "Shown in your invite list." },
+              h(Text, {
+                value: label,
+                disabled: busy,
+                placeholder: "Alex",
+                onChange: (e) => setLabel(e.target.value),
+              }),
+            )
+          : h(
+              Row,
+              {
+                label: "Who are you inviting?",
+                hint: "They get an Accept & Connect prompt in Buzz. Their agents run in a Docker sandbox.",
+              },
+              memberPicker,
+            ),
+        limits,
+        error && h(Note, { tone: "error" }, error),
+        h(
+          "div",
+          { style: { display: "flex", gap: "var(--space-2)", flexWrap: "wrap", alignItems: "center" } },
+          linkMode || !dmAvailable
+            ? h(
+                Button,
+                {
+                  variant: "primary",
+                  disabled: busy || !label.trim(),
+                  onClick: () => void createInvite({ sendDm: false }),
+                },
+                busy ? "Creating…" : "Create link",
+              )
+            : h(
+                Button,
+                {
+                  variant: "primary",
+                  disabled: busy || !selectedMember,
+                  onClick: () => void createInvite({ sendDm: true }),
+                },
+                busy ? "Sending…" : "Send Invite",
+              ),
+          h(Button, { disabled: busy, onClick: closeComposer }, "Cancel"),
+          dmAvailable &&
+            h(
+              "button",
+              {
+                type: "button",
+                disabled: busy,
+                onClick: () => {
+                  setLinkMode((v) => !v);
+                  setError("");
+                },
+                style: {
+                  background: "none",
+                  border: "none",
+                  padding: 0,
+                  color: "var(--text-secondary)",
+                  textDecoration: "underline",
+                  cursor: "pointer",
+                  font: "inherit",
+                },
+              },
+              linkMode ? "Send in Buzz instead" : "Create a shareable link instead",
+            ),
+        ),
+      );
 
     return h(
       "div",
@@ -194,277 +481,34 @@ export function createServerCard({ React, client, uiKit, Btn, relay }) {
           borderTop: "1px solid var(--border-standard)",
         },
       },
-      h("strong", null, "Guest invites (friends)"),
-      h(
-        Note,
-        null,
-        `Send a one-click Buzz invite or create a personal invite link so a friend can host sandboxed agents on this server.${
-          publicGuestUrl ? ` Guest endpoint: ${publicGuestUrl}` : ""
-        }`,
-      ),
-      dmAvailable &&
-        h(
-          "div",
-          {
-            style: {
-              display: "grid",
-              gap: "var(--space-2)",
-              padding: "var(--space-3)",
-              borderRadius: "var(--radius-control)",
-              background: "var(--surface-inset)",
-              border: "1px solid var(--border-standard)",
-            },
-          },
-          h(
-            Row,
-            {
-              label: "Send directly to a Buzz member",
-              hint: "They'll get an automatic Accept & Connect popup right in Buzz — no copy-paste needed.",
-            },
-            selectedMember
-              ? h(
-                  "div",
-                  {
-                    style: {
-                      display: "flex",
-                      alignItems: "center",
-                      justifyContent: "space-between",
-                      gap: "var(--space-2)",
-                      padding: "var(--space-2)",
-                      borderRadius: "var(--radius-control)",
-                      background: "var(--surface-panel, var(--surface-elevated, transparent))",
-                      border: "1px solid var(--border-standard)",
-                    },
-                  },
-                  h(
-                    "div",
-                    { style: { display: "grid", gap: "2px", minWidth: 0 } },
-                    h("strong", null, selectedMember.name || selectedMember.username || selectedMember.pubkey.slice(0, 10)),
-                    h(
-                      Note,
-                      null,
-                      `${selectedMember.username ? `@${selectedMember.username} · ` : ""}${selectedMember.pubkey.slice(0, 12)}… (token pre-bound to this account)`,
-                    ),
-                  ),
-                  h(
-                    "button",
-                    { type: "button", disabled: busy, onClick: clearMember },
-                    "Change",
-                  ),
-                )
-              : h(
-                  "div",
-                  { style: { display: "grid", gap: "var(--space-2)" } },
-                  h(Text, {
-                    value: memberQuery,
-                    disabled: busy,
-                    placeholder: "Search community members (e.g. Anu)…",
-                    onChange: (e) => setMemberQuery(e.target.value),
-                  }),
-                  searchingMembers
-                    ? h(Note, null, "Searching members…")
-                    : members.length === 0
-                      ? h(Note, null, memberQuery.trim() ? "No matching members found." : "No other community members loaded yet.")
-                      : h(
-                          "div",
-                          {
-                            style: {
-                              display: "flex",
-                              flexWrap: "wrap",
-                              gap: "var(--space-1, 6px)",
-                              maxHeight: "120px",
-                              overflowY: "auto",
-                            },
-                          },
-                          ...members.slice(0, 12).map((person) =>
-                            h(
-                              "button",
-                              {
-                                key: person.pubkey,
-                                type: "button",
-                                disabled: busy,
-                                onClick: () => selectMember(person),
-                                style: {
-                                  display: "inline-flex",
-                                  alignItems: "center",
-                                  gap: "6px",
-                                  padding: "4px 10px",
-                                  borderRadius: "999px",
-                                  border: "1px solid var(--border-standard)",
-                                  background: "var(--surface-panel, transparent)",
-                                  color: "var(--text-standard)",
-                                  cursor: busy ? "default" : "pointer",
-                                  font: "inherit",
-                                  fontSize: "0.85rem",
-                                },
-                              },
-                              person.name || person.username || `${person.pubkey.slice(0, 8)}…`,
-                              person.username && person.name && person.username !== person.name
-                                ? h("span", { className: "text-secondary" }, `@${person.username}`)
-                                : null,
-                            ),
-                          ),
-                        ),
-                ),
-          ),
-        ),
       h(
         "div",
-        { style: { display: "grid", gap: "var(--space-2)", gridTemplateColumns: "minmax(0, 1fr) minmax(0, 1fr)" } },
-        h(
-          Row,
-          { label: "Friend label", hint: "Shown in your invite list (e.g. Alex)." },
-          h(Text, {
-            value: label,
-            disabled: busy,
-            placeholder: "Alex",
-            onChange: (e) => setLabel(e.target.value),
-          }),
-        ),
-        h(
-          Row,
-          {
-            label: "Owner pubkey (optional)",
-            hint: selectedMember
-              ? "Auto-filled from selected Buzz member."
-              : "Leave blank to bind automatically on their first agent.",
-          },
-          h(Text, {
-            value: ownerPubkey,
-            disabled: busy || Boolean(selectedMember),
-            placeholder: "64-char hex pubkey (optional)",
-            onChange: (e) => setOwnerPubkey(e.target.value),
-          }),
-        ),
-      ),
-      h(
-        "div",
-        { style: { display: "grid", gap: "var(--space-2)", gridTemplateColumns: "minmax(0, 1fr) minmax(0, 1fr)" } },
-        h(
-          Row,
-          { label: "Max agents" },
-          h(Text, {
-            type: "number",
-            min: 1,
-            max: 20,
-            value: maxAgents,
-            disabled: busy,
-            onChange: (e) => setMaxAgents(e.target.value),
-          }),
-        ),
-        h(
-          Row,
-          { label: "Max parallel chats" },
-          h(Text, {
-            type: "number",
-            min: 1,
-            max: 8,
-            value: maxConcurrency,
-            disabled: busy,
-            onChange: (e) => setMaxConcurrency(e.target.value),
-          }),
-        ),
-      ),
-      h(
-        "label",
-        {
-          style: {
-            display: "flex",
-            gap: "var(--space-2)",
-            alignItems: "flex-start",
-            cursor: busy ? "default" : "pointer",
-          },
-        },
-        h("input", {
-          type: "checkbox",
-          checked: allowSandboxDesktop,
-          disabled: busy,
-          onChange: (e) => setAllowSandboxDesktop(e.target.checked),
-          style: { marginTop: "3px" },
-        }),
+        { style: { display: "flex", justifyContent: "space-between", alignItems: "center", gap: "var(--space-2)" } },
         h(
           "div",
           { style: { display: "grid", gap: "2px" } },
-          h("span", { style: { fontWeight: 500 } }, "Allow a sandboxed desktop"),
-          h(
-            Note,
-            null,
-            "Their agents can have their own desktop (Viewport, computer tools) inside a separate container with internet only. Nothing runs on the host as you. Uses about 2 GB of RAM per running desktop.",
-          ),
+          h("strong", null, "Shared access"),
+          h(Note, null, "Let friends run their own agents on this server."),
         ),
+        !composing &&
+          h(Button, { variant: "primary", onClick: () => setComposing(true) }, "+ Invite"),
       ),
-      h(
-        "label",
-        {
-          style: {
-            display: "flex",
-            gap: "var(--space-2)",
-            alignItems: "flex-start",
-            cursor: busy ? "default" : "pointer",
-          },
-        },
-        h("input", {
-          type: "checkbox",
-          checked: allowHostDesktop,
-          disabled: busy,
-          onChange: (e) => setAllowHostDesktop(e.target.checked),
-          style: { marginTop: "3px" },
-        }),
-        h(
-          "div",
-          { style: { display: "grid", gap: "2px" } },
-          h("span", { style: { fontWeight: 500 } }, "Allow remote desktop (trusted — runs on host)"),
-          h(
-            Note,
-            null,
-            "Only for people you trust on this machine. Lets them run owner-only agents on the host and open Viewport Remote Desktop.",
-          ),
-        ),
-      ),
-      h(
-        "div",
-        { style: { display: "flex", gap: "var(--space-2)", flexWrap: "wrap" } },
-        selectedMember && dmAvailable &&
-          (Btn
-            ? h(
-                Btn,
-                { variant: "primary", disabled: busy, onClick: () => void createInvite({ sendDm: true }) },
-                busy ? "Sending…" : `Send invite to ${selectedMember.name || selectedMember.username || label || "member"}`,
-              )
-            : h(
-                "button",
-                { type: "button", disabled: busy, onClick: () => void createInvite({ sendDm: true }) },
-                busy ? "Sending…" : `Send invite to ${selectedMember.name || selectedMember.username || label || "member"}`,
-              )),
-        h(
-          "button",
-          { type: "button", disabled: busy, onClick: () => void createInvite({ sendDm: false }) },
-          busy ? "Working…" : selectedMember ? "Create link only" : "Create guest invite",
-        ),
-      ),
-      error && h(Note, { tone: "error" }, error),
+      composer,
+      error && !composing && h(Note, { tone: "error" }, error),
       created &&
         h(
           "div",
-          {
-            style: {
-              display: "grid",
-              gap: "var(--space-2)",
-              padding: "var(--space-3)",
-              borderRadius: "var(--radius-control)",
-              background: "var(--surface-inset)",
-              border: "1px solid var(--border-standard)",
-            },
-          },
+          { style: panelBox },
           h(
             Note,
             null,
             dmSentTo
-              ? `Invite sent to ${dmSentTo} in Buzz! An Accept & Connect popup will appear on their Buzz app (and the DM also has an Accept button). Fallback link below if needed:`
-              : `Invite created for ${created.record.label}. Copy and send it now — the secret token is shown only once.`,
+              ? `Invite sent to ${dmSentTo} in Buzz. They'll get an Accept & Connect prompt. The link below is a fallback:`
+              : `Invite created for ${created.record.label}. Copy and send it now — the secret is shown only once.`,
           ),
           h(Text, {
             readOnly: true,
+            "aria-label": "Invite link",
             value: created.inviteUrl || created.token,
             onFocus: (e) => e.target.select(),
           }),
@@ -472,214 +516,234 @@ export function createServerCard({ React, client, uiKit, Btn, relay }) {
             "div",
             { style: { display: "flex", gap: "var(--space-2)", alignItems: "center" } },
             h(
-              "button",
-              {
-                type: "button",
-                onClick: () => void copyText(created.inviteUrl || created.token),
-              },
+              Button,
+              { onClick: () => void copyText(created.inviteUrl || created.token) },
               copied ? "Copied!" : "Copy invite link",
             ),
-            created.inviteUrl &&
-              h(
-                "button",
-                { type: "button", onClick: () => void copyText(created.token) },
-                "Copy token only",
-              ),
           ),
         ),
       loading
-        ? h(Note, null, "Loading guest invites…")
+        ? h(Note, null, "Loading shared access…")
         : activeTokens.length === 0
-          ? h(Note, null, "No active guest invites.")
+          ? h(Note, null, "No one has been invited yet.")
           : h(
               "div",
-              { style: { display: "grid", gap: "var(--space-2)" } },
+              { role: "list", style: { display: "grid", gap: "var(--space-2)" } },
               ...activeTokens.map((t) =>
                 h(
                   "div",
-                  {
-                    key: t.id,
-                    style: {
-                      display: "flex",
-                      justifyContent: "space-between",
-                      alignItems: "center",
-                      gap: "var(--space-2)",
-                      padding: "var(--space-2)",
-                      borderRadius: "var(--radius-control)",
-                      border: "1px solid var(--border-standard)",
-                    },
-                  },
+                  { key: t.id, role: "listitem", style: rowBox },
                   h(
                     "div",
                     { style: { display: "grid", gap: "2px", minWidth: 0 } },
-                    h("strong", null, `${t.label} (${t.id})`),
+                    h("strong", null, t.label),
                     h(
                       Note,
                       null,
-                      t.role === "admin"
-                        ? `Admin access token · full access to this host${
-                            t.ownerPubkey ? ` · owner ${t.ownerPubkey.slice(0, 10)}…` : ""
-                          }`
-                        : `${t.agentCount ?? 0}/${t.maxAgents} agents · max ${t.maxConcurrency} parallel · ${(t.allowedRuntimes ?? []).join(", ")}${
-                            t.allowHostDesktop ? " · host desktop (trusted)" : ""
-                          }${t.role !== "admin" && t.allowSandboxDesktop !== false && !t.allowHostDesktop ? " · sandboxed desktop" : ""} · ${
-                            t.ownerPubkey ? `bound ${t.ownerPubkey.slice(0, 10)}…` : "unbound (binds on first agent)"
-                          }`,
+                      `${t.agentCount ?? 0}/${t.maxAgents} agents · ${inviteAccessLabel(t)} · ${inviteState(t)}`,
                     ),
                   ),
                   h(
-                    "button",
-                    { type: "button", disabled: busy, onClick: () => void revoke(t.id) },
+                    Button,
+                    { disabled: busy, onClick: () => void revoke(t.id), "aria-label": `Revoke ${t.label}` },
                     "Revoke",
                   ),
                 ),
               ),
             ),
       revokedTokens.length > 0 &&
-        h(Note, null, `${revokedTokens.length} revoked invite${revokedTokens.length === 1 ? "" : "s"}.`),
+        h(
+          "div",
+          { style: { display: "grid", gap: "var(--space-2)" } },
+          h(
+            "button",
+            {
+              type: "button",
+              "aria-expanded": showRevoked,
+              onClick: () => setShowRevoked((v) => !v),
+              style: {
+                justifySelf: "start",
+                background: "none",
+                border: "none",
+                padding: 0,
+                color: "var(--text-secondary)",
+                cursor: "pointer",
+                font: "inherit",
+              },
+            },
+            `${showRevoked ? "Hide" : "Show"} revoked invites (${revokedTokens.length})`,
+          ),
+          showRevoked &&
+            h(
+              "div",
+              { role: "list", style: { display: "grid", gap: "var(--space-1)" } },
+              ...revokedTokens.map((t) =>
+                h(
+                  "div",
+                  { key: t.id, role: "listitem" },
+                  h(Note, null, `${t.label} · ${t.agentCount ?? 0}/${t.maxAgents} agents · revoked`),
+                ),
+              ),
+            ),
+        ),
+    );
+  }
+
+  function StatusPill({ tone, children }) {
+    const color =
+      tone === "ok"
+        ? "var(--text-success, #2f9e44)"
+        : tone === "bad"
+          ? "var(--text-danger, #e03131)"
+          : "var(--text-secondary)";
+    return h(
+      "span",
+      {
+        style: {
+          display: "inline-flex",
+          alignItems: "center",
+          gap: "6px",
+          padding: "2px 10px",
+          borderRadius: "999px",
+          border: "1px solid var(--border-standard)",
+          fontSize: "0.8rem",
+          color,
+        },
+      },
+      h("span", {
+        "aria-hidden": "true",
+        style: { width: "7px", height: "7px", borderRadius: "50%", background: color },
+      }),
+      children,
     );
   }
 
   return function ServerCard() {
     const state = React.useSyncExternalStore(client.subscribe, client.snapshot);
-    const [url, setUrl] = React.useState(storedUrl());
-    const [token, setToken] = React.useState(storedToken());
-    const [showToken, setShowToken] = React.useState(false);
-    const [notice, setNotice] = React.useState("");
     const [info, setInfo] = React.useState();
     const [error, setError] = React.useState("");
+    const [checking, setChecking] = React.useState(false);
 
-    const handleUrlChange = (raw) => {
-      const parsed = parseInviteInput(raw);
-      if (parsed.token) {
-        setUrl(parsed.url);
-        setToken(parsed.token);
-        setNotice("Invite link parsed into Server URL and Access token. Click Save and check to connect.");
-      } else {
-        setUrl(raw);
-        setNotice("");
-      }
-    };
+    const configured = Boolean(storedMachines().length || storedUrl());
 
-    const check = async (overrideUrl, overrideToken) => {
+    const check = async () => {
+      if (!configured) return;
       setError("");
-      setInfo(undefined);
-      const rawUrl = overrideUrl ?? url;
-      const parsed = parseInviteInput(rawUrl);
-      const cleanUrl = (parsed.url || DEFAULT_URL).trim();
-      const cleanToken = (parsed.token ?? overrideToken ?? token).trim();
-      if (!cleanUrl) {
-        setNotice("Paste your server URL or invite link above, then click Save and check.");
-        return;
-      }
-      if (parsed.token) {
-        setUrl(cleanUrl);
-        setToken(cleanToken);
-      }
+      setChecking(true);
       try {
-        setStoredUrl(cleanUrl);
-        setStoredToken(cleanToken);
         await client.reconnect();
         const [hello, list] = await Promise.all([client.call("hello"), client.call("list")]);
         setInfo({ hello, list });
-        setNotice("");
       } catch (e) {
+        setInfo(undefined);
         setError(String(e.message ?? e));
+      } finally {
+        setChecking(false);
       }
     };
+
     React.useEffect(() => {
       void check();
       // biome-ignore lint: check once on open
     }, []);
-    const isGuest = info?.hello?.role === "guest";
-    const isAdmin = info?.hello?.role === "admin";
+
+    const machine = activeMachine();
+    const hello = info?.hello;
+    const agents = info?.list?.agents ?? [];
+    const isGuest = hello?.role === "guest";
+    const isAdmin = hello?.role === "admin";
+    const online = Boolean(hello);
+    const runtimes = (hello?.runtimes ?? []).filter((r) => r.available !== false).map((r) => r.title);
+    const hostName = hello?.host || machine?.name || "Remote machine";
+
+    if (!configured) {
+      return h(
+        "div",
+        { style: { ...panelBox, justifyItems: "start" } },
+        h("strong", null, "No machine connected"),
+        h(
+          Note,
+          null,
+          "Connect a machine running buzz-host, or paste an invite link a friend sent you, to run agents on it.",
+        ),
+        h(Button, { variant: "primary", onClick: openMachines }, "Connect a machine"),
+      );
+    }
+
+    const subtitle = !online
+      ? error || (checking ? "Checking the connection…" : `Connection: ${state.status}`)
+      : isGuest
+        ? `Guest account${hello.label ? `: ${hello.label}` : ""} · ${agents.length}/${hello.limits?.maxAgents ?? 2} agents · max ${hello.limits?.maxConcurrency ?? 2} parallel chats${
+            hello.limits?.allowHostDesktop
+              ? " · remote desktop enabled"
+              : hello.limits?.allowSandboxDesktop
+                ? " · sandboxed desktop enabled"
+                : ""
+          }`
+        : `${agents.length} agent${agents.length === 1 ? "" : "s"}${runtimes.length ? ` · ${runtimes.join(", ")}` : ""}`;
+
     return h(
       "div",
       { style: { display: "grid", gap: "var(--space-3)" } },
       h(
-        Note,
-        null,
-        "Agents of type Self-hosted run on a buzz-host server. Create one in Agents → New agent by picking a machine under Run on. In a chat, tag the agent with /model, /effort, /runtime, /new, /stop, /status or /help to control that chat (or thread).",
-      ),
-      h(
-        Row,
-        {
-          label: "Server (or paste invite link)",
-          hint: "Admin: your wss:// tailscale serve address, or an admin link (#token=bha_…) for any wss:// tunnel. Guest: paste the invite link from your host.",
-        },
-        h(Text, {
-          value: url,
-          placeholder: "wss://host.example/_buzz-host#token=bhg_…",
-          onChange: (e) => handleUrlChange(e.target.value),
-        }),
-      ),
-      h(
-        Row,
-        {
-          label: "Access token",
-          hint: "Leave blank on your own tailnet admin connection. Guests use a bhg_ invite token; an admin access token (bha_, from buzz-host-tokens create-admin) connects without Tailscale. Filled automatically when pasting an invite link.",
-        },
+        "div",
+        { role: "status", style: { ...panelBox, gap: "var(--space-2)" } },
         h(
           "div",
-          { style: { display: "flex", gap: "var(--space-2)" } },
-          h(Text, {
-            type: showToken ? "text" : "password",
-            value: token,
-            placeholder: "bhg_… or bha_… (optional)",
-            style: { flex: 1 },
-            onChange: (e) => setToken(e.target.value),
-          }),
+          { style: { display: "flex", justifyContent: "space-between", alignItems: "center", gap: "var(--space-2)" } },
           h(
-            "button",
-            { type: "button", onClick: () => setShowToken((v) => !v) },
-            showToken ? "Hide" : "Show",
+            "div",
+            { style: { display: "flex", alignItems: "center", gap: "var(--space-2)", minWidth: 0 } },
+            h("strong", null, hostName),
+            h(
+              StatusPill,
+              { tone: online ? "ok" : checking ? undefined : "bad" },
+              online ? "Online" : checking ? "Checking" : "Offline",
+            ),
+          ),
+          h(
+            "div",
+            { style: { display: "flex", gap: "var(--space-2)" } },
+            !online && !checking && h(Button, { onClick: () => void check() }, "Retry"),
+            h(Button, { onClick: openMachines }, "Manage machines"),
           ),
         ),
+        h(Note, { tone: !online && error ? "error" : undefined }, subtitle),
       ),
-      h(
-        "div",
-        { style: { display: "flex", gap: "var(--space-2)" } },
-        h("button", { type: "button", onClick: () => void check() }, "Save and check"),
-        token &&
-          h(
-            "button",
-            {
-              type: "button",
-              onClick: () => {
-                setToken("");
-                setStoredToken("");
-                setNotice("Access token cleared. Click Save and check to reconnect.");
-              },
-            },
-            "Clear token",
-          ),
-      ),
-      notice && h(Note, null, notice),
-      h(Note, { tone: error ? "error" : undefined }, error || `Connection: ${state.status}`),
-      info &&
+      online &&
         h(
-          Note,
+          "details",
           null,
-          (isGuest
-            ? `Guest account: ${info.hello.label} · ${info.list.agents.length}/${info.hello.limits?.maxAgents ?? 2} agents · max ${info.hello.limits?.maxConcurrency ?? 2} parallel chats${
-                info.hello.limits?.allowHostDesktop
-                  ? " · remote desktop enabled"
-                  : info.hello.limits?.allowSandboxDesktop
-                    ? " · sandboxed desktop enabled"
-                    : ""
-              }\n`
-            : "") +
-            `Host ${info.hello.host}${info.hello.role ? ` (${info.hello.role})` : ""} · runtimes: ${info.hello.runtimes
-              .map((r) => `${r.title}${r.available ? "" : " (missing)"}`)
-              .join(", ")}` +
-            (Array.isArray(info.hello.runners)
-              ? `\nRunners: ${info.hello.runners
+          h("summary", { style: { cursor: "pointer" } }, "Connection details"),
+          h(
+            "div",
+            { style: { display: "grid", gap: "var(--space-1)", paddingTop: "var(--space-2)" } },
+            h(
+              Note,
+              null,
+              `Host ${hello.host}${hello.role ? ` (${hello.role})` : ""} · ${state.routeType || "wss"} · ${state.status}`,
+            ),
+            state.url && h(Note, null, state.url.split("#")[0]),
+            h(
+              Note,
+              null,
+              `Runtimes: ${(hello.runtimes ?? [])
+                .map((r) => `${r.title}${r.available ? "" : " (missing)"}`)
+                .join(", ") || "none"}`,
+            ),
+            Array.isArray(hello.runners) &&
+              h(
+                Note,
+                null,
+                `Runners: ${hello.runners
                   .map((r) => `${r.title}${r.available ? "" : " (unavailable)"}`)
-                  .join(", ")}`
-              : "") +
-            "\n" +
-            (info.list.agents.length
-              ? info.list.agents
+                  .join(", ")}`,
+              ),
+            agents.length > 0 &&
+              h(
+                Note,
+                null,
+                agents
                   .map((a) => {
                     const extra = [
                       a.runner && a.runner !== "host" ? a.runner : "",
@@ -689,10 +753,11 @@ export function createServerCard({ React, client, uiKit, Btn, relay }) {
                       .join(" · ");
                     return `• ${a.name} — ${a.runtime}${a.model ? `/${a.model}` : ""}${extra ? ` [${extra}]` : ""} — ${a.status}`;
                   })
-                  .join("\n")
-              : "No agents yet."),
+                  .join("\n"),
+              ),
+          ),
         ),
-      isAdmin && h(GuestInvites, { publicGuestUrl: info.hello.publicGuestUrl }),
+      isAdmin && h(SharedAccess, { publicGuestUrl: hello.publicGuestUrl }),
     );
   };
 }

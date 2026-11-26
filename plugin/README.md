@@ -10,7 +10,10 @@ answering while this computer is off.
    Iroh (with `wss://` fallback).
 2. Open **Settings → Agent setup → Harness defaults → Self-hosted** to manage
    connected machines or paste an invite/pairing link (`wss://...#token=...`).
-3. In **Agents**, choose **New agent**, pick your machine under **Run on**,
+3. **Settings → Plugins → Remote Agents** shows your machine's status and, on
+   machines you administer, **Shared access**: use **+ Invite** to let a friend
+   run sandboxed agents on your machine.
+4. In **Agents**, choose **New agent**, pick your machine under **Run on**,
    and select its **Harness** (Claude Code, Codex, Hermes, or Antigravity).
 
 ## What it adds

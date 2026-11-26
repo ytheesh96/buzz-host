@@ -17,7 +17,7 @@ import { createInviteFeature } from "./invite.js";
 
 export { catalogKey, catalogParams, composerModels } from "./composer.js";
 
-export const inject = ["react", "agents", "settingsCards"];
+export const inject = ["react", "agents", "settingsCards", "navigation"];
 
 export function apply(ctx) {
   const React = ctx.react;
@@ -50,12 +50,12 @@ export function apply(ctx) {
     hostedSessions,
   });
 
-  // ----- Settings → Remote Agents: server address and status -----
+  // ----- Settings → Remote Agents: status card and Shared access -----
   ctx.settingsCards.register({
     id: "server",
     title: "Remote Agents",
     group: "Plugins",
-    component: createServerCard({ React, client, uiKit, Btn, relay }),
+    component: createServerCard({ React, client, uiKit, Btn, relay, navigation: ctx.navigation }),
   });
 
   // ----- Seamless 1:1 DM invites: inline card + automatic Accept overlay -----

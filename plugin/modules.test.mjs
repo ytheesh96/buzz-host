@@ -49,6 +49,7 @@ import {
   setInviteDecision,
   subscribeInviteDecisions,
 } from "./src/invite.js";
+import { inviteAccessLabel, inviteState } from "./src/server-card.js";
 import * as remoteAgentsSrc from "./src/index.js";
 import * as remoteAgentsBuilt from "./plugin.js";
 import * as viewportSrc from "../plugins/viewport/src/index.js";
@@ -293,11 +294,19 @@ test("attention formatting helpers format ids, headings, and schedules", () => {
 
 test("Remote Agents: src and bundled plugin.js expose the same API surface", () => {
   assert.deepEqual(remoteAgentsBuilt.inject, remoteAgentsSrc.inject);
-  assert.deepEqual(remoteAgentsBuilt.inject, ["react", "agents", "settingsCards"]);
+  assert.deepEqual(remoteAgentsBuilt.inject, ["react", "agents", "settingsCards", "navigation"]);
   assert.equal(typeof remoteAgentsBuilt.apply, "function");
   assert.equal(typeof remoteAgentsBuilt.catalogKey, "function");
   assert.equal(typeof remoteAgentsBuilt.catalogParams, "function");
   assert.equal(typeof remoteAgentsBuilt.composerModels, "function");
+
+  assert.equal(inviteState({ agentCount: 1, ownerPubkey: "a".repeat(64) }), "In use");
+  assert.equal(inviteState({ agentCount: 0, ownerPubkey: "a".repeat(64) }), "Invited via Buzz DM");
+  assert.equal(inviteState({ agentCount: 0 }), "Not used yet");
+  assert.equal(inviteAccessLabel({ allowHostDesktop: true }), "Trusted host access");
+  assert.equal(inviteAccessLabel({ allowSandboxDesktop: false }), "Sandboxed · no desktop");
+  assert.equal(inviteAccessLabel({ allowSandboxDesktop: true }), "Sandboxed");
+  assert.equal(inviteAccessLabel({}), "Sandboxed");
 
   for (const mod of [remoteAgentsSrc, remoteAgentsBuilt]) {
     const cleanups = [];
@@ -311,6 +320,7 @@ test("Remote Agents: src and bundled plugin.js expose the same API surface", () 
           registerTab: (t) => registered.tabs.push(t),
         },
         settingsCards: { register: (c) => registered.cards.push(c) },
+        navigation: { open: async () => ({ status: "opened" }) },
         inject: (deps, cb) => {
           if (deps.includes("conversation")) {
             cb({ conversation: { registerMessage: (m) => registered.messages.push(m) } });
