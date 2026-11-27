@@ -449,11 +449,13 @@ What the pieces do:
   - **Discovery with no agents yet:** `--owner <npub|hex> --relay wss://…` saves `ownerPubkey` and
     `discoveryRelays`. Buzz only trusts a status event signed by a key its owner attested, so
     buzz-host has its own machine key (`~/.local/share/buzz-host/machine-key`, 0600). `pair`
-    prints that key. Authorize it in Buzz (Settings → Security), then pass the proof with
-    `--owner-proof '["auth",…]'`; up saves it as `ownerAuth`. From then on the machine key
-    publishes to each such relay that none of the owner's agents already covers. Over an admin
-    connection, the app can do the same with the `machine.attest {auth, relay}` RPC; `hello`
-    gives admins `machinePubkey` and `discoveryOwner`.
+    prints that key. When you explicitly add or save the machine in Buzz Desktop with an admin
+    token, Buzz automatically signs a `kind=30003`-scoped attestation (limiting the machine key to
+    discovery statuses) and calls the `machine.attest {auth, relay}` RPC (`hello` exposes
+    `machinePubkey` and `discoveryOwner` to admins). For manual setup without the app, authorize
+    the key in Buzz (Settings → Security) and pass `--owner-proof '["auth",…]'` (either
+    `kind=30003`-scoped or unconditional); `up` saves it as `ownerAuth`. From then on the machine
+    key publishes to each configured relay that none of the owner's agents already covers.
 - Host requirements: `bash`, `python3` (acp-proxy), systemd with a user manager (Linux) or a
   logged-in user (macOS). Optional: a C compiler (otherwise the prebuilt MCP bridge is used),
   Docker (sandboxed agents) and Tailscale (Funnel/Serve URLs).

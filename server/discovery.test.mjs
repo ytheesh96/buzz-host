@@ -17,6 +17,7 @@ import {
   buildStatusEvent,
   configuredOwner,
   createDiscoveryPublisher,
+  DISCOVERY_AUTH_CONDITION,
   groupByOwner,
   loadMachineId,
   loadMachineKey,
@@ -39,10 +40,10 @@ function keypair() {
   return { secret, pubkey: bytesToHex(schnorr.getPublicKey(hexToBytes(secret))) };
 }
 
-/** The owner's NIP-OA attestation of `agentPubkey` (unconditional). */
-function attest(owner, agentPubkey) {
-  const digest = sha256(new TextEncoder().encode(`nostr:agent-auth:${agentPubkey}:`));
-  return ["auth", owner.pubkey, "", bytesToHex(schnorr.sign(digest, hexToBytes(owner.secret)))];
+/** The owner's NIP-OA attestation of `agentPubkey` (unconditional by default, or with `conditions`). */
+function attest(owner, agentPubkey, conditions = "") {
+  const digest = sha256(new TextEncoder().encode(`nostr:agent-auth:${agentPubkey}:${conditions}`));
+  return ["auth", owner.pubkey, conditions, bytesToHex(schnorr.sign(digest, hexToBytes(owner.secret)))];
 }
 
 function verifyEvent(event) {
@@ -180,7 +181,7 @@ async function startRelay({ requireAuth = true, refuseLogin = false } = {}) {
             verifyEvent(event) &&
             tag("challenge")?.[1] === challenge &&
             tag("relay")?.[1] === url &&
-            validAuthTag(event.pubkey, tag("auth"));
+            validAuthTag(event.pubkey, tag("auth"), { allowDiscoveryScope: true });
           if (ok) {
             authed = event.pubkey;
             logins.push({ pubkey: event.pubkey, authTag: tag("auth") });
@@ -251,12 +252,17 @@ test("status event: NIP-44 v2 to the owner, NIP-01 signed, with d/k/p/auth tags"
   assert.ok(!verifyEvent({ ...event, content: event.content.slice(0, -2) + "AA" }));
 });
 
-test("validAuthTag accepts only the owner's unconditional NIP-OA attestation of that agent", () => {
+test("validAuthTag accepts only the owner's NIP-OA attestation of that agent (and kind=30003 for discovery)", () => {
   const owner = keypair();
   const agent = keypair();
   const other = keypair();
   const tag = attest(owner, agent.pubkey);
+  const scoped = attest(owner, agent.pubkey, DISCOVERY_AUTH_CONDITION);
   assert.ok(validAuthTag(agent.pubkey, tag));
+  assert.ok(!validAuthTag(agent.pubkey, scoped), "agents require unconditional attestation");
+  assert.ok(validAuthTag(agent.pubkey, scoped, { allowDiscoveryScope: true }), "machine key accepts kind=30003");
+  assert.ok(!validAuthTag(agent.pubkey, ["auth", owner.pubkey, DISCOVERY_AUTH_CONDITION, tag[3]], { allowDiscoveryScope: true }), "condition swap rejected");
+  assert.ok(!validAuthTag(agent.pubkey, attest(owner, agent.pubkey, "kind=1"), { allowDiscoveryScope: true }), "other conditions rejected");
   assert.ok(!validAuthTag(other.pubkey, tag), "attestation is for another agent");
   assert.ok(!validAuthTag(agent.pubkey, ["auth", other.pubkey, "", tag[3]]), "signed by someone else");
   assert.ok(!validAuthTag(agent.pubkey, ["auth", owner.pubkey, "kind=1", tag[3]]), "conditions not allowed");
@@ -898,10 +904,13 @@ test("configuredOwner / parseOwnerProof: only the owner's attestation of this ma
   const machine = keypair();
   const other = keypair();
   const proof = attest(owner, machine.pubkey);
+  const scopedProof = attest(owner, machine.pubkey, DISCOVERY_AUTH_CONDITION);
   assert.deepEqual(parseOwnerProof(JSON.stringify(proof), machine.pubkey), proof);
+  assert.deepEqual(parseOwnerProof(JSON.stringify(scopedProof), machine.pubkey), scopedProof);
   assert.throws(() => parseOwnerProof("nope", machine.pubkey), /JSON Buzz prints/);
   assert.throws(() => parseOwnerProof(JSON.stringify(attest(owner, other.pubkey)), machine.pubkey), /does not attest this machine/);
-  assert.throws(() => parseOwnerProof(JSON.stringify(["auth", owner.pubkey, "kind=1", proof[3]]), machine.pubkey), /unconditional/);
+  assert.throws(() => parseOwnerProof(JSON.stringify(["auth", owner.pubkey, "kind=1", proof[3]]), machine.pubkey), /kind=30003/);
+  assert.throws(() => parseOwnerProof(JSON.stringify(["auth", owner.pubkey, DISCOVERY_AUTH_CONDITION, proof[3]]), machine.pubkey), /does not attest this machine/);
 
   assert.equal(configuredOwner({}, machine.pubkey), null);
   assert.equal(configuredOwner({ ownerPubkey: "junk" }, machine.pubkey), null);
@@ -913,6 +922,7 @@ test("configuredOwner / parseOwnerProof: only the owner's attestation of this ma
     attested: false,
   });
   assert.equal(configuredOwner({ ownerPubkey: owner.pubkey, ownerAuth: proof }, machine.pubkey).attested, true);
+  assert.equal(configuredOwner({ ownerPubkey: owner.pubkey, ownerAuth: scopedProof }, machine.pubkey).attested, true);
   // A proof by someone else, or for another key, is ignored.
   assert.equal(configuredOwner({ ownerPubkey: other.pubkey, ownerAuth: proof }, machine.pubkey).attested, false);
   assert.equal(configuredOwner({ ownerPubkey: owner.pubkey, ownerAuth: proof }, other.pubkey).attested, false);
@@ -1012,10 +1022,12 @@ test("buzz-host: zero agents, machine.attest makes the machine discoverable at o
     assert.equal(saved.pubkey, hello.machinePubkey);
 
     await assert.rejects(rpc(port, "machine.attest", { auth: attest(owner, keypair().pubkey), relay: relay.url }), /does not attest/);
-    const state = await rpc(port, "machine.attest", { auth: attest(owner, hello.machinePubkey), relay: relay.url });
+    const scopedAuth = attest(owner, hello.machinePubkey, DISCOVERY_AUTH_CONDITION);
+    const state = await rpc(port, "machine.attest", { auth: scopedAuth, relay: relay.url });
     assert.deepEqual(state, { ownerPubkey: owner.pubkey, relays: [relay.url], attested: true, enabled: true });
     await until(() => relay.events.length >= 1, { timeoutMs: 15_000, what: "publish after attest" });
     assert.equal(relay.events[0].pubkey, hello.machinePubkey);
+    assert.deepEqual(relay.events[0].tags.find((t) => t[0] === "auth"), scopedAuth);
     const online = open(relay.events[0], owner);
     assert.equal(online.machineId, hello.machineId);
     assert.deepEqual(online.agents, []);
@@ -1025,7 +1037,7 @@ test("buzz-host: zero agents, machine.attest makes the machine discoverable at o
     assert.equal(config.machineName, "Zero");
     assert.deepEqual(config.discoveryRelays, [relay.url]);
     assert.equal(config.ownerPubkey, owner.pubkey);
-    assert.ok(validAuthTag(hello.machinePubkey, config.ownerAuth));
+    assert.ok(validAuthTag(hello.machinePubkey, config.ownerAuth, { allowDiscoveryScope: true }));
     host.child.kill("SIGTERM");
     assert.equal((await host.exited).code, 0, host.output());
     assert.equal(open(relay.events.at(-1), owner).status, "stopped");

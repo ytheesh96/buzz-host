@@ -33,6 +33,7 @@ import { encrypt, getConversationKey } from "./nip44.mjs";
 import { signEvent } from "./attention-relay.mjs";
 
 export const STATUS_KIND = 30003;
+export const DISCOVERY_AUTH_CONDITION = `kind=${STATUS_KIND}`;
 export const STATUS_K = "buzz-host-status";
 export const IROH_ADDR_FILE = "iroh-addr.json";
 const HEX64 = /^[0-9a-f]{64}$/;
@@ -158,12 +159,17 @@ export function configuredOwner(config, machinePubkey) {
   if (!ownerPubkey) return null;
   const auth = config.ownerAuth;
   const attested =
-    Boolean(machinePubkey) && Array.isArray(auth) && auth[1] === ownerPubkey && validAuthTag(machinePubkey, auth);
+    Boolean(machinePubkey) &&
+    Array.isArray(auth) &&
+    auth[1] === ownerPubkey &&
+    validAuthTag(machinePubkey, auth, { allowDiscoveryScope: true });
   return { ownerPubkey, relays: discoveryRelays(config), authTag: attested ? [...auth] : null, attested };
 }
 
-/** Parse an owner proof: the JSON `["auth", owner, "", sig]` Buzz's Security
- * settings print, checked against `machinePubkey`. Throws with a reason. */
+/** Parse an owner proof: a NIP-OA `["auth", owner, ""|"kind=30003", sig]`
+ * tag checked against `machinePubkey`. Prefers `kind=30003` so the machine key
+ * can only publish discovery statuses, and still accepts unconditional proofs
+ * from Buzz's Security settings. Throws with a reason. */
 export function parseOwnerProof(text, machinePubkey) {
   let auth;
   try {
@@ -173,28 +179,32 @@ export function parseOwnerProof(text, machinePubkey) {
   }
   if (!Array.isArray(auth) || auth[0] !== "auth" || auth.length !== 4)
     throw new Error('owner proof must be the JSON Buzz prints: ["auth","<owner>","","<signature>"]');
-  if (auth[2] !== "") throw new Error("owner proof must be unconditional (empty conditions)");
-  if (!validAuthTag(machinePubkey, auth))
+  if (auth[2] !== "" && auth[2] !== DISCOVERY_AUTH_CONDITION)
+    throw new Error(`owner proof conditions must be empty or "${DISCOVERY_AUTH_CONDITION}"`);
+  if (!validAuthTag(machinePubkey, auth, { allowDiscoveryScope: true }))
     throw new Error(`owner proof does not attest this machine's key (${machinePubkey}); authorize that key in Buzz`);
   return auth;
 }
 
 // ---------- owners and their agents ----------
 
-/** True when `authTag` is `["auth", owner, "", sig]` with sig the owner's
- * NIP-OA attestation of `agentPubkey` (unconditional). */
-export function validAuthTag(agentPubkey, authTag) {
+/** True when `authTag` is `["auth", owner, cond, sig]` with sig the owner's
+ * NIP-OA attestation of `agentPubkey`. Agents require unconditional (`""`);
+ * machine discovery keys also accept `kind=30003` (`allowDiscoveryScope`). */
+export function validAuthTag(agentPubkey, authTag, { allowDiscoveryScope = false } = {}) {
   if (
     !Array.isArray(authTag) ||
     authTag.length !== 4 ||
     authTag[0] !== "auth" ||
     !HEX64.test(authTag[1]) ||
-    authTag[2] !== "" ||
+    typeof authTag[2] !== "string" ||
     !SIG.test(authTag[3])
   )
     return false;
+  const condition = authTag[2];
+  if (condition !== "" && !(allowDiscoveryScope && condition === DISCOVERY_AUTH_CONDITION)) return false;
   try {
-    const digest = sha256(new TextEncoder().encode(`nostr:agent-auth:${agentPubkey}:`));
+    const digest = sha256(new TextEncoder().encode(`nostr:agent-auth:${agentPubkey}:${condition}`));
     return schnorr.verify(hexToBytes(authTag[3]), digest, hexToBytes(authTag[1]));
   } catch {
     return false;
