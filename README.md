@@ -418,7 +418,7 @@ What the pieces do:
   1. Writes `~/.config/buzz-host/config.json` if it's missing. A new config is token-only:
      `guestPort` 8467, no `allowLogins`, and an empty `publicGuestUrl` so the host doesn't
      advertise omarchy's URL. An existing config is kept; up only adds a missing `guestPort` and
-     an explicit `--url`.
+     what the flags below set.
   2. Runs the bundle's `deploy.sh --local` without restarting anything, with
      `BUZZ_HOST_NODE=<runtime>/current/node/bin/node`. It then copies the prebuilt binaries
      whose bytes changed, keeping the old buzz-acp as `buzz-acp.prev`, and links `bin/node` to
@@ -433,7 +433,29 @@ What the pieces do:
   Re-running up with the same bundle restarts nothing. A new bundle upgrades in place and
   restarts buzz-host. Agent units (`buzz-agent@<pubkey>.service`) are never touched, so agents
   keep running and pick up a new buzz-acp at their next restart. `--no-service` installs only
-  the files and config. `buzz-host up --help` lists every flag.
+  the files and config. `buzz-host up --help` lists every flag. Reaching the machine:
+  - **Same machine:** Buzz Desktop accepts `ws://127.0.0.1:<guestPort>` (and `localhost`/`[::1]`)
+    directly. Every other host must be `wss://`.
+  - **`--tailscale-serve [--tailscale-path /_buzz-host]`:** checks that Tailscale is logged in
+    with a MagicDNS `*.ts.net` name and HTTPS certificates. It then runs
+    `tailscale serve --bg --set-path <path> http://127.0.0.1:<guestPort>` and saves
+    `wss://<name>.ts.net<path>` as `publicGuestUrl`. buzz-host stays bound to loopback; only your
+    tailnet can reach the URL. Each failure names its fix (`tailscale up`, enable MagicDNS/HTTPS in
+    the admin console, `sudo tailscale set --operator=$USER`).
+  - **`--lan` / `--no-lan`:** binds the token listener to `0.0.0.0`, or back to `127.0.0.1`
+    (saved as `guestHost`). Every socket still needs an access token. On a LAN socket
+    `X-Forwarded-For` is ignored (only a loopback tunnel may set it). Buzz Desktop needs `wss://`
+    for other machines, so put TLS in front of it.
+  - **Discovery with no agents yet:** `--owner <npub|hex> --relay wss://…` saves `ownerPubkey` and
+    `discoveryRelays`. Buzz only trusts a status event signed by a key its owner attested, so
+    buzz-host has its own machine key (`~/.local/share/buzz-host/machine-key`, 0600). `pair`
+    prints that key. When you explicitly add or save the machine in Buzz Desktop with an admin
+    token, Buzz automatically signs a `kind=30003`-scoped attestation (limiting the machine key to
+    discovery statuses) and calls the `machine.attest {auth, relay}` RPC (`hello` exposes
+    `machinePubkey` and `discoveryOwner` to admins). For manual setup without the app, authorize
+    the key in Buzz (Settings → Security) and pass `--owner-proof '["auth",…]'` (either
+    `kind=30003`-scoped or unconditional); `up` saves it as `ownerAuth`. From then on the machine
+    key publishes to each configured relay that none of the owner's agents already covers.
 - Host requirements: `bash`, `python3` (acp-proxy), systemd with a user manager (Linux) or a
   logged-in user (macOS). Optional: a C compiler (otherwise the prebuilt MCP bridge is used),
   Docker (sandboxed agents) and Tailscale (Funnel/Serve URLs).
@@ -469,10 +491,10 @@ exits 2).
 | Command | What it does |
 |---|---|
 | `up` | Install/upgrade and start (above). Its `--json` contract is unchanged |
-| `status [--json]` | buzz-host's and every agent's unit state (`active`, `inactive`, `failed`…), listener `/health`, URL, iroh node id, version. Exit 0 when buzz-host is running, 3 when it isn't |
+| `status [--json]` | buzz-host's and every agent's unit state (`active`, `inactive`, `failed`…), listener `/health`, URL, iroh node id, discovery, version. Exit 0 when buzz-host is running, 3 when it isn't |
 | `down [agent] [--keep-agents]` | Stop buzz-host and all agents, or just one agent. Units stay installed: they start at the next login, `up` restarts buzz-host, `restart --agents` starts the agents |
 | `restart [agent] [--agents]` | Restart buzz-host and wait for `/health`; agents keep running unless `--agents`, or name one. Also starts a stopped unit |
-| `pair [--new] [--label …] [--url wss://…] [--qr]` | URL, admin token and the 1-paste pairing URL, plus the iroh node id, routes and discovery relays (PR #38). Prints the token `up` does (made if missing); `--new` mints a separate admin token for one device. `--qr` draws a QR code with `qrencode` when it's installed |
+| `pair [--new] [--label …] [--url wss://…] [--qr]` | URL, admin token, the 1-paste pairing URL and a `buzz://pair?url=…&name=…#token=…` link (`deepLink` in `--json`) that opens Buzz Desktop's Add machine form prefilled for you to confirm. Also the iroh node id, routes, discovery relays and the machine key / owner attestation state (PR #38). Prints the token `up` does (made if missing); `--new` mints a separate admin token for one device. `--qr` draws a QR code with `qrencode` when it's installed |
 | `tokens create \| create-admin \| list \| revoke` | The access-token commands, as in `buzz-host-tokens` |
 | `logs [agent] [-n 80] [-f]` | buzz-host's log, or one agent's: `journalctl --user` on Linux, `~/Library/Logs/buzz-host` on macOS |
 | `doctor` | Read-only checks: user service manager and linger, installed files, config, buzz-host and its ports, iroh, runtimes installed and signed in (Claude, Codex, Hermes, Antigravity), Python, Docker, tokens. Prints a fix for each problem; exit 1 if a check fails |
@@ -483,6 +505,7 @@ An `agent` is a name (case-insensitive) or a pubkey prefix of 4+ hex digits. `st
 {"version":"0.1.0","bundleId":"…","platform":"linux","url":"wss://…",
  "server":{"unit":"buzz-host.service","state":"active","listeners":[{"role":"token","port":8467,"healthy":true}]},
  "iroh":{"nodeId":"…"},
+ "discovery":{"enabled":true,"relays":["wss://…"],"machinePubkey":"…","owner":{"pubkey":"…","relays":["wss://…"],"attested":true}},
  "agents":[{"pubkey":"…","name":"…","runtime":"claude","runner":"host","unit":"buzz-agent@….service","state":"active"}]}
 ```
 

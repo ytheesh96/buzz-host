@@ -11,7 +11,8 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { createTokenStore } from "../server/auth.mjs";
 import { main, usage } from "./main.mjs";
-import { connectUrl, parseUpArgs, up } from "./up.mjs";
+import { bytesToHex, hexToBytes, schnorr, sha256 } from "../server/noble.mjs";
+import { connectUrl, formatHuman, parseUpArgs, tailscaleServe, up } from "./up.mjs";
 
 const realRun = promisify(execFile);
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -72,6 +73,10 @@ function fakeRun({ state, calls, fakeDeploy }) {
       if (args[0] === "bootstrap") state.loaded = true;
       if (args[0] === "bootout") state.loaded = false;
       return { stdout: "", stderr: "" };
+    }
+    if (cmd === "tailscale") {
+      if (!state.tailscale) throw Object.assign(new Error("spawn tailscale ENOENT"), { code: "ENOENT" });
+      return state.tailscale(args);
     }
     if (cmd.endsWith("npm")) {
       state.npm = args;
@@ -328,4 +333,121 @@ test("bin/buzz-host runs the CLI through a symlink", async (t) => {
   await fs.symlink(path.join(REPO, "bin/buzz-host"), link);
   const { stdout } = await realRun(link, ["--help"], { env: { PATH: `${path.dirname(process.execPath)}:/usr/bin:/bin` } });
   assert.match(stdout, /Usage: buzz-host <command>/);
+});
+
+// ---------- --tailscale-serve, --lan, --owner/--relay/--owner-proof ----------
+
+const tsStatus = (over = {}) =>
+  JSON.stringify({ BackendState: "Running", Self: { DNSName: "box.tail1234.ts.net." }, CertDomains: ["box.tail1234.ts.net"], ...over });
+
+test("--tailscale-serve: serves the token listener on the tailnet name and saves the wss URL", async (t) => {
+  const dir = await tmp(t);
+  const root = await makeBundle(path.join(dir, "bundle"));
+  const home = path.join(dir, "home");
+  await fs.mkdir(home);
+  const served = [];
+  const state = {
+    tailscale: async (args) => {
+      if (args[0] === "status") return { stdout: tsStatus(), stderr: "" };
+      served.push(args);
+      return { stdout: "", stderr: "" };
+    },
+  };
+  const opts = parseUpArgs(["--tailscale-serve", "--tailscale-path", "/bh", "--guest-port", "9467"]);
+  const { result, config } = await up({ ...opts, adapters: false, service: false }, deps(t, { root, home, state, calls: [] }));
+  assert.deepEqual(served, [["serve", "--bg", "--set-path", "/bh", "http://127.0.0.1:9467"]]);
+  assert.equal(result.url, "wss://box.tail1234.ts.net/bh");
+  assert.equal(config.publicGuestUrl, "wss://box.tail1234.ts.net/bh");
+  assert.equal(config.guestHost, undefined, "buzz-host itself stays on loopback");
+  assert.doesNotMatch(formatHuman({ result, service: "skipped", installed: [] }), /127\.0\.0\.1 URL directly/);
+
+  // The default path, and the existing config's guestPort wins over --guest-port.
+  served.length = 0;
+  await up({ ...parseUpArgs(["--tailscale-serve"]), adapters: false, service: false }, deps(t, { root, home, state, calls: [] }));
+  assert.deepEqual(served, [["serve", "--bg", "--set-path", "/_buzz-host", "http://127.0.0.1:9467"]]);
+
+  assert.throws(() => parseUpArgs(["--tailscale-path", "/x"]), /only applies with --tailscale-serve/);
+  assert.throws(() => parseUpArgs(["--tailscale-serve", "--url", "wss://x"]), /drop --url/);
+  assert.throws(() => parseUpArgs(["--tailscale-serve", "--tailscale-path", "nope"]), /must be a path/);
+});
+
+test("--tailscale-serve errors say what to fix", async () => {
+  const serve = (tailscale) =>
+    tailscaleServe({
+      run: async (cmd, args, opts) => (tailscale ? tailscale(args, opts) : Promise.reject(Object.assign(new Error("ENOENT"), { code: "ENOENT" }))),
+      guestPort: 8467,
+      log() {},
+    });
+  const fail = (stderr) => Promise.reject(Object.assign(new Error("exit 1"), { stderr }));
+  await assert.rejects(serve(null), /needs the tailscale CLI/);
+  await assert.rejects(serve(() => fail("failed to connect to local tailscaled; it doesn't appear to be running")), /tailscaled is not running/);
+  await assert.rejects(serve(() => ({ stdout: tsStatus({ BackendState: "NeedsLogin" }) })), /not logged in.*tailscale up/);
+  await assert.rejects(serve(() => ({ stdout: tsStatus({ Self: { DNSName: "box." } }) })), /MagicDNS/);
+  await assert.rejects(serve(() => ({ stdout: tsStatus({ CertDomains: [] }) })), /HTTPS Certificates/);
+  const withServe = (onServe) => (args) => (args[0] === "status" ? { stdout: tsStatus() } : onServe());
+  await assert.rejects(serve(withServe(() => fail("Access denied: serve config denied"))), /sudo tailscale set --operator=\$USER/);
+  await assert.rejects(
+    serve(withServe(() => fail("Serve is not enabled on your tailnet.\nTo enable, visit:\n\n         https://login.tailscale.com/f/serve?node=abc\n"))),
+    /enable it at https:\/\/login\.tailscale\.com\/f\/serve\?node=abc/,
+  );
+  assert.equal(await serve(withServe(() => ({ stdout: "" }))), "wss://box.tail1234.ts.net/_buzz-host");
+});
+
+test("--lan / --no-lan set guestHost and restart; the LAN note warns", async (t) => {
+  const dir = await tmp(t);
+  const root = await makeBundle(path.join(dir, "bundle"));
+  const home = path.join(dir, "home");
+  await fs.mkdir(home);
+  const state = {};
+  await up({ adapters: false }, deps(t, { root, home, state, calls: [] }));
+  const readConfig = async () => JSON.parse(await fs.readFile(path.join(home, ".config/buzz-host/config.json"), "utf8"));
+  assert.equal((await readConfig()).guestHost, undefined);
+  const logs = [];
+  const lan = await up({ ...parseUpArgs(["--lan"]), adapters: false }, deps(t, { root, home, state, calls: [], logs }));
+  assert.equal((await readConfig()).guestHost, "0.0.0.0");
+  assert.equal(lan.service, "restarted");
+  assert.ok(logs.some((l) => /connections from your LAN.*access token/.test(l)));
+  const again = await up({ ...parseUpArgs(["--lan"]), adapters: false }, deps(t, { root, home, state, calls: [] }));
+  assert.equal(again.service, "running", "same setting: no restart");
+  await up({ ...parseUpArgs(["--no-lan"]), adapters: false }, deps(t, { root, home, state, calls: [] }));
+  assert.equal((await readConfig()).guestHost, "127.0.0.1");
+});
+
+test("--owner/--relay/--owner-proof: saved for zero-agent discovery; bad proofs refused", async (t) => {
+  const dir = await tmp(t);
+  const root = await makeBundle(path.join(dir, "bundle"));
+  const home = path.join(dir, "home");
+  await fs.mkdir(home);
+  const ownerSecret = bytesToHex(crypto.getRandomValues(new Uint8Array(32)));
+  const owner = bytesToHex(schnorr.getPublicKey(hexToBytes(ownerSecret)));
+  const readConfig = async () => JSON.parse(await fs.readFile(path.join(home, ".config/buzz-host/config.json"), "utf8"));
+  const run = (argv) => up({ ...parseUpArgs(argv), adapters: false, service: false }, deps(t, { root, home, state: {}, calls: [] }));
+
+  const first = await run(["--owner", owner, "--relay", "wss://relay.example", "--relay", "wss://relay.example"]);
+  assert.match(first.machinePubkey, /^[0-9a-f]{64}$/);
+  let config = await readConfig();
+  assert.equal(config.ownerPubkey, owner);
+  assert.deepEqual(config.discoveryRelays, ["wss://relay.example"]);
+  assert.match(formatHuman(first), new RegExp(`waiting for your attestation of this machine's key ${first.machinePubkey}`));
+
+  const sign = (target) =>
+    JSON.stringify(["auth", owner, "", bytesToHex(schnorr.sign(sha256(new TextEncoder().encode(`nostr:agent-auth:${target}:`)), hexToBytes(ownerSecret)))]);
+  await assert.rejects(run(["--owner-proof", sign("ab".repeat(32))]), /does not attest this machine's key/);
+  await assert.rejects(run(["--owner-proof", "{}"]), /JSON Buzz prints/);
+  const second = await run(["--owner-proof", sign(first.machinePubkey), "--relay", "wss://two.example"]);
+  assert.equal(second.machinePubkey, first.machinePubkey, "the machine key is kept");
+  config = await readConfig();
+  assert.deepEqual(config.ownerAuth.slice(0, 3), ["auth", owner, ""]);
+  assert.deepEqual(config.discoveryRelays, ["wss://relay.example", "wss://two.example"]);
+  assert.doesNotMatch(formatHuman(second), /waiting for your attestation/);
+
+  // A different owner drops the old owner's relays and proof.
+  await run(["--owner", "ab".repeat(32)]);
+  config = await readConfig();
+  assert.equal(config.ownerPubkey, "ab".repeat(32));
+  assert.equal(config.ownerAuth, undefined);
+  assert.deepEqual(config.discoveryRelays, []);
+
+  assert.throws(() => parseUpArgs(["--owner", "npub1nope"]), /not a Nostr public key/);
+  assert.throws(() => parseUpArgs(["--relay", "https://x"]), /wss:\/\//);
 });

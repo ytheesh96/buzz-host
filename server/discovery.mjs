@@ -13,6 +13,15 @@
 // status "stopped" on stop(). Never throws into buzz-host: a relay that is
 // down is retried with backoff, and a host with no authorized agents simply
 // publishes nothing.
+//
+// Zero-agent discovery: the machine has its own Nostr key (machine-key, 0600).
+// When config.json names an owner (`ownerPubkey`), their relays
+// (`discoveryRelays`) and the owner's NIP-OA attestation of the machine key
+// (`ownerAuth`), the machine key publishes for every such relay that no agent
+// of that owner already publishes to. The owner's Buzz only accepts a status
+// signed by a key the owner attested, so the owner and relay alone are not
+// enough: `buzz-host up --owner-proof` or the admin RPC `machine.attest`
+// supplies the attestation.
 
 import fs from "node:fs/promises";
 import { watch } from "node:fs";
@@ -24,6 +33,7 @@ import { encrypt, getConversationKey } from "./nip44.mjs";
 import { signEvent } from "./attention-relay.mjs";
 
 export const STATUS_KIND = 30003;
+export const DISCOVERY_AUTH_CONDITION = `kind=${STATUS_KIND}`;
 export const STATUS_K = "buzz-host-status";
 export const IROH_ADDR_FILE = "iroh-addr.json";
 const HEX64 = /^[0-9a-f]{64}$/;
@@ -72,22 +82,129 @@ export function machineName(configured, hostname = os.hostname()) {
   return hostname.split(".")[0] || hostname;
 }
 
+/** This machine's Nostr key: the hex secret saved in `file` (0600), else a
+ * new one saved there. `create: false` returns null instead of creating one. */
+export async function loadMachineKey({ file, create = true } = {}) {
+  try {
+    const key = (await fs.readFile(file, "utf8")).trim().toLowerCase();
+    if (HEX64.test(key)) return { key, pubkey: bytesToHex(schnorr.getPublicKey(hexToBytes(key))) };
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
+  if (!create) return null;
+  const key = bytesToHex(schnorr.utils.randomSecretKey());
+  await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
+  const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
+  await fs.writeFile(tmp, `${key}\n`, { mode: 0o600 });
+  await fs.chmod(tmp, 0o600);
+  await fs.rename(tmp, file);
+  return { key, pubkey: bytesToHex(schnorr.getPublicKey(hexToBytes(key))) };
+}
+
+const BECH32 = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+
+/** A hex pubkey from 64 hex digits or an `npub1…`; throws on anything else. */
+export function parsePubkey(value) {
+  const text = String(value ?? "").trim().toLowerCase();
+  if (HEX64.test(text)) return text;
+  const sep = text.lastIndexOf("1");
+  if (text.startsWith("npub1") && sep === 4 && text.length === 63) {
+    const data = [...text.slice(5)].map((c) => BECH32.indexOf(c));
+    if (!data.includes(-1)) {
+      const GEN = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3];
+      let chk = 1;
+      for (const v of [..."npub"].map((c) => c.charCodeAt(0) >> 5).concat([0], [..."npub"].map((c) => c.charCodeAt(0) & 31), data)) {
+        const top = chk >> 25;
+        chk = ((chk & 0x1ffffff) << 5) ^ v;
+        for (let i = 0; i < 5; i++) if ((top >> i) & 1) chk ^= GEN[i];
+      }
+      if (chk === 1) {
+        let acc = 0;
+        let bits = 0;
+        const bytes = [];
+        for (const v of data.slice(0, -6)) {
+          acc = (acc << 5) | v;
+          bits += 5;
+          while (bits >= 8) {
+            bits -= 8;
+            bytes.push((acc >> bits) & 0xff);
+          }
+        }
+        if (bytes.length === 32) return bytesToHex(Uint8Array.from(bytes));
+      }
+    }
+  }
+  throw new Error(`not a Nostr public key (npub1… or 64 hex digits): ${String(value).slice(0, 80)}`);
+}
+
+/** The relays config.json lists for discovery: wss:// (or ws://) URLs, deduplicated. */
+export function discoveryRelays(config) {
+  const list = Array.isArray(config?.discoveryRelays) ? config.discoveryRelays : [];
+  return [...new Set(list.filter((u) => typeof u === "string" && /^wss?:\/\/[^\s#]+$/.test(u.trim())).map((u) => u.trim()))];
+}
+
+/**
+ * The owner config.json names for this machine and whether they attested the
+ * machine key: { ownerPubkey, relays, authTag, attested }, or null without an
+ * owner. `authTag` is set only when it is a valid NIP-OA attestation of
+ * `machinePubkey` by that owner.
+ */
+export function configuredOwner(config, machinePubkey) {
+  let ownerPubkey;
+  try {
+    ownerPubkey = config?.ownerPubkey ? parsePubkey(config.ownerPubkey) : null;
+  } catch {
+    ownerPubkey = null;
+  }
+  if (!ownerPubkey) return null;
+  const auth = config.ownerAuth;
+  const attested =
+    Boolean(machinePubkey) &&
+    Array.isArray(auth) &&
+    auth[1] === ownerPubkey &&
+    validAuthTag(machinePubkey, auth, { allowDiscoveryScope: true });
+  return { ownerPubkey, relays: discoveryRelays(config), authTag: attested ? [...auth] : null, attested };
+}
+
+/** Parse an owner proof: a NIP-OA `["auth", owner, ""|"kind=30003", sig]`
+ * tag checked against `machinePubkey`. Prefers `kind=30003` so the machine key
+ * can only publish discovery statuses, and still accepts unconditional proofs
+ * from Buzz's Security settings. Throws with a reason. */
+export function parseOwnerProof(text, machinePubkey) {
+  let auth;
+  try {
+    auth = typeof text === "string" ? JSON.parse(text) : text;
+  } catch {
+    throw new Error('owner proof must be the JSON Buzz prints: ["auth","<owner>","","<signature>"]');
+  }
+  if (!Array.isArray(auth) || auth[0] !== "auth" || auth.length !== 4)
+    throw new Error('owner proof must be the JSON Buzz prints: ["auth","<owner>","","<signature>"]');
+  if (auth[2] !== "" && auth[2] !== DISCOVERY_AUTH_CONDITION)
+    throw new Error(`owner proof conditions must be empty or "${DISCOVERY_AUTH_CONDITION}"`);
+  if (!validAuthTag(machinePubkey, auth, { allowDiscoveryScope: true }))
+    throw new Error(`owner proof does not attest this machine's key (${machinePubkey}); authorize that key in Buzz`);
+  return auth;
+}
+
 // ---------- owners and their agents ----------
 
-/** True when `authTag` is `["auth", owner, "", sig]` with sig the owner's
- * NIP-OA attestation of `agentPubkey` (unconditional). */
-export function validAuthTag(agentPubkey, authTag) {
+/** True when `authTag` is `["auth", owner, cond, sig]` with sig the owner's
+ * NIP-OA attestation of `agentPubkey`. Agents require unconditional (`""`);
+ * machine discovery keys also accept `kind=30003` (`allowDiscoveryScope`). */
+export function validAuthTag(agentPubkey, authTag, { allowDiscoveryScope = false } = {}) {
   if (
     !Array.isArray(authTag) ||
     authTag.length !== 4 ||
     authTag[0] !== "auth" ||
     !HEX64.test(authTag[1]) ||
-    authTag[2] !== "" ||
+    typeof authTag[2] !== "string" ||
     !SIG.test(authTag[3])
   )
     return false;
+  const condition = authTag[2];
+  if (condition !== "" && !(allowDiscoveryScope && condition === DISCOVERY_AUTH_CONDITION)) return false;
   try {
-    const digest = sha256(new TextEncoder().encode(`nostr:agent-auth:${agentPubkey}:`));
+    const digest = sha256(new TextEncoder().encode(`nostr:agent-auth:${agentPubkey}:${condition}`));
     return schnorr.verify(hexToBytes(authTag[3]), digest, hexToBytes(authTag[1]));
   } catch {
     return false;
@@ -134,8 +251,11 @@ export async function readAuthorizedAgents(dataDir, log = console) {
 }
 
 /** One publish target per (relay, owner): the first agent there (by pubkey)
- * publishes, and the event lists all of that owner's agents on this host. */
-export function groupByOwner(agents) {
+ * publishes, and the event lists all of that owner's agents on this host.
+ * `machine` ({ key, pubkey, owner: configuredOwner(...) }) adds a target per
+ * configured relay of an attested owner that no agent of theirs covers; the
+ * machine key publishes those, listing that owner's agents (maybe none). */
+export function groupByOwner(agents, machine = null) {
   const byOwner = new Map();
   for (const agent of agents) {
     if (!byOwner.has(agent.ownerPubkey)) byOwner.set(agent.ownerPubkey, []);
@@ -154,6 +274,20 @@ export function groupByOwner(agents) {
       publisher: { pubkey: agent.pubkey, key: agent.key, authTag: agent.authTag },
       agents: byOwner.get(agent.ownerPubkey),
     });
+  }
+  const owner = machine?.owner;
+  if (machine?.key && owner?.attested) {
+    for (const relayUrl of owner.relays) {
+      const id = `${relayUrl}\n${owner.ownerPubkey}`;
+      if (groups.has(id)) continue;
+      groups.set(id, {
+        id,
+        relayUrl,
+        ownerPubkey: owner.ownerPubkey,
+        publisher: { pubkey: machine.pubkey, key: machine.key, authTag: owner.authTag },
+        agents: byOwner.get(owner.ownerPubkey) ?? [],
+      });
+    }
   }
   return groups;
 }
@@ -216,6 +350,8 @@ export function buildStatusEvent({ secretKey, ownerPubkey, authTag, machineId, p
  * @param {() => object} [options.config]  current config (machineName, publicGuestUrl, publicUrl)
  * @param {() => Promise<string[]>} [options.runtimes]  installed runtime ids
  * @param {() => Promise<object>} [options.capabilities]  { desktop, docker }
+ * @param {{key: string, pubkey: string}} [options.machineKey]  this machine's
+ *   Nostr key; publishes for an attested config owner (see groupByOwner)
  */
 export function createDiscoveryPublisher({
   dataDir,
@@ -224,6 +360,7 @@ export function createDiscoveryPublisher({
   config = () => ({}),
   runtimes = async () => [],
   capabilities = async () => ({}),
+  machineKey = null,
   intervalMs = DEFAULT_INTERVAL_MS,
   debounceMs = DEBOUNCE_MS,
   authWaitMs = AUTH_WAIT_MS,
@@ -452,7 +589,10 @@ export function createDiscoveryPublisher({
   /** Reads the agents again and publishes `status` to every (relay, owner). */
   async function publishAll(status = "online", connectOptions) {
     const agents = await readAuthorizedAgents(dataDir, log);
-    const next = groupByOwner(agents);
+    const next = groupByOwner(
+      agents,
+      machineKey && { ...machineKey, owner: configuredOwner(config() ?? {}, machineKey.pubkey) },
+    );
     // Connections whose publisher no longer publishes there are closed.
     const wanted = new Set([...next.values()].map(connectionKey));
     for (const key of [...connections.keys()]) if (!wanted.has(key)) closeConnection(key);
@@ -460,7 +600,7 @@ export function createDiscoveryPublisher({
     const agentsKey = JSON.stringify([...next.values()].map((g) => [g.id, g.publisher.pubkey, g.agents.length]));
     if (agentsKey !== lastAgentsKey) {
       lastAgentsKey = agentsKey;
-      if (!next.size) log.log("discovery: no owner-authorized agents; nothing to publish");
+      if (!next.size) log.log("discovery: no owner-authorized agents or attested owner; nothing to publish");
       else
         log.log(
           `discovery: publishing machine ${machineId} to ${next.size} owner relay(s): ` +

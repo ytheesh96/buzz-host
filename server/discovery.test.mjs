@@ -15,9 +15,14 @@ import { schnorr, sha256, bytesToHex, hexToBytes } from "./noble.mjs";
 import { decrypt, getConversationKey } from "./nip44.mjs";
 import {
   buildStatusEvent,
+  configuredOwner,
   createDiscoveryPublisher,
+  DISCOVERY_AUTH_CONDITION,
   groupByOwner,
   loadMachineId,
+  loadMachineKey,
+  parseOwnerProof,
+  parsePubkey,
   machineName,
   readAuthorizedAgents,
   readRoutes,
@@ -35,10 +40,10 @@ function keypair() {
   return { secret, pubkey: bytesToHex(schnorr.getPublicKey(hexToBytes(secret))) };
 }
 
-/** The owner's NIP-OA attestation of `agentPubkey` (unconditional). */
-function attest(owner, agentPubkey) {
-  const digest = sha256(new TextEncoder().encode(`nostr:agent-auth:${agentPubkey}:`));
-  return ["auth", owner.pubkey, "", bytesToHex(schnorr.sign(digest, hexToBytes(owner.secret)))];
+/** The owner's NIP-OA attestation of `agentPubkey` (unconditional by default, or with `conditions`). */
+function attest(owner, agentPubkey, conditions = "") {
+  const digest = sha256(new TextEncoder().encode(`nostr:agent-auth:${agentPubkey}:${conditions}`));
+  return ["auth", owner.pubkey, conditions, bytesToHex(schnorr.sign(digest, hexToBytes(owner.secret)))];
 }
 
 function verifyEvent(event) {
@@ -176,7 +181,7 @@ async function startRelay({ requireAuth = true, refuseLogin = false } = {}) {
             verifyEvent(event) &&
             tag("challenge")?.[1] === challenge &&
             tag("relay")?.[1] === url &&
-            validAuthTag(event.pubkey, tag("auth"));
+            validAuthTag(event.pubkey, tag("auth"), { allowDiscoveryScope: true });
           if (ok) {
             authed = event.pubkey;
             logins.push({ pubkey: event.pubkey, authTag: tag("auth") });
@@ -247,12 +252,17 @@ test("status event: NIP-44 v2 to the owner, NIP-01 signed, with d/k/p/auth tags"
   assert.ok(!verifyEvent({ ...event, content: event.content.slice(0, -2) + "AA" }));
 });
 
-test("validAuthTag accepts only the owner's unconditional NIP-OA attestation of that agent", () => {
+test("validAuthTag accepts only the owner's NIP-OA attestation of that agent (and kind=30003 for discovery)", () => {
   const owner = keypair();
   const agent = keypair();
   const other = keypair();
   const tag = attest(owner, agent.pubkey);
+  const scoped = attest(owner, agent.pubkey, DISCOVERY_AUTH_CONDITION);
   assert.ok(validAuthTag(agent.pubkey, tag));
+  assert.ok(!validAuthTag(agent.pubkey, scoped), "agents require unconditional attestation");
+  assert.ok(validAuthTag(agent.pubkey, scoped, { allowDiscoveryScope: true }), "machine key accepts kind=30003");
+  assert.ok(!validAuthTag(agent.pubkey, ["auth", owner.pubkey, DISCOVERY_AUTH_CONDITION, tag[3]], { allowDiscoveryScope: true }), "condition swap rejected");
+  assert.ok(!validAuthTag(agent.pubkey, attest(owner, agent.pubkey, "kind=1"), { allowDiscoveryScope: true }), "other conditions rejected");
   assert.ok(!validAuthTag(other.pubkey, tag), "attestation is for another agent");
   assert.ok(!validAuthTag(agent.pubkey, ["auth", other.pubkey, "", tag[3]]), "signed by someone else");
   assert.ok(!validAuthTag(agent.pubkey, ["auth", owner.pubkey, "kind=1", tag[3]]), "conditions not allowed");
@@ -850,6 +860,187 @@ test("buzz-host: hello carries the persisted machineId; boot publishes it, SIGTE
     host.child.kill("SIGTERM");
     await host.exited;
     assert.equal(relay.events.length, count, "discovery: false publishes nothing");
+  } finally {
+    if (host && host.child.exitCode === null) {
+      host.child.kill("SIGKILL");
+      await host.exited;
+    }
+    await relay.close();
+    await fs.rm(home, { recursive: true, force: true });
+    await fs.rm(run, { recursive: true, force: true });
+  }
+});
+
+// ---------- zero-agent discovery (the machine's own key) ----------
+
+test("parsePubkey takes hex or npub and rejects the rest", () => {
+  const hex = "67c54ea8adf416ff8042951cb9f83d1634fb6d5341e5300e9bd57aa4587ae464";
+  assert.equal(parsePubkey("npub1vlz5a29d7st0lqzzj5wtn7pazc60km2ng8jnqr5m64a2gkr6u3jqf7z4kq"), hex);
+  assert.equal(parsePubkey(` ${hex.toUpperCase()} `), hex);
+  // One wrong character breaks the checksum.
+  assert.throws(() => parsePubkey("npub1vlz5a29d7st0lqzzj5wtn7pazc60km2ng8jnqr5m64a2gkr6u3jqf7z4kp"), /not a Nostr public key/);
+  assert.throws(() => parsePubkey("nsec1vlz5a29d7st0lqzzj5wtn7pazc60km2ng8jnqr5m64a2gkr6u3jqf7z4kq"), /not a Nostr public key/);
+  assert.throws(() => parsePubkey("abc"), /not a Nostr public key/);
+});
+
+test("loadMachineKey: created once 0600, reused; create:false never creates", async () => {
+  const dir = await tmpdir("disc-mkey-");
+  try {
+    const file = path.join(dir, "sub/machine-key");
+    assert.equal(await loadMachineKey({ file, create: false }), null);
+    const first = await loadMachineKey({ file });
+    assert.match(first.pubkey, /^[0-9a-f]{64}$/);
+    assert.equal(bytesToHex(schnorr.getPublicKey(hexToBytes(first.key))), first.pubkey);
+    assert.equal((await fs.stat(file)).mode & 0o777, 0o600);
+    assert.deepEqual(await loadMachineKey({ file }), first);
+    assert.deepEqual(await loadMachineKey({ file, create: false }), first);
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("configuredOwner / parseOwnerProof: only the owner's attestation of this machine key counts", () => {
+  const owner = keypair();
+  const machine = keypair();
+  const other = keypair();
+  const proof = attest(owner, machine.pubkey);
+  const scopedProof = attest(owner, machine.pubkey, DISCOVERY_AUTH_CONDITION);
+  assert.deepEqual(parseOwnerProof(JSON.stringify(proof), machine.pubkey), proof);
+  assert.deepEqual(parseOwnerProof(JSON.stringify(scopedProof), machine.pubkey), scopedProof);
+  assert.throws(() => parseOwnerProof("nope", machine.pubkey), /JSON Buzz prints/);
+  assert.throws(() => parseOwnerProof(JSON.stringify(attest(owner, other.pubkey)), machine.pubkey), /does not attest this machine/);
+  assert.throws(() => parseOwnerProof(JSON.stringify(["auth", owner.pubkey, "kind=1", proof[3]]), machine.pubkey), /kind=30003/);
+  assert.throws(() => parseOwnerProof(JSON.stringify(["auth", owner.pubkey, DISCOVERY_AUTH_CONDITION, proof[3]]), machine.pubkey), /does not attest this machine/);
+
+  assert.equal(configuredOwner({}, machine.pubkey), null);
+  assert.equal(configuredOwner({ ownerPubkey: "junk" }, machine.pubkey), null);
+  const relays = ["wss://r.example", "wss://r.example", "https://no", "wss://two.example"];
+  assert.deepEqual(configuredOwner({ ownerPubkey: owner.pubkey, discoveryRelays: relays }, machine.pubkey), {
+    ownerPubkey: owner.pubkey,
+    relays: ["wss://r.example", "wss://two.example"],
+    authTag: null,
+    attested: false,
+  });
+  assert.equal(configuredOwner({ ownerPubkey: owner.pubkey, ownerAuth: proof }, machine.pubkey).attested, true);
+  assert.equal(configuredOwner({ ownerPubkey: owner.pubkey, ownerAuth: scopedProof }, machine.pubkey).attested, true);
+  // A proof by someone else, or for another key, is ignored.
+  assert.equal(configuredOwner({ ownerPubkey: other.pubkey, ownerAuth: proof }, machine.pubkey).attested, false);
+  assert.equal(configuredOwner({ ownerPubkey: owner.pubkey, ownerAuth: proof }, other.pubkey).attested, false);
+});
+
+test("groupByOwner: an attested owner's relays get the machine key, unless an agent of theirs is there", async () => {
+  const dataDir = await tmpdir("disc-group-m-");
+  try {
+    const owner = keypair();
+    const machine = keypair();
+    const agent = await writeAgent(dataDir, { owner, name: "A", relay: "wss://one.example" });
+    const agents = await readAuthorizedAgents(dataDir, quiet);
+    const machineOwner = configuredOwner(
+      { ownerPubkey: owner.pubkey, discoveryRelays: ["wss://one.example", "wss://two.example"], ownerAuth: attest(owner, machine.pubkey) },
+      machine.pubkey,
+    );
+    const groups = [...groupByOwner(agents, { key: machine.secret, pubkey: machine.pubkey, owner: machineOwner }).values()];
+    assert.deepEqual(
+      groups.map((g) => [g.relayUrl, g.publisher.pubkey]),
+      [
+        ["wss://one.example", agent.pubkey],
+        ["wss://two.example", machine.pubkey],
+      ],
+    );
+    assert.deepEqual(groups[1].agents, [{ pubkey: agent.pubkey, name: "A" }]);
+    assert.deepEqual(groups[1].publisher.authTag, machineOwner.authTag);
+    // Not attested: nothing extra. No agents and no machine: nothing at all.
+    const pending = configuredOwner({ ownerPubkey: owner.pubkey, discoveryRelays: ["wss://two.example"] }, machine.pubkey);
+    assert.equal(groupByOwner(agents, { key: machine.secret, pubkey: machine.pubkey, owner: pending }).size, 1);
+    assert.equal(groupByOwner([]).size, 0);
+  } finally {
+    await fs.rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("publisher with no agents: the attested machine key logs in and publishes to the owner", async () => {
+  const relay = await startRelay();
+  const dataDir = await tmpdir("disc-zero-");
+  const runDir = await tmpdir("disc-zero-run-");
+  const owner = keypair();
+  const machine = keypair();
+  const config = { ownerPubkey: owner.pubkey, discoveryRelays: [relay.url] };
+  const publisher = createDiscoveryPublisher({
+    dataDir,
+    runDir,
+    machineId: "12345678-9abc-4def-8123-456789abcdef",
+    machineKey: { key: machine.secret, pubkey: machine.pubkey },
+    config: () => config,
+    intervalMs: 60_000,
+    debounceMs: 10,
+    authWaitMs: 2_000,
+    log: quiet,
+  });
+  try {
+    // Owner and relay alone: the owner's Buzz would reject it, so nothing goes out.
+    assert.deepEqual(await publisher.publishNow(), []);
+    assert.equal(relay.connections(), 0);
+    config.ownerAuth = attest(owner, machine.pubkey);
+    const [event] = await publisher.publishNow();
+    assert.ok(verifyEvent(event));
+    assert.equal(event.pubkey, machine.pubkey);
+    assert.deepEqual(relay.logins[0], { pubkey: machine.pubkey, authTag: config.ownerAuth });
+    assert.ok(event.tags.some((t) => t[0] === "auth" && t[1] === owner.pubkey));
+    assert.ok(event.tags.some((t) => t[0] === "p" && t[1] === owner.pubkey));
+    const payload = open(event, owner);
+    assert.equal(payload.status, "online");
+    assert.deepEqual(payload.agents, []);
+    await publisher.stop();
+  } finally {
+    await publisher.stop();
+    await relay.close();
+    await fs.rm(dataDir, { recursive: true, force: true });
+    await fs.rm(runDir, { recursive: true, force: true });
+  }
+});
+
+test("buzz-host: zero agents, machine.attest makes the machine discoverable at once", { timeout: 60_000 }, async () => {
+  const relay = await startRelay();
+  const home = await tmpdir("disc-home0-");
+  const run = await tmpdir("disc-xdg0-");
+  await fs.chmod(run, 0o700);
+  const port = await freePort();
+  const owner = keypair();
+  const configFile = path.join(home, ".config/buzz-host/config.json");
+  let host;
+  try {
+    await fs.mkdir(path.dirname(configFile), { recursive: true });
+    await fs.writeFile(
+      configFile,
+      JSON.stringify({ port, guestPort: 0, allowLogins: ["owner@example.com"], machineName: "Zero", ownerPubkey: owner.pubkey }),
+    );
+    host = await bootHost(home, run, port);
+    const hello = await rpc(port, "hello");
+    assert.match(hello.machinePubkey, /^[0-9a-f]{64}$/);
+    assert.deepEqual(hello.discoveryOwner, { ownerPubkey: owner.pubkey, relays: [], attested: false, enabled: true });
+    const saved = await loadMachineKey({ file: path.join(home, ".local/share/buzz-host/machine-key"), create: false });
+    assert.equal(saved.pubkey, hello.machinePubkey);
+
+    await assert.rejects(rpc(port, "machine.attest", { auth: attest(owner, keypair().pubkey), relay: relay.url }), /does not attest/);
+    const scopedAuth = attest(owner, hello.machinePubkey, DISCOVERY_AUTH_CONDITION);
+    const state = await rpc(port, "machine.attest", { auth: scopedAuth, relay: relay.url });
+    assert.deepEqual(state, { ownerPubkey: owner.pubkey, relays: [relay.url], attested: true, enabled: true });
+    await until(() => relay.events.length >= 1, { timeoutMs: 15_000, what: "publish after attest" });
+    assert.equal(relay.events[0].pubkey, hello.machinePubkey);
+    assert.deepEqual(relay.events[0].tags.find((t) => t[0] === "auth"), scopedAuth);
+    const online = open(relay.events[0], owner);
+    assert.equal(online.machineId, hello.machineId);
+    assert.deepEqual(online.agents, []);
+
+    // Saved for the next boot, with the owner's other keys kept.
+    const config = JSON.parse(await fs.readFile(configFile, "utf8"));
+    assert.equal(config.machineName, "Zero");
+    assert.deepEqual(config.discoveryRelays, [relay.url]);
+    assert.equal(config.ownerPubkey, owner.pubkey);
+    assert.ok(validAuthTag(hello.machinePubkey, config.ownerAuth, { allowDiscoveryScope: true }));
+    host.child.kill("SIGTERM");
+    assert.equal((await host.exited).code, 0, host.output());
+    assert.equal(open(relay.events.at(-1), owner).status, "stopped");
   } finally {
     if (host && host.child.exitCode === null) {
       host.child.kill("SIGKILL");

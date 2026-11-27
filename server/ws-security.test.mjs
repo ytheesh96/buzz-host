@@ -3,6 +3,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  isLoopbackAddress,
   clientIpFromForwardedFor,
   createFragmentBuffer,
   createGuestSocketRegistry,
@@ -212,4 +213,10 @@ test("idle watch is a no-op for a non-positive timeout", () => {
   watch.arm();
   assert.equal(armed, false);
   assert.equal(watch.pending, false);
+});
+
+test("loopback peers: 127/8, ::1 and IPv4-mapped loopback only", () => {
+  for (const a of ["127.0.0.1", "127.8.9.10", "::1", "::ffff:127.0.0.1"]) assert.equal(isLoopbackAddress(a), true, a);
+  for (const a of ["192.168.1.5", "::ffff:10.0.0.1", "0.0.0.0", "", undefined, "fe80::1", "127.0.0.1.evil"])
+    assert.equal(isLoopbackAddress(a), false, String(a));
 });

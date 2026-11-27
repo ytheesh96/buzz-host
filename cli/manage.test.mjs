@@ -17,7 +17,7 @@ import { createHost, parseArgs, UsageError } from "./host.mjs";
 import { runDown, runRestart, runStatus } from "./lifecycle.mjs";
 import { runLogs } from "./logs.mjs";
 import { COMMANDS, usage } from "./main.mjs";
-import { runPair } from "./pair.mjs";
+import { buildPairDeepLink, runPair } from "./pair.mjs";
 import { runTokensCommand } from "./tokens.mjs";
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -169,7 +169,8 @@ test("status --json: the documented shape; exit 3 when buzz-host is down", async
   state.units[unitName(keys[1].pubkey)] = "failed";
   assert.equal(await runStatus(["--json"], host, io), 0);
   const j = io.json();
-  assert.deepEqual(Object.keys(j).sort(), ["agents", "bundleId", "iroh", "platform", "server", "url", "version"]);
+  assert.deepEqual(Object.keys(j).sort(), ["agents", "bundleId", "discovery", "iroh", "platform", "server", "url", "version"]);
+  assert.deepEqual(j.discovery, { enabled: true, relays: [], machinePubkey: null, owner: null });
   assert.deepEqual(j.server, { unit: "buzz-host.service", state: "active", listeners: [{ role: "token", port: 8467, healthy: true }] });
   assert.deepEqual(j.iroh, { nodeId: "node1" });
   assert.equal(j.url, "ws://127.0.0.1:8467");
@@ -366,7 +367,14 @@ test("pair prints URL, the token `up` uses, pairing URL and routes; --json is st
   assert.deepEqual(j.machine, { id: "11111111-2222-4333-8444-555555555555", name: "Box" });
   assert.deepEqual(j.iroh, { nodeId: "nodeabc", endpointAddr: "addrabc" });
   assert.deepEqual(j.routes.map((r) => r.type), ["iroh", "wss"]);
-  assert.deepEqual(j.discovery, { enabled: true, relays: ["wss://relay.example"] });
+  const machineKey = (await fs.readFile(path.join(home, ".local/share/buzz-host/machine-key"), "utf8")).trim();
+  assert.deepEqual(j.discovery, {
+    enabled: true,
+    relays: ["wss://relay.example"],
+    machinePubkey: bytesToHex(schnorr.getPublicKey(hexToBytes(machineKey))),
+    owner: null,
+  });
+  assert.equal(j.deepLink, `buzz://pair?url=wss%3A%2F%2Fbox.example%2F_buzz-host&name=Box#token=${j.token}`);
 
   // The same admin token as `buzz-host up` keeps printing.
   io.lines.length = 0;
@@ -380,6 +388,8 @@ test("pair prints URL, the token `up` uses, pairing URL and routes; --json is st
   await runPair([], host, io, { log() {} });
   assert.match(io.text(), /Pair a device with Box \(11111111/);
   assert.match(io.text(), /Pairing URL: +wss:\/\/box\.example\/_buzz-host#token=bha_/);
+  assert.match(io.text(), /Open in Buzz: +buzz:\/\/pair\?url=wss%3A%2F%2Fbox\.example%2F_buzz-host&name=Box#token=bha_/);
+  assert.doesNotMatch(io.text(), /ws:\/\/127\.0\.0\.1 URL directly/);
   assert.match(io.text(), /Iroh node: +nodeabc/);
   assert.match(io.text(), /Discovery: +publishing to wss:\/\/relay\.example/);
 });
@@ -406,6 +416,40 @@ test("pair --new mints a separate admin token; --qr uses qrencode and degrades w
   assert.match(warnings[0], /qrencode is not installed/);
   await assert.rejects(runPair(["--label", "x"], host, io), /only applies with --new/);
   await assert.rejects(runPair(["--url", "https://x"], host, io), /ws:\/\/ or wss:\/\//);
+});
+
+test("pair: deep link encoding, the loopback hint, and zero-agent discovery reporting", async (t) => {
+  const owner = keypair();
+  const { host, io } = await setup(t, {
+    agents: [],
+    config: { guestPort: 8467, publicGuestUrl: "", machineName: "My Box & Co", ownerPubkey: owner.pubkey, discoveryRelays: ["wss://relay.example"] },
+  });
+  assert.equal(buildPairDeepLink("ws://127.0.0.1:8467#old", "bha_x", "A b"), "buzz://pair?url=ws%3A%2F%2F127.0.0.1%3A8467&name=A%20b#token=bha_x");
+  assert.equal(buildPairDeepLink("wss://h.example", "bha_y"), "buzz://pair?url=wss%3A%2F%2Fh.example#token=bha_y");
+
+  await runPair(["--json"], host, io, { log() {} });
+  const j = io.json();
+  assert.equal(j.deepLink, `buzz://pair?url=ws%3A%2F%2F127.0.0.1%3A8467&name=My%20Box%20%26%20Co#token=${j.token}`);
+  assert.deepEqual(j.discovery.owner, { pubkey: owner.pubkey, relays: ["wss://relay.example"], attested: false });
+  assert.deepEqual(j.discovery.relays, []);
+  io.lines.length = 0;
+  await runPair([], host, io, { log() {} });
+  assert.match(io.text(), /accepts this ws:\/\/127\.0\.0\.1 URL directly/);
+  assert.match(io.text(), /buzz-host up --tailscale-serve/);
+  assert.match(io.text(), new RegExp(`waiting for the owner to attest machine key ${j.discovery.machinePubkey}`));
+
+  // With the owner's proof, the configured relay is published to with no agents.
+  const digest = sha256(new TextEncoder().encode(`nostr:agent-auth:${j.discovery.machinePubkey}:`));
+  const ownerAuth = ["auth", owner.pubkey, "", bytesToHex(schnorr.sign(digest, hexToBytes(owner.secret)))];
+  const config = JSON.parse(await fs.readFile(host.paths.config, "utf8"));
+  await fs.writeFile(host.paths.config, JSON.stringify({ ...config, ownerAuth }));
+  io.lines.length = 0;
+  await runPair(["--json"], host, io, { log() {} });
+  assert.deepEqual(io.json().discovery.relays, ["wss://relay.example"]);
+  assert.equal(io.json().discovery.owner.attested, true);
+  io.lines.length = 0;
+  await runStatus([], host, io);
+  assert.match(io.text(), /discovery publishing to wss:\/\/relay\.example/);
 });
 
 // ---------- logs ----------
