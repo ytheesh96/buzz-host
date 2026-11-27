@@ -1,9 +1,10 @@
 // `buzz-host status | down | restart`: the server unit and every agent's unit,
 // on systemd (--user) or launchd through server/service-manager.mjs.
 
-import { readIrohAddr } from "../server/discovery.mjs";
+import { loadMachineKey, readAuthorizedAgents, readIrohAddr } from "../server/discovery.mjs";
 import { resolvePublicUrl } from "../server/tokens-cli.mjs";
 import { listenerPorts, parseArgs, printJson } from "./host.mjs";
+import { describeDiscovery, discoveryReport } from "./pair.mjs";
 import { waitForHealth } from "./up.mjs";
 
 export const STATUS_USAGE = `Usage: buzz-host status [--json]
@@ -13,7 +14,7 @@ and this bundle's version. Exits 0 when buzz-host is running, 3 when it isn't.
 
 Options:
   --json   Print one JSON object: {version, bundleId, platform, server, url,
-           iroh, agents[]} (server.state is systemd's is-active word: active,
+           iroh, discovery, agents[]} (server.state is systemd's is-active word: active,
            activating, inactive, failed, unknown)
   -h, --help`;
 
@@ -49,10 +50,12 @@ export async function collectStatus(host) {
     ...agents.map((a) => host.services.status(a.pubkey)),
   ]);
   const running = state === "active";
-  const [guestOk, tailnetOk, iroh] = await Promise.all([
+  const [guestOk, tailnetOk, iroh, authorized, machineKey] = await Promise.all([
     running ? host.healthy(ports.guest) : false,
     running && ports.tailnet ? host.healthy(ports.tailnet) : false,
     readIrohAddr(host.runDir),
+    readAuthorizedAgents(host.paths.agents, { warn() {} }),
+    loadMachineKey({ file: host.paths.machineKey, create: false }).catch(() => null),
   ]);
   const listeners = [{ role: "token", port: ports.guest, healthy: guestOk }];
   if (ports.tailnet) listeners.push({ role: "tailnet", port: ports.tailnet, healthy: tailnetOk });
@@ -62,6 +65,7 @@ export async function collectStatus(host) {
     platform: host.platform,
     server: { unit: host.services.server.unit, state, listeners },
     iroh: iroh ? { nodeId: iroh.nodeId } : null,
+    discovery: discoveryReport(config, authorized, machineKey?.pubkey),
     config,
     agents: agents.map((a, i) => ({ pubkey: a.pubkey, name: a.name, runtime: a.runtime, runner: a.runner, unit: host.services.unit(a.pubkey), state: states[i] })),
   };
@@ -85,6 +89,7 @@ export async function runStatus(argv, host, io) {
     for (const l of s.server.listeners) io.out(`        ${l.role} listener :${l.port} ${running ? (l.healthy ? "answers /health" : "NOT answering /health") : ""}`.trimEnd());
     io.out(`url     ${url}`);
     if (s.iroh) io.out(`iroh    ${s.iroh.nodeId}`);
+    io.out(`discovery ${describeDiscovery(s.discovery)}`);
     io.out("");
     if (!s.agents.length) io.out("No agents.");
     else {

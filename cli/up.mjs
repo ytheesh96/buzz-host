@@ -17,11 +17,13 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
+import { loadMachineKey, parseOwnerProof, parsePubkey } from "../server/discovery.mjs";
 
 export const DEFAULT_PORT = 8457;
 export const DEFAULT_GUEST_PORT = 8467;
 export const SERVER_LABEL = "com.buzz-host.server";
 export const UP_TOKEN_LABEL = "buzz-host up";
+export const DEFAULT_TAILSCALE_PATH = "/_buzz-host";
 /** Prebuilt binaries a bundle ships in bin/, installed into <lib>/bin. */
 export const BUNDLE_BINARIES = ["buzz-acp", "buzz", "buzz-host-iroh"];
 const HEALTH_TIMEOUT_MS = 30_000;
@@ -41,6 +43,17 @@ Options:
   --url <wss://…>    Public URL clients use (saved as publicGuestUrl)
   --guest-port <n>   Token listener port for a new config (default ${DEFAULT_GUEST_PORT})
   --port <n>         Tailscale-login listener port for a new config (default ${DEFAULT_PORT})
+  --tailscale-serve  Publish the token listener on this machine's tailnet HTTPS name
+                     (tailscale serve --bg) and save wss://<name>.ts.net<path> as the URL.
+                     buzz-host itself stays on 127.0.0.1.
+  --tailscale-path <path>  Path for --tailscale-serve (default ${DEFAULT_TAILSCALE_PATH})
+  --lan / --no-lan   Bind the token listener to 0.0.0.0 (LAN, still token-gated) /
+                     back to 127.0.0.1 (saved as guestHost)
+  --owner <npub|hex> Your Buzz identity: announce this machine to you even with no agents
+  --relay <wss://…>  Your community relay for that announcement (repeatable; added to
+                     discoveryRelays)
+  --owner-proof <json>  Your attestation of this machine's key (Buzz → Settings → Security
+                     → authorize an identity; \`buzz-host pair\` prints the key)
   --force            Reinstall the files even if this bundle is already installed
   --no-service       Install files and config only; don't touch systemd/launchd
   --no-linger        Linux: don't enable lingering (buzz-host stops at logout)
@@ -67,6 +80,23 @@ export function parseUpArgs(argv) {
       case "--no-service": opts.service = false; break;
       case "--no-linger": opts.linger = false; break;
       case "--no-adapters": opts.adapters = false; break;
+      case "--tailscale-serve": opts.tailscaleServe = true; break;
+      case "--tailscale-path": {
+        const p = value().trim();
+        if (!/^\/[A-Za-z0-9._~\-/]*$/.test(p)) throw new Error("--tailscale-path must be a path like /_buzz-host");
+        opts.tailscalePath = p;
+        break;
+      }
+      case "--lan": opts.lan = true; break;
+      case "--no-lan": opts.lan = false; break;
+      case "--owner": opts.owner = parsePubkey(value()); break;
+      case "--relay": {
+        const url = value().trim();
+        if (!/^wss?:\/\/[^\s#]+$/.test(url)) throw new Error("--relay must be a wss:// URL");
+        (opts.relays ??= []).push(url);
+        break;
+      }
+      case "--owner-proof": opts.ownerProof = value(); break;
       case "--url": {
         const url = value().trim();
         if (!/^wss?:\/\/[^\s#]+$/.test(url)) throw new Error("--url must be a ws:// or wss:// URL");
@@ -79,6 +109,8 @@ export function parseUpArgs(argv) {
       default: throw new Error(`unknown option ${arg}`);
     }
   }
+  if (opts.tailscalePath && !opts.tailscaleServe) throw new Error("--tailscale-path only applies with --tailscale-serve");
+  if (opts.tailscaleServe && opts.url) throw new Error("--tailscale-serve sets the URL itself; drop --url");
   return opts;
 }
 
@@ -93,6 +125,7 @@ export function hostPaths(home, platform) {
     config: path.join(home, ".config/buzz-host/config.json"),
     upToken: path.join(home, ".config/buzz-host/up-token.json"),
     tokens: path.join(home, ".local/share/buzz-host/tokens.json"),
+    machineKey: path.join(home, ".local/share/buzz-host/machine-key"),
     serviceFile:
       platform === "darwin"
         ? path.join(home, "Library/LaunchAgents", `${SERVER_LABEL}.plist`)
@@ -147,24 +180,22 @@ export async function describeBundle(root, { fs = nodeFs } = {}) {
 /**
  * Create config.json if missing (token-only: no allowLogins, so only the
  * token listener runs). An existing config is kept; only a missing guestPort
- * (required for the token this command prints) and an explicit --url are
- * filled in. Returns the parsed config.
+ * (required for the token this command prints) and the options given
+ * (--url, --lan/--no-lan, --owner, --relay, --owner-proof) are filled in.
+ * `machinePubkey` checks --owner-proof. Returns the parsed config.
  */
-export async function ensureConfig(paths, opts, { fs = nodeFs, log }) {
+export async function ensureConfig(paths, opts, { fs = nodeFs, log, machinePubkey } = {}) {
   const text = await readText(fs, paths.config);
-  if (text === null) {
-    const config = {
-      port: opts.port ?? DEFAULT_PORT,
-      guestPort: opts.guestPort ?? DEFAULT_GUEST_PORT,
-      // Empty, not omitted: buzz-host.mjs otherwise falls back to omarchy's URL.
-      publicGuestUrl: opts.url ?? "",
-    };
-    await writePrivate(fs, paths.config, `${JSON.stringify(config, null, 2)}\n`);
-    log(`wrote ${paths.config}`);
-    return { config, changed: true };
-  }
-  const config = JSON.parse(text);
-  let changed = false;
+  const created = text === null;
+  const config = created
+    ? {
+        port: opts.port ?? DEFAULT_PORT,
+        guestPort: opts.guestPort ?? DEFAULT_GUEST_PORT,
+        // Empty, not omitted: buzz-host.mjs otherwise falls back to omarchy's URL.
+        publicGuestUrl: opts.url ?? "",
+      }
+    : JSON.parse(text);
+  let changed = created;
   if (!Number.isInteger(config.guestPort) || config.guestPort <= 0) {
     config.guestPort = opts.guestPort ?? DEFAULT_GUEST_PORT;
     log(`added guestPort ${config.guestPort} to ${paths.config}`);
@@ -175,8 +206,100 @@ export async function ensureConfig(paths, opts, { fs = nodeFs, log }) {
     log(`set publicGuestUrl in ${paths.config}`);
     changed = true;
   }
-  if (changed) await writePrivate(fs, paths.config, `${JSON.stringify(config, null, 2)}\n`);
+  if (opts.lan !== undefined) {
+    const host = opts.lan ? "0.0.0.0" : "127.0.0.1";
+    if ((config.guestHost ?? "127.0.0.1") !== host) {
+      config.guestHost = host;
+      log(`set guestHost ${host} in ${paths.config}`);
+      changed = true;
+    }
+    if (opts.lan)
+      log(
+        `note: the token listener (port ${config.guestPort}) now takes connections from your LAN. Every connection still needs an access token. Buzz Desktop only accepts wss:// for other machines, so put TLS in front of it (or use --tailscale-serve / iroh).`,
+      );
+  }
+  const proof = opts.ownerProof === undefined ? null : parseOwnerProof(opts.ownerProof, machinePubkey);
+  const owner = opts.owner ?? (proof ? parsePubkey(proof[1]) : undefined);
+  if (proof && owner !== proof[1]) throw new Error("--owner-proof was signed by a different identity than --owner");
+  if (owner && config.ownerPubkey !== owner) {
+    // A different owner: their relays and proof replace the old owner's.
+    if (config.ownerPubkey) {
+      delete config.ownerAuth;
+      config.discoveryRelays = [];
+    }
+    config.ownerPubkey = owner;
+    log(`set ownerPubkey in ${paths.config}`);
+    changed = true;
+  }
+  if (opts.relays?.length) {
+    if (!config.ownerPubkey) throw new Error("--relay needs --owner (whose relay it is)");
+    const current = Array.isArray(config.discoveryRelays) ? config.discoveryRelays : [];
+    const next = [...new Set([...current, ...opts.relays])];
+    if (next.length !== current.length) {
+      config.discoveryRelays = next;
+      log(`set discoveryRelays in ${paths.config}`);
+      changed = true;
+    }
+  }
+  if (proof && JSON.stringify(config.ownerAuth) !== JSON.stringify(proof)) {
+    config.ownerAuth = proof;
+    log(`saved the owner's attestation of this machine in ${paths.config}`);
+    changed = true;
+  }
+  if (created) {
+    await writePrivate(fs, paths.config, `${JSON.stringify(config, null, 2)}\n`);
+    log(`wrote ${paths.config}`);
+  } else if (changed) await writePrivate(fs, paths.config, `${JSON.stringify(config, null, 2)}\n`);
   return { config, changed };
+}
+
+const tsError = (error) => `${error.stderr || ""}${error.stdout || ""}`.trim() || error.message || "";
+
+/**
+ * `--tailscale-serve`: proxy https://<this machine>.ts.net<servePath> to the
+ * token listener on 127.0.0.1 (tailscale serve --bg) and return the wss://
+ * URL clients use. Every failure says what to fix.
+ */
+export async function tailscaleServe({ run, guestPort, servePath = DEFAULT_TAILSCALE_PATH, log }) {
+  let status;
+  try {
+    const { stdout } = await run("tailscale", ["status", "--json"], { timeout: 30_000, maxBuffer: 16 << 20 });
+    status = JSON.parse(stdout);
+  } catch (error) {
+    if (error.code === "ENOENT")
+      throw new Error("--tailscale-serve needs the tailscale CLI on PATH (install Tailscale: https://tailscale.com/download)");
+    if (error instanceof SyntaxError) throw new Error("`tailscale status --json` printed something that isn't JSON");
+    const why = tsError(error);
+    if (/doesn't appear to be running|failed to connect|connection refused/i.test(why))
+      throw new Error(`tailscaled is not running (${why.split("\n")[0]}). Start Tailscale, then rerun.`);
+    throw new Error(`tailscale status failed: ${why.split("\n")[0]}`);
+  }
+  if (status?.BackendState !== "Running")
+    throw new Error(`Tailscale is not logged in (state: ${status?.BackendState ?? "unknown"}). Run \`tailscale up\`, then rerun.`);
+  const dnsName = String(status?.Self?.DNSName ?? "").replace(/\.$/, "");
+  if (!/\.ts\.net$/.test(dnsName))
+    throw new Error("This machine has no MagicDNS *.ts.net name. Turn on MagicDNS in the Tailscale admin console (DNS), then rerun.");
+  if (Array.isArray(status.CertDomains) && !status.CertDomains.length)
+    throw new Error("HTTPS certificates are off for your tailnet. Turn on HTTPS Certificates in the Tailscale admin console (DNS), then rerun.");
+  try {
+    await run("tailscale", ["serve", "--bg", "--set-path", servePath, `http://127.0.0.1:${guestPort}`], {
+      timeout: 60_000,
+    });
+  } catch (error) {
+    const why = tsError(error);
+    if (/access denied|permission denied|operator|must be root|sudo/i.test(why))
+      throw new Error(
+        `tailscale serve needs operator rights: run \`sudo tailscale set --operator=$USER\` once, then rerun. (${why.split("\n")[0]})`,
+      );
+    const link = why.match(/https:\/\/login\.tailscale\.com\/\S+/)?.[0];
+    if (/not enabled|enable.*serve|https/i.test(why) || link)
+      throw new Error(`Tailscale Serve/HTTPS is not enabled for your tailnet${link ? `: enable it at ${link}` : " (admin console → DNS → HTTPS Certificates)"}, then rerun.`);
+    if (error.killed) throw new Error("`tailscale serve` did not finish within 60s (is it waiting for you to enable Serve in the admin console?)");
+    throw new Error(`tailscale serve failed: ${why.split("\n")[0]}`);
+  }
+  const url = `wss://${dnsName}${servePath === "/" ? "" : servePath}`;
+  log(`tailscale serve: https://${dnsName}${servePath} -> http://127.0.0.1:${guestPort}`);
+  return url;
 }
 
 async function sameBytes(fs, a, b) {
@@ -433,7 +556,14 @@ export async function up(opts = {}, deps = {}) {
 
   const paths = hostPaths(home, platform);
   const bundle = await describeBundle(root, { fs });
-  const { config, changed: configChanged } = await ensureConfig(paths, opts, { fs, log });
+  if (opts.tailscaleServe) {
+    const existing = JSON.parse((await readText(fs, paths.config)) ?? "{}");
+    const guestPort = Number.isInteger(existing.guestPort) && existing.guestPort > 0 ? existing.guestPort : (opts.guestPort ?? DEFAULT_GUEST_PORT);
+    opts = { ...opts, url: await tailscaleServe({ run, guestPort, servePath: opts.tailscalePath, log }) };
+  }
+  // The machine's Nostr key: what the owner attests for zero-agent discovery.
+  const machineKey = await loadMachineKey({ file: paths.machineKey });
+  const { config, changed: configChanged } = await ensureConfig(paths, opts, { fs, log, machinePubkey: machineKey.pubkey });
 
   let installed = [];
   const install = await needsInstall(bundle, paths, opts, { fs });
@@ -474,10 +604,10 @@ export async function up(opts = {}, deps = {}) {
 
   const result = { version: bundle.version, url: connectUrl(config), token };
   if (pubkey) result.pubkey = pubkey;
-  return { result, service, installed, configChanged };
+  return { result, service, installed, configChanged, machinePubkey: machineKey.pubkey, config };
 }
 
-export function formatHuman({ result, service, installed }) {
+export function formatHuman({ result, service, installed, machinePubkey, config = {} }) {
   const lines = [
     `buzz-host ${result.version}: ${service === "skipped" ? "installed (service not started: --no-service)" : service}`,
     installed.length ? `updated: ${installed.join(", ")}` : "already up to date",
@@ -487,6 +617,17 @@ export function formatHuman({ result, service, installed }) {
   ];
   if (result.pubkey) lines.push(`  Iroh:  ${result.pubkey}`);
   if (result.url.startsWith("ws://127.0.0.1:"))
-    lines.push("", "The URL is local to this machine: reach it over an SSH tunnel, or expose it", "(e.g. `tailscale funnel`) and rerun with --url wss://….");
+    lines.push(
+      "",
+      "Buzz Desktop on this machine accepts this ws://127.0.0.1 URL directly.",
+      "For other devices: rerun with --tailscale-serve, use an SSH tunnel, or expose it",
+      "(e.g. Tailscale Funnel) and rerun with --url wss://….",
+    );
+  if (config.ownerPubkey && machinePubkey && !(Array.isArray(config.ownerAuth) && config.ownerAuth[1] === config.ownerPubkey))
+    lines.push(
+      "",
+      `Discovery: waiting for your attestation of this machine's key ${machinePubkey}.`,
+      "In Buzz: Settings → Security → authorize that key, then rerun with --owner-proof '<proof>'.",
+    );
   return `${lines.join("\n")}\n`;
 }

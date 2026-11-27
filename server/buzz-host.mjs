@@ -29,7 +29,15 @@ import { createMcpServer } from "./mcp-server.mjs";
 import { createMemory } from "./memory.mjs";
 import { createOrchestrator } from "./orchestrator.mjs";
 import { createRelayWatcher } from "./attention-relay.mjs";
-import { createDiscoveryPublisher, loadMachineId } from "./discovery.mjs";
+import {
+  configuredOwner,
+  createDiscoveryPublisher,
+  discoveryRelays,
+  loadMachineId,
+  loadMachineKey,
+  parseOwnerProof,
+  parsePubkey,
+} from "./discovery.mjs";
 import { catalogs, forComposer, formatTarget, parseTarget, resolveChatSettings, toModelList, toModels } from "./catalog.mjs";
 import {
   createDirectory as createHostDirectory,
@@ -80,6 +88,7 @@ import {
   MAX_GUEST_SOCKETS,
   MAX_MESSAGE_BYTES,
   MAX_UNAUTHENTICATED_GUEST_SOCKETS,
+  isLoopbackAddress,
 } from "./ws-security.mjs";
 
 const run = promisify(execFile);
@@ -212,6 +221,10 @@ function parseConfig(raw, file = CONFIG) {
     // zrok, any wss:// proxy). Ignores Tailscale-User-Login headers completely
     // and requires an access token (guest bhg_ or admin bha_).
     guestPort,
+    // Where the token listener binds: loopback by default (reach it through
+    // Tailscale Serve/Funnel, SSH or iroh); "0.0.0.0" (`buzz-host up --lan`)
+    // also takes LAN connections, still token-gated.
+    guestHost: parseGuestHost(raw.guestHost),
     publicGuestUrl: raw.publicGuestUrl ?? "",
     maxGuestDesktops: Number.isInteger(raw.maxGuestDesktops) && raw.maxGuestDesktops >= 0 ? raw.maxGuestDesktops : 1,
     guestDesktopIdleMs:
@@ -246,6 +259,11 @@ function parseConfig(raw, file = CONFIG) {
     discovery: raw.discovery !== false,
     discoveryIntervalMs:
       Number.isFinite(raw.discoveryIntervalMs) && raw.discoveryIntervalMs >= 5_000 ? raw.discoveryIntervalMs : 45_000,
+    // Zero-agent discovery (discovery.mjs): the machine's owner, their
+    // relays and the owner's attestation of the machine key.
+    ownerPubkey: typeof raw.ownerPubkey === "string" ? raw.ownerPubkey : undefined,
+    discoveryRelays: discoveryRelays(raw),
+    ownerAuth: Array.isArray(raw.ownerAuth) ? raw.ownerAuth : undefined,
     machineId: typeof raw.machineId === "string" ? raw.machineId : undefined,
     machineName: typeof raw.machineName === "string" ? raw.machineName : undefined,
     publicUrl: typeof raw.publicUrl === "string" ? raw.publicUrl : undefined,
@@ -257,6 +275,18 @@ function parseConfig(raw, file = CONFIG) {
         ? raw.irohMaxStreams
         : undefined,
   };
+}
+
+function parseGuestHost(value) {
+  if (value === undefined || value === null || value === "") return "127.0.0.1";
+  if (value === "127.0.0.1" || value === "0.0.0.0") return value;
+  throw new Error(`${CONFIG}: guestHost must be "127.0.0.1" (default) or "0.0.0.0" (LAN)`);
+}
+
+/** Merge `changes` into config.json on disk (the owner's other keys kept). */
+async function updateConfigFile(changes) {
+  const raw = JSON.parse(await fs.readFile(CONFIG, "utf8"));
+  await writePrivate(CONFIG, `${JSON.stringify({ ...raw, ...changes }, null, 2)}\n`);
 }
 
 async function loadConfig() {
@@ -846,6 +876,10 @@ const methods = {
           }
         : {
             publicGuestUrl: config.publicGuestUrl,
+            // This machine's Nostr key: the owner attests it (machine.attest)
+            // so the machine can announce itself with no agents yet.
+            machinePubkey: MACHINE_KEY.pubkey,
+            discoveryOwner: discoveryOwnerState(config),
           }),
       runtimes,
       runners,
@@ -955,6 +989,32 @@ const methods = {
     await services.restart(pubkey);
     discovery?.notifyChanged();
     return { status: await active(pubkey) };
+  },
+
+  // Zero-agent discovery: the owner attests this machine's key (NIP-OA, as for
+  // an agent) and names the relay to announce it on. Saved in config.json.
+  async "machine.attest"(config, { auth, relay }, session) {
+    if (session?.role !== "admin") throw new Error('Method "machine.attest" is not permitted for guest accounts');
+    const proof = parseOwnerProof(auth, MACHINE_KEY.pubkey);
+    const ownerPubkey = parsePubkey(proof[1]);
+    if (session.ownerPubkey && session.ownerPubkey !== ownerPubkey)
+      throw new Error("This access token is bound to another user");
+    const relays =
+      relay === undefined || relay === null || relay === ""
+        ? []
+        : [relay].map((r) => {
+            checkCommunity(config, r);
+            return r.trim();
+          });
+    // A new owner replaces the old one (and their relays); the same owner adds relays.
+    const sameOwner = configuredOwner(config, MACHINE_KEY.pubkey)?.ownerPubkey === ownerPubkey;
+    const nextRelays = [...new Set([...(sameOwner ? config.discoveryRelays : []), ...relays])];
+    await updateConfigFile({ ownerPubkey, ownerAuth: proof, discoveryRelays: nextRelays });
+    config.ownerPubkey = ownerPubkey;
+    config.ownerAuth = proof;
+    config.discoveryRelays = nextRelays;
+    discovery?.notifyChanged();
+    return discoveryOwnerState(config);
   },
 
   async profile(config, { pubkey, name, picture }, session) {
@@ -1513,6 +1573,15 @@ const MACHINE_ID = await loadMachineId({
   file: path.join(HOME, ".local/share/buzz-host/machine-id"),
   configured: config.machineId,
 });
+/** This machine's Nostr key (discovery with no agents; see machine.attest). */
+const MACHINE_KEY = await loadMachineKey({ file: path.join(HOME, ".local/share/buzz-host/machine-key") });
+/** What hello/pair report about the configured discovery owner (never the key). */
+function discoveryOwnerState(config) {
+  const owner = configuredOwner(config, MACHINE_KEY.pubkey);
+  return owner
+    ? { ownerPubkey: owner.ownerPubkey, relays: owner.relays, attested: owner.attested, enabled: config.discovery }
+    : null;
+}
 /** Machine discovery publisher (set once boot reaches it; null when off). */
 let discovery = null;
 // macOS: the short /tmp base is shared space, so create it 0700 and refuse one
@@ -1653,6 +1722,7 @@ discovery = config.discovery
       dataDir: DATA,
       runDir: RUN_DIR,
       machineId: MACHINE_ID,
+      machineKey: MACHINE_KEY,
       intervalMs: config.discoveryIntervalMs,
       config: () => config,
       runtimes: async () => {
@@ -1844,10 +1914,12 @@ if (Number.isInteger(config.guestPort) && config.guestPort > 0) {
     // Tailscale Funnel appends the peer address it saw to X-Forwarded-For, so
     // only the RIGHTMOST entry is trustworthy: everything to its left is
     // client-supplied and spoofable (it keys the auth rate limiter).
-    const remoteAddress = clientIpFromForwardedFor(
-      req.headers["x-forwarded-for"],
-      req.socket.remoteAddress,
-    );
+    // Only a loopback peer (the tunnel) may say who the client is: with
+    // guestHost 0.0.0.0 a LAN client connects directly and could forge it.
+    const peer = req.socket.remoteAddress || "unknown";
+    const remoteAddress = isLoopbackAddress(peer)
+      ? clientIpFromForwardedFor(req.headers["x-forwarded-for"], peer)
+      : peer;
     const refuse = (code, why) => {
       console.warn(`guest refused ${code}: ${why} (remote=${remoteAddress} origin=${origin ?? "-"})`);
       socket.end(`HTTP/1.1 ${code}\r\nConnection: close\r\n\r\n`);
@@ -1961,8 +2033,12 @@ if (Number.isInteger(config.guestPort) && config.guestPort > 0) {
       } catch {}
     }
   });
-  guestServer.listen(config.guestPort, "127.0.0.1", () => {
-    console.log(`buzz-host guest listening on 127.0.0.1:${config.guestPort}`);
+  guestServer.listen(config.guestPort, config.guestHost, () => {
+    console.log(`buzz-host guest listening on ${config.guestHost}:${config.guestPort}`);
+    if (!isLoopbackAddress(config.guestHost))
+      console.warn(
+        `buzz-host: the token listener takes LAN connections on port ${config.guestPort} (guestHost ${config.guestHost}); every socket still needs an access token`,
+      );
     irohSupervisor = createIrohSupervisor({
       config,
       libDir: LIB,

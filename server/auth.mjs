@@ -53,6 +53,7 @@ export const ADMIN_ONLY_METHODS = new Set([
   "tokens.create",
   "tokens.list",
   "tokens.revoke",
+  "machine.attest",
 ]);
 
 export function hashToken(token) {

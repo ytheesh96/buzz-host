@@ -57,6 +57,13 @@ export function createFragmentBuffer({ maxBytes = MAX_MESSAGE_BYTES } = {}) {
  * rightmost non-empty entry is the closest to us; anything to its left is
  * client-supplied and spoofable.
  */
+/** True for 127.0.0.0/8, ::1 and IPv4-mapped loopback (how Node reports a local peer). */
+export function isLoopbackAddress(address) {
+  const value = String(address ?? "").trim().toLowerCase();
+  const v4 = value.startsWith("::ffff:") ? value.slice(7) : value;
+  return value === "::1" || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(v4);
+}
+
 export function clientIpFromForwardedFor(headerValue, fallback = "unknown") {
   const raw = Array.isArray(headerValue) ? headerValue.join(",") : String(headerValue ?? "");
   const parts = raw
